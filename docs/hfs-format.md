@@ -250,6 +250,212 @@ understanding it is not the same as being able to decrypt anything: Apple's
 `hfs_cprotect.c` is metadata handling, while the keys live outside the
 filesystem. See `core/hfs_cprotect.c` when that investigation starts.
 
+## B-tree node geometry
+
+An HFS+ B-tree node is a fixed-size block with three regions:
+
+```text
+0                                                        node_size
++--------+--------------------------------------------+
+| 14-byte|  records, growing UPWARD from offset 14     |
+|  node  |                                             |
+| descr. |                                             |
++--------+----------------------------------------------+
+|                     free space                        |
++------------------------------------------------------+
+|  offset array: (numRecords + 1) u16, growing DOWNWARD|
++-------------------------------------------+---------+
+```
+
+Two things here are easy to get backwards:
+
+- The offset array sits at the **end** of the node and grows downward. Slot `i`
+  is stored at `node + nodeSize - (i << 1) - 2`.
+- Because slot *addresses* descend while record *offsets* ascend, record `i`
+  occupies `[offset[i], offset[i + 1])`. Reading the ranges as
+  `[offset[i+1], offset[i])` inverts every record.
+
+Mining reference: Apple `core/BTreeNodeOps.c`:
+
+```c
+#define GetRecordOffset(btreePtr,node,index) \
+    (*(short *) ((u_int8_t *)(node) + (btreePtr)->nodeSize - ((index) << 1) - kOffsetSize))
+
+pos = (u_int16_t *) ((Ptr)node + btreePtr->nodeSize - (index << 1) - kOffsetSize);
+return  *(pos-1) - *pos;                    /* GetRecordSize */
+```
+
+and `GetNodeFreeSize`, verbatim:
+
+```c
+freeOffset = GetRecordOffset (btreePtr, node, node->numRecords);
+return btreePtr->nodeSize - freeOffset - (node->numRecords << 1) - kOffsetSize;
+```
+
+The node descriptor is not subtracted from the free space: it lies below the
+records, outside that gap. `GetRecordOffset` itself does no bounds checking;
+every accessor in `src/btree/node.rs` range-checks first, because `numRecords`
+comes off the disk and the offset array holds only `nodeSize / 2` slots.
+
+## B-tree node size is not the allocation block size
+
+Node numbers are contiguous and fixed-size apart, so a node's byte offset within
+its fork is `node_number * node_size`. That byte offset must then be split by the
+volume's **allocation block size**, not by the node size, before the extent
+mapper can be asked for a physical block.
+
+On a default volume the two coincide: `mkfs.hfsplus` picks a 4096-byte
+allocation block size *and* 4096-byte B-tree nodes. Every other volume in the
+corpus separates them:
+
+| Image | allocation block | catalog node | extents node | attributes node |
+| --- | --- | --- | --- | --- |
+| `basic-hfsplus` | 4096 | 4096 | 4096 | 8192 |
+| `basic-hfsplus-1k` | 1024 | 4096 | 4096 | 8192 |
+| `basic-hfsplus-8k` | 8192 | 4096 | 4096 | 8192 |
+| `basic-hfsplus-16k` | 16384 | 4096 | 4096 | 8192 |
+
+Two conclusions, both of which produced wrong code before being found:
+
+1. **There is no rule that a volume's three B-trees share a node size.**
+   hfsprogs formats the attributes tree with 8192-byte nodes regardless of the
+   allocation block size.
+2. Splitting the node offset by the node size instead of the allocation block
+   size is *invisible on a default volume* and wrong everywhere else. It reads
+   zeroes on `basic-hfsplus-8k`, which is how it was caught: the catalog's
+   `first_leaf_node` appeared to be an empty index node instead of the leaf
+   holding the root folder record.
+
+## Opening a B-tree: the nodeSize chicken-and-egg problem
+
+`nodeSize` lives inside node 0, and finding node `n` needs `nodeSize`. Apple
+reads node 0 at the device's logical block size, parses the header record at
+offset 14, and re-reads if the declared size differs:
+
+```c
+if ( btreePtr->nodeSize != nodeRec.blockSize ) {
+    err = SetBTreeBlockSize (..., btreePtr->nodeSize, 32);
+    ReleaseBTreeBlock (..., kTrashBlock);
+    GetNode (btreePtr, kHeaderNodeNum, 0, &nodeRec);
+}
+```
+
+Mining reference: Apple `core/BTree.c` `BTOpenPath`. `src/btree/io.rs`
+`BTreeFile::open` performs the same sequence.
+
+## B-tree header validation
+
+`core/BTreeMiscOps.c` `VerifyHeader` rejects a header unless all of the
+following hold, and `src/btree/header.rs` reproduces each rule:
+
+| Check | Rule |
+| --- | --- |
+| `nodeSize` | one of 512, 1024, 2048, 4096, 8192, 16384, 32768 |
+| `nodeSize` on HFS+ | must not be 512 |
+| `totalNodes * nodeSize` | must not exceed the fork's logical size |
+| `freeNodes` | must be below `totalNodes` |
+| `rootNode`, `firstLeafNode`, `lastLeafNode` | must be below `totalNodes` |
+| `treeDepth` | at most `kMaxTreeDepth` = 16 |
+| `btreeType` | 0, 128.. (`kUserBTreeType`), or 255 |
+
+The 512-byte rule is Apple asserting explicitly:
+
+```c
+PanicIf((...vcbSigWord != 0x4244) && (header->nodeSize == 512),
+        " BTOpenPath: wrong node size for HFS+ volume!");
+```
+
+An empty tree has `treeDepth == 0` and `leafRecords == 0`. That is a valid
+state, not a corrupt header, and `BTGetInformation` reports it faithfully.
+
+## Key encoding
+
+Every node record begins with a key. The length prefix is 16 bits when the tree
+sets `kBTBigKeysMask` and 8 bits otherwise, and a key's on-disk size is the
+prefix plus the body **rounded up to an even number**:
+
+```c
+if ( btreePtr->attributes & kBTBigKeysMask )
+    keySize = keyLength + sizeof(u_int16_t);
+else
+    keySize = keyLength + sizeof(u_int8_t);
+if ( M_IsOdd (keySize) )
+    ++keySize;                    // add pad byte
+```
+
+Apple does not trust the stored attribute bit but re-derives it from the key
+length, with an explicit admission that the attribute is unreliable:
+
+```c
+if ( btreePtr->maxKeyLength > 40 )
+    btreePtr->attributes |= (kBTBigKeysMask + kBTVariableIndexKeysMask);
+       // "we need a way to save these attributes"
+```
+
+So the threshold is **strictly greater than 40**. Measured across the corpus:
+catalog `maxKeyLength` is 516 and attributes 264, so both are big-key trees;
+the extents tree's 8-byte keys are not. `has_big_keys` in
+`src/btree/key.rs` follows Apple's rule rather than the stored bit alone.
+
+## Key maximum lengths
+
+| Tree | Constant | Value |
+| --- | --- | --- |
+| catalog | `kHFSPlusCatalogKeyMaximumLength` | 516 (`u32 parentID` + `HFSUniStr255` 512) |
+| extents | `kHFSPlusExtentKeyMaximumLength` | 8 (`u32 fileID` + `u32 startBlock`) |
+| attributes | `kHFSPlusAttrKeyMaximumLength` | 264 |
+
+All three are defined in `core/hfs_format.h` as `sizeof(Key) - sizeof(u_int16_t)`.
+
+## Case sensitivity comes from keyCompareType, not the signature
+
+The volume signature does not decide name comparison. The catalog B-tree's own
+`keyCompareType` does. Measured across the corpus:
+
+| Image | Signature | Catalog `keyCompareType` | Comparison |
+| --- | --- | --- | --- |
+| HFS+ volumes | `0x482B` | `0xCF` (`kHFSCaseFolding`) | case-insensitive |
+| `hfsx-case-sensitive` | `0x4858` | `0xBC` (`kHFSBinaryCompare`) | case-sensitive |
+| `hfsx-case-insensitive` | `0x482B` | `0xCF` | case-insensitive |
+
+Mining reference: `core/hfs_format.h` defines `kHFSCaseFolding = 0xCF` and
+`kHFSBinaryCompare = 0xBC`; `core/hfs_catalog.c` (`cat_binarykeycompare`)
+dispatches on the value.
+
+Note that `hfsx-case-insensitive` has an HFS+ signature, not an HFSX one:
+`mkfs.hfsplus` only emits `kHFSXSigWord` for `-s`. An HFSX signature means the
+volume supports case sensitivity, not that it is enabled.
+
+### A real disagreement: keyCompareType in the other two trees
+
+Apple's `newfs_hfs` writes `kHFSBinaryCompare` into the attributes tree header:
+
+```c
+bthp->keyCompareType = kHFSBinaryCompare;
+```
+
+Mining reference: Apple `core/hfs_btreeio.c`, in the attributes tree creation
+path.
+
+hfsprogs 540.1 writes **0** into both the attributes and extents tree headers.
+Observed on every corpus image.
+
+The two implementations disagree, so the disagreement is recorded rather than
+resolved by preference. It is harmless in practice: those trees are keyed by
+(CNID, attribute name) and (CNID, block offset), never by a user-visible file
+name, so the comparison rule is never exercised. The consequence for this crate
+is that an unrecognised `keyCompareType` must be **preserved verbatim** as
+`KeyCompareType::Unknown(raw)` rather than coerced into a known variant.
+
+## Volume name in the catalog
+
+The root folder record — CNID `kHFSRootFolderID` = 2 — carries the volume name.
+In every corpus image it sits at a fixed offset within the catalog's first leaf
+node: 22 bytes into the record area, i.e. 14 bytes of node descriptor plus
+`0x001C` of key prefix and key body. The two records in that leaf are the root
+folder record and its thread record, which is what `leafRecords == 2` on a
+freshly formatted volume means.
+
 ## Checklist for any new structure
 
 Before adding a parser:

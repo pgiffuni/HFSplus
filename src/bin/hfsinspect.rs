@@ -18,6 +18,8 @@
 use std::process::ExitCode;
 
 use hfsplus::blockdev::{BlockDevice, FileDevice, ViewDevice, VOLUME_HEADER_OFFSET};
+use hfsplus::btree::io::BTreeFile;
+use hfsplus::btree::KeyCompareType;
 use hfsplus::error::{Error, Result};
 use hfsplus::format::extents::ExtentDescriptor;
 use hfsplus::format::fork::ForkData;
@@ -72,6 +74,8 @@ fn main() -> ExitCode {
 struct Options {
     json: bool,
     verbose: bool,
+    /// Walk every leaf node of the catalog B-tree.
+    btrees: bool,
 }
 
 struct Args {
@@ -80,13 +84,14 @@ struct Args {
 }
 
 fn parse_args() -> std::result::Result<Option<Args>, String> {
-    let mut opts = Options { json: false, verbose: false };
+    let mut opts = Options { json: false, verbose: false, btrees: false };
     let mut paths = Vec::new();
     let it = std::env::args().skip(1);
     for arg in it {
         match arg.as_str() {
             "--json" => opts.json = true,
             "--verbose" | "-v" => opts.verbose = true,
+            "--btrees" => opts.btrees = true,
             "--help" | "-h" => return Ok(None),
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unknown option `{s}`"))
@@ -241,6 +246,8 @@ fn render_text(vh: VolumeHeader, dev: &(impl BlockDevice + ?Sized), path: &str, 
     // Catalog presence is the minimum precondition for a read-only mount.
     if vh.catalog_file.logical_size == 0 {
         out.push_str("\nnote: catalogFile is empty; the volume has no catalog B-tree\n");
+    } else if opts.btrees {
+        out.push_str(&render_btrees(dev, &vh));
     }
 
     if opts.verbose {
@@ -303,6 +310,102 @@ fn special_forks(vh: &VolumeHeader) -> [ForkData; 5] {
         vh.attributes_file,
         vh.startup_file,
     ]
+}
+
+/// Open the volume's three B-trees and report their geometry.
+fn render_btrees(dev: &(impl BlockDevice + ?Sized), vh: &VolumeHeader) -> String {
+    let mut out = String::from("\nb-trees:\n");
+    for (label, fork) in [
+        ("catalogFile", vh.catalog_file),
+        ("extentsFile", vh.extents_file),
+        ("attributesFile", vh.attributes_file),
+    ] {
+        match BTreeFile::open(dev, &fork, vh.block_size, true) {
+            Ok(bt) => {
+                let h = bt.header();
+                out.push_str(&format!(
+                    "  {label}\n\
+                     \x20   node size      {}\n\
+                     \x20   total nodes    {}\n\
+                     \x20   free nodes     {}\n\
+                     \x20   tree depth     {}\n\
+                     \x20   leaf records   {}\n\
+                     \x20   root node      {}\n\
+                     \x20   first/last leaf {}/{}\n\
+                     \x20   max key length {}\n\
+                     \x20   key compare    0x{:02x}{}\n",
+                    h.node_size,
+                    h.total_nodes,
+                    h.free_nodes,
+                    h.tree_depth,
+                    h.leaf_records,
+                    h.root_node,
+                    h.first_leaf_node,
+                    h.last_leaf_node,
+                    h.max_key_length,
+                    h.key_compare_type.code(),
+                    match h.key_compare_type {
+                        KeyCompareType::CaseFolding => " (case folding)",
+                        KeyCompareType::BinaryCompare => " (binary, case-sensitive)",
+                        KeyCompareType::Unknown(_) => " (unrecognised)",
+                    },
+                ));
+                out.push_str(&render_leaf_chain(&bt));
+            }
+            Err(e) => out.push_str(&format!("  {label}\n     failed to open: {e}\n")),
+        }
+    }
+    out
+}
+
+/// Walk the leaf chain, which is the cheapest end-to-end check that the node
+/// offset arithmetic and the extent mapper agree with what the formatter wrote.
+fn render_leaf_chain(bt: &BTreeFile<'_, impl BlockDevice + ?Sized>) -> String {
+    use hfsplus::btree::node::NodeDescriptor;
+
+    let header = bt.header();
+    if header.leaf_records == 0 {
+        return "     leaf chain      empty\n".to_string();
+    }
+
+    let mut out = String::new();
+    let mut node = header.first_leaf_node;
+    // Bounded by totalNodes so a corrupt fLink cannot make this loop forever.
+    let mut budget = header.total_nodes;
+
+    loop {
+        if budget == 0 {
+            out.push_str("     <leaf chain did not terminate>\n");
+            break;
+        }
+        budget -= 1;
+
+        let bytes = match bt.read_node_bytes(node) {
+            Ok(b) => b,
+            Err(e) => {
+                out.push_str(&format!("     leaf {node:>4}       unreadable: {e}\n"));
+                break;
+            }
+        };
+        let parsed = match bt.parse_node(&bytes) {
+            Ok(p) => p,
+            Err(e) => {
+                out.push_str(&format!("     leaf {node:>4}       unparsable: {e}\n"));
+                break;
+            }
+        };
+        let NodeDescriptor { f_link, .. } = parsed.descriptor();
+        out.push_str(&format!(
+            "     leaf {node:>4}       {} records, fLink {f_link}\n",
+            parsed.num_records()
+        ));
+
+        if node == header.last_leaf_node {
+            break;
+        }
+        node = f_link;
+    }
+    out
 }
 
 fn render_json(vh: VolumeHeader, path: &str) -> String {
