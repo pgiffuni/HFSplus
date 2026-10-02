@@ -1,0 +1,29 @@
+[package]
+name = "hfsplus"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.70"
+description = "Userspace HFS+/HFSX filesystem implementation in Rust, initially exposed through FUSE"
+license = "BSD-2-Clause AND APSL-1.2"
+publish = false
+
+[lib]
+name = "hfsplus"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hfsinspect"
+path = "src/bin/hfsinspect.rs"
+
+# No third-party dependencies are used by the library at this stage.
+# The format, B-tree and catalog layers are pure Rust so that every
+# on-disk field is decoded explicitly and bounds-checked, which is a
+# hard requirement for treating disk images as untrusted input.
+[dependencies]
+
+[dev-dependencies]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+panic = "abort"

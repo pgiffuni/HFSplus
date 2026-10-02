@@ -1,0 +1,12 @@
+# Test images are generated, not committed. See tests/images/README.md.
+/target
+tests/images/generated/
+tests/images/malformed/
+tests/images/public/*
+tests/images/macos/*
+!tests/images/public/.gitkeep
+!tests/images/macos/.gitkeep
+!tests/images/expected/.gitkeep
+
+# Manifests are committed: they are the test specification.
+!tests/images/manifests/
