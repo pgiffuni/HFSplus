@@ -55,8 +55,10 @@
 #![warn(missing_debug_implementations)]
 
 pub mod blockdev;
+pub mod btree;
 pub mod endian;
 pub mod error;
+pub mod extent;
 pub mod format;
 pub mod timestamp;
 
