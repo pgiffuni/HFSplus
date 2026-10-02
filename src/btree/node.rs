@@ -47,6 +47,14 @@ pub const NODE_DESCRIPTOR_SIZE: usize = 14;
 /// Byte size of each entry in a node's record offset array.
 pub const OFFSET_SIZE: usize = 2;
 
+/// Upper bound on how many levels a search will descend.
+///
+/// Apple's `VerifyHeader` rejects a header whose `treeDepth` exceeds
+/// `kMaxTreeDepth`, which is 16, so a valid tree never needs more than that.
+/// Descent is bounded anyway: the bound is what stops a corrupt tree whose
+/// header lies about its depth from looping forever.
+pub const NODE_MAX_DEPTH: usize = 16;
+
 /// The kind of a B-tree node.
 ///
 /// Mining reference: Apple `core/hfs_format.h`:
