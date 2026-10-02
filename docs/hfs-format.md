@@ -456,6 +456,150 @@ node: 22 bytes into the record area, i.e. 14 bytes of node descriptor plus
 folder record and its thread record, which is what `leafRecords == 2` on a
 freshly formatted volume means.
 
+## Catalog record layout
+
+| Record | Size | Key | Body carries |
+| --- | --- | --- | --- |
+| `kHFSPlusFolderRecord` (1) | 88 | `(parent, name)` | its own CNID in `folderID` |
+| `kHFSPlusFileRecord` (2) | 248 | `(parent, name)` | its own CNID in `fileID` |
+| `kHFSPlusFolderThreadRecord` (3) | variable | `(ownCNID, "")` | its **parent** and **name** |
+| `kHFSPlusFileThreadRecord` (4) | variable | `(ownCNID, "")` | its **parent** and **name** |
+
+Mining reference: Apple `core/hfs_format.h` for the layouts; `core/hfs_catalog.c`
+`buildkey`, `buildthread` and `buildthreadkey` for who writes what.
+
+The thread layout is the corner that surprises people. A thread record's **body**
+`parentID` is the object's *parent*, and the object's own CNID is the thread
+record's **key** `parentID`. `buildthread` copies the main record's key straight
+into the body, while `buildthreadkey` builds the thread key from the node's CNID:
+
+```c
+rec->parentID = key->parentID;
+bcopy(&key->nodeName, &rec->nodeName, sizeof(UniChar) * (key->nodeName.length + 1));
+```
+
+Verified on `basic-hfsplus`, whose root folder has CNID 2, name `BasicVolume`,
+parent 1: the folder record is keyed `(1, "BasicVolume")` and the thread record is
+keyed `(2, "")` with body `(parentID = 1, name = "BasicVolume")`.
+
+Two consequences:
+
+- **Thread keys are not one contiguous range.** Each has a different `parentID`, so
+  enumerating a whole volume means scanning the catalog, not one key range. The
+  opposite is a natural assumption to make and it is wrong.
+- `CatalogRecord::cnid()` returns `Option` and is `None` for thread records, so the
+  body cannot be silently misread as a CNID.
+
+## Hard links: the discriminator is a flag, not a value
+
+`bsdInfo.special` is a union meaning `hl_linkCount` on the indirect node and
+`hl_linkReference` on a hard link. The two are told apart by
+`kHFSHasLinkChainMask` in the record flags, **not** by the magnitude of the value.
+
+Mining reference: `core/hfs_format.h` documents the union members and aliases them
+(`hl_firstLinkID` is the file record's `reserved1`, `hl_prevLinkID` is
+`bsdInfo.ownerID`, `hl_nextLinkID` is `bsdInfo.groupID`); `core/hfs_catalog.c` states
+the rule in prose and even repairs volumes that get it wrong:
+
+```c
+Set kHFSHasLinkChainBit for hard links, and reset it for all other
+items. Also set linkCount to 1 for regular files.
+```
+
+because rdar://8505977 shows regular files carrying the bit with a count above
+one. Inferring the role from the value would misread exactly those files.
+
+## Name comparison
+
+Mining reference: `core/UnicodeWrappers.c` (`FastUnicodeCompare`,
+`UnicodeBinaryCompare`) and `core/UCStringCompareData.h`.
+
+Two corrections to widely held beliefs, both established by enumerating Apple's
+generated tables rather than by assumption:
+
+### HFS+ does not normalise names
+
+There is no decomposition table in `UCStringCompareData.h`. The only folding data
+is `gLatinCaseFold`, `gLowerCaseTable` and `gCompareTable`, and the last is for
+legacy 8-bit Mac Script names used by classic HFS. So:
+
+```
+"cafe" + U+0301  !=  U+00E9
+```
+
+Composed and decomposed spellings are **different names**. The belief that they
+are equal comes from classic HFS, which did compare through a decomposition table.
+
+### The Latin-1 supplement is almost entirely identity
+
+`gLatinCaseFold` spans U+0000-U+00FF but changes only **34** entries: ASCII A-Z,
+plus the four letters with no precomposed upper/lower pair.
+
+| Range | Folded? |
+| --- | --- |
+| U+0041-U+005A | yes, to lowercase |
+| U+00C6, U+00D0, U+00D8, U+00DE | yes (AE, Eth, O-stroke, Thorn) |
+| all other U+00C0-U+00DE | **no** |
+| U+0100-U+01FF (Latin Extended-A) | a subset: D-stroke, Eng, kra, digraphs |
+| U+0391-U+03A9 (Greek capitals) | yes |
+| U+0410-U+04FF (Cyrillic) | yes |
+| U+0531-U+0556 (Armenian) | yes |
+| U+10A0-U+10C5 (Georgian) | yes |
+| U+2160-U+216F (Roman numerals) | yes |
+| U+FF21-U+FF3A (fullwidth Latin) | yes |
+
+So `À` does **not** match `à` on an HFS+ volume, while `Α` does match `α`. This is
+a genuine interoperability hazard between macOS and Linux: the same directory can
+be listed under different names depending on which folding rules apply.
+
+### Ignorable characters
+
+Exactly sixteen characters fold to zero and are skipped. All are bidi, zero-width
+or deprecated formatting characters:
+
+```
+U+200C U+200D U+200E U+200F U+202A-U+202E U+206A-U+206F U+FEFF
+```
+
+None is a combining mark. `tests` assert the documented list against the generated
+table so the two cannot drift apart.
+
+## Which comparator a volume uses
+
+Case sensitivity needs an HFSX signature **and** a catalog `keyCompareType` of
+`kHFSBinaryCompare`. Mining reference: `core/hfs_vfsutils.c`
+(`hfs_MountHFSPlusVolume`):
+
+```c
+retval = BTOpenPath(catalog_vp, (KeyCompareProcPtr) CompareExtendedCatalogKeys);
+...
+if ((hfsmp->hfs_flags & HFS_X) && BTGetInformation(...) == 0) {
+    if (btinfo.keyCompareType == kHFSBinaryCompare) {
+        hfsmp->hfs_flags |= HFS_CASE_SENSITIVE;
+        BTOpenPath(catalog_vp, (KeyCompareProcPtr) cat_binarykeycompare);
+    }
+}
+```
+
+So the folding comparator is the default, the binary one is installed only under
+that conjunction, and on a plain HFS+ volume `keyCompareType` is not consulted at
+all. An HFSX signature *permits* case sensitivity without enabling it — which is
+why the corpus's case-insensitive HFSX image has an HFS+ signature.
+
+## Formatter behaviours worth knowing
+
+Observed on every corpus image:
+
+- The root folder's `fileMode` is **0**, so no permission bits can be inferred
+  from it. The root is a directory because its record type says so.
+- The root folder's `ownerID` and `groupID` are **0**.
+- A **journaled** volume's root contains two real directory entries,
+  `.journal` and `.journal_info_block`, with their own CNIDs and thread records.
+  The root's `valence` counts them and agrees with `read_dir`. A non-journaled
+  fresh root is empty.
+- `valence` is a reliable cross-check: it equals the number of entries `read_dir`
+  returns for that directory.
+
 ## Checklist for any new structure
 
 Before adding a parser:
