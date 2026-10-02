@@ -14,7 +14,7 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/hfsx-case-sensitive.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "6abbe74a02f988ac76ba1bf2eb0e21ae5973e69d0b2c30fc492ec57cda66f705"
+sha256_informational = "00c8fc28de493d34695dbae945304386c6bbe5e05aafcace2516ca5968c969a6"
 
 [volume]
 block_size = 4096

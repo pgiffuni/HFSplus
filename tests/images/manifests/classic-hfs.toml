@@ -12,7 +12,7 @@ tool_version = "540.1.linux3"
 tool_licence = "APSL-2.0"
 command = "mkfs.hfsplus -h -v ClassicVolume tests/images/generated/classic-hfs.img"
 image = "tests/images/generated/classic-hfs.img"
-sha256_informational = "f6bcfa60b02aa83d0b8ac11960a53a66219c77d4563a48a9bb6b41354f6e9b9c"
+sha256_informational = "07556bf4ef868c0794fac6e29af025391891d805c2e437015f1de0c743f07ebc"
 
 [features]
 # Not applicable: nothing is parsed from this image beyond its signature.

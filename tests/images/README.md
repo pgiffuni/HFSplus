@@ -114,11 +114,16 @@ Consequences, applied consistently:
 - `sha256_informational` is provenance, not a fixture identity.
 - No test compares a committed image byte-for-byte.
 - Tests that need byte-exact behaviour regenerate into a temp directory.
-- When a byte-exact image genuinely matters, set `faketime`-style controls on the
-  *generator*, not by checking a digest in.
+- When a byte-exact image genuinely matters, fix the generator's clock, not a
+  digest in a test.
 
-Timestamps that are genuinely constant across runs — signature, version,
-blockSize, totalBlocks, fork geometry — *are* asserted exactly.
+Verified: deleting `generated/`, rebuilding with `tools/genimages.sh`, and
+regenerating manifests changes **only** the `sha256_informational` line of each
+manifest. Every field a test asserts on — signature, version, `blockSize`,
+`totalBlocks`, `freeBlocks`, `nextCatalogID`, the five forks, and the
+`fsck.hfsplus` verdict — is identical across runs. Timestamps that are genuinely
+constant are therefore asserted exactly, which is what makes the conformance
+suite meaningful.
 
 ## Coverage now
 

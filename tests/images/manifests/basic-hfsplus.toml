@@ -14,7 +14,7 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/basic-hfsplus.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "ab82e369209b6b4fc9db6b6f7632e8d449b5f3372baa6d76f8a784eb429b75e7"
+sha256_informational = "46a64d051c35fbda8af364ada3ad411e620a1f11633562d805e321303d6ce1e1"
 
 [volume]
 block_size = 4096
