@@ -189,10 +189,19 @@ hfsls [options] <image> [path]
 
 hfsinspect [options] <image>...
   --json, --verbose, --btrees
+
+hfsck [--json] [--quiet] <image>...
 ```
 
-Exit status is the same in both, and the three cases stay distinct so a caller
-can tell them apart:
+`hfsck` is this project's own consistency checker: the allocation bitmap against
+the catalog's extents in both directions, each fork's declared block count
+against what its extents describe, and `nextCatalogID` against the CNIDs in use.
+It reads only and **never repairs**, so there is no `--fix` to mis-invoke -- which
+matters, because `fsck_hfs` repairs as well as reports and pointing it at a
+fixture undoes the corruption it was meant to diagnose.
+
+Exit status is the same in `hfsls` and `hfsinspect`, and the three cases stay
+distinct so a caller can tell them apart:
 
 | Status | Meaning |
 | --- | --- |
@@ -204,6 +213,18 @@ A malformed image is a *result*, not a crash. `hfsinspect` reports it and
 continues to the next path, so one bad image in a batch does not hide the others;
 in `--json` mode each line is a self-contained object carrying its own `ok`
 field, so a later failure cannot truncate an earlier result.
+
+`hfsck` has a **fourth** status, because "cannot read this" and "read this and
+found it broken" call for different responses:
+
+| Status | Meaning |
+| --- | --- |
+| 3 | an image was read and found inconsistent |
+
+What the checker can and cannot establish is in `docs/roadmap-write-fsck.md`.
+The short version: it shares a parser with the reader, so it agrees with the
+reader about anything both derive from the same code. That is why it is not the
+arbiter for the reader's tests -- the oracle there is Apple's source.
 
 Two behaviours worth knowing before relying on the output:
 
