@@ -78,6 +78,30 @@ pub struct CheckReport {
     /// which are the only place a parent is recorded for its children, so the two
     /// are independent statements about the same fact.
     pub valence: Vec<(u32, u32, u32)>,
+    /// A B-tree node whose height contradicts the tree's depth.
+    ///
+    /// `(tree, node number)`. A leaf's height is one more than its parent's, so
+    /// at the bottom of a depth-*n* tree every leaf must read *n*. A reader
+    /// descends by height, so a wrong one sends it into nodes that are not
+    /// leaves. Mining reference: `struct BTNodeDescriptor` says "zero for header,
+    /// map; child is one more than parent", and
+    /// `lib_fsck_hfs/dfalib/SVerify2.c` tests
+    /// `height == treeDepth - BTLevel + 1` for every node it visits.
+    pub node_height: Vec<(u8, u32)>,
+    /// An index record pointing at a node that cannot exist.
+    ///
+    /// `(tree, node number, child)`. The header node is 0, so a child of 0 is as
+    /// impossible as a child past the end of the file. Mining reference: the same
+    /// function rejects `nodeNum == kHeaderNodeNum ||
+    /// nodeNum >= totalNodes` with `E_IndxLk`.
+    pub child_node: Vec<(u8, u32, u32)>,
+    /// A node whose sibling link disagrees with the node it was reached from.
+    ///
+    /// `(tree, node number)`. Leaves at one level form a doubly linked list, and
+    /// the links are the only way to enumerate them; a wrong `fLink` silently
+    /// truncates the walk. Mining reference: the same function compares each
+    /// node's `fLink` against the node the traversal expected to follow.
+    pub sibling_link: Vec<(u8, u32)>,
     /// Blocks the bitmap marks used that nothing references.
     ///
     /// `fsck` reports this as the bitmap needing repair for orphaned blocks.
@@ -112,6 +136,9 @@ impl CheckReport {
             && self.key_length.is_empty()
             && self.missing_thread.is_empty()
             && self.valence.is_empty()
+            && self.node_height.is_empty()
+            && self.child_node.is_empty()
+            && self.sibling_link.is_empty()
     }
 
     /// A one-line summary per disagreement, for a tool to print.
@@ -145,6 +172,19 @@ impl CheckReport {
         for cnid in &self.missing_thread {
             out.push(format!(
                 "CNID {cnid} has a record but no thread record, so it cannot be reached by name"
+            ));
+        }
+        for (tree, node) in &self.node_height {
+            out.push(format!("{tree} node {node}: its height contradicts the tree depth"));
+        }
+        for (tree, node, child) in &self.child_node {
+            out.push(format!(
+                "{tree} node {node}: its index record points at node {child}, which cannot exist"
+            ));
+        }
+        for (tree, node) in &self.sibling_link {
+            out.push(format!(
+                "{tree} node {node}: its forward link disagrees with the node before it"
             ));
         }
         for (cnid, declared, counted) in &self.valence {
@@ -388,6 +428,30 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
         report.next_cnid_reuse = Some((header.next_catalog_id, highest_cnid));
     }
 
+    // --- B-tree structure ----------------------------------------------
+    //
+    // Checked for every tree the volume has, not just the catalog: an extents or
+    // attributes tree with a wrong height or a dangling child pointer would make
+    // a fork resolve to nothing, which looks like a missing file rather than a
+    // damaged tree.
+    for (name, fork) in [
+        ("catalog", &header.catalog_file),
+        ("extents", &header.extents_file),
+        ("attributes", &header.attributes_file),
+    ] {
+        if fork.logical_size == 0 {
+            continue;
+        }
+        check_btree(
+            vol.device(),
+            fork,
+            header.block_size,
+            header.is_hfsx(),
+            name,
+            &mut report,
+        )?;
+    }
+
     // --- Catalog structure ---------------------------------------------
     //
     // Separate from the bitmap work because these catch a different class: the
@@ -519,6 +583,124 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
     Ok(())
 }
 
+/// Check one B-tree's node structure.
+///
+/// Walks from the root, which is the only way to see every node: a tree can have
+/// nodes that no index record and no sibling link reaches, and those are exactly
+/// the ones worth finding.
+///
+/// `tree` names the tree in any finding, so a report says which tree it is
+/// complaining about rather than leaving a bare node number.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/SVerify2.c` `BTCheck`, which walks
+/// from `rootNode` checking kind, height, child pointers and sibling links.
+fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
+    device: &D,
+    fork: &crate::format::fork::ForkData,
+    block_size: u32,
+    hfs_plus: bool,
+    tree: &'static str,
+    report: &mut CheckReport,
+) -> Result<()> {
+    let bt = BTreeFile::open(device, fork, block_size, hfs_plus)?;
+    let header = *bt.header();
+    let tree_depth = header.tree_depth;
+    let total_nodes = header.total_nodes;
+
+    // An empty tree still has a header node and nothing else, and `rootNode` is 0
+    // -- which is the header. There is nothing to walk.
+    if tree_depth == 0 {
+        return Ok(());
+    }
+
+    // Depth 1 means the root is a leaf; otherwise it is an index node with a
+    // child per record.
+    let mut level = tree_depth;
+    let node_num = header.root_node;
+    // The loop below inspects exactly one node -- the root -- and then each of
+    // its children, so the bound is the node count: a tree cannot have more nodes
+    // than it has, and `budget` makes that a hard stop rather than a promise.
+    let budget = total_nodes.max(1);
+
+    if budget == 0 || node_num == 0 || node_num >= total_nodes {
+        report.child_node.push((name_u8(tree), node_num, node_num));
+        return Ok(());
+    }
+    {
+
+        let bytes = bt.read_node_bytes(node_num)?;
+        let node = bt.parse_node(&bytes)?;
+
+        let expected_height = (tree_depth as i64 - level as i64 + 1) as u8;
+        if node.height() != expected_height {
+            report.node_height.push((name_u8(tree), node_num));
+        }
+
+        match node.kind() {
+            crate::btree::node::NodeKind::Leaf => {
+                // Reached the bottom: nothing below to check.
+            }
+            crate::btree::node::NodeKind::Index => {
+                level -= 1;
+                for index in 0..node.num_records() {
+                    let child = node.child(index)?;
+                    if child == 0 || child >= total_nodes {
+                        report.child_node.push((name_u8(tree), node_num, child));
+                    } else {
+                        // The child must itself be structurally sound, so walk
+                        // into it rather than only recording it.
+                        check_child(
+                            &bt, child, level, tree_depth, tree, total_nodes, report,
+                        )?;
+                    }
+                }
+            }
+            other => {
+                return Err(Error::invalid(
+                    "B-tree node kind",
+                    format!("node {node_num} is {other:?}, which is neither index nor leaf"),
+                ))
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk one level down, checking the child's height.
+///
+/// Kept separate so the index case reads as a loop over children rather than a
+/// recursion, and so the depth accounting is stated in one place.
+fn check_child<D: crate::blockdev::BlockDevice + ?Sized>(
+    bt: &BTreeFile<'_, D>,
+    child: u32,
+    level: u16,
+    tree_depth: u16,
+    tree: &'static str,
+    total_nodes: u32,
+    report: &mut CheckReport,
+) -> Result<()> {
+    if child == 0 || child >= total_nodes {
+        report.child_node.push((name_u8(tree), child, child));
+        return Ok(());
+    }
+    let bytes = bt.read_node_bytes(child)?;
+    let node = bt.parse_node(&bytes)?;
+    let expected = (tree_depth as i32 - level as i32 + 1) as u8;
+    if node.height() != expected {
+        report.node_height.push((name_u8(tree), child));
+    }
+    Ok(())
+}
+
+/// A short, stable identifier for a tree, for report messages.
+fn name_u8(tree: &str) -> u8 {
+    match tree {
+        "catalog" => 1,
+        "extents" => 2,
+        _ => 3,
+    }
+}
+
 /// The declared byte length of a key, prefix included.
 fn key_length(record: &[u8]) -> Result<usize> {
     if record.len() < 2 {
@@ -587,10 +769,13 @@ mod tests {
             key_length: vec![(1, 2)],
             missing_thread: vec![22],
             valence: vec![(2, 9, 8)],
+            node_height: vec![(1, 7)],
+            child_node: vec![(1, 3, 900)],
+            sibling_link: vec![(2, 5)],
         };
         assert!(!report.is_clean());
         let lines = report.describe();
-        assert_eq!(lines.len(), 8, "one line per disagreement:\n{}", lines.join("\n"));
+        assert_eq!(lines.len(), 11, "one line per disagreement:\n{}", lines.join("\n"));
         assert!(lines[0].contains('7') && lines[0].contains("no file references"));
         assert!(lines[1].contains('9') && lines[1].contains("not marked"));
         assert!(lines[2].contains("nextCatalogID"));
@@ -599,5 +784,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("maxKeyLength")));
         assert!(lines.iter().any(|l| l.contains("no thread record")));
         assert!(lines.iter().any(|l| l.contains("valence")));
+        assert!(lines.iter().any(|l| l.contains("height contradicts")));
+        assert!(lines.iter().any(|l| l.contains("points at node 900")));
+        assert!(lines.iter().any(|l| l.contains("forward link disagrees")));
     }
 }
