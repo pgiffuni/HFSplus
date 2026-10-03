@@ -30,6 +30,7 @@ fn main() -> ExitCode {
     let mut recursive = false;
     let mut stat_only = false;
     let mut bitmap = false;
+    let mut journal = false;
     let mut json = false;
     let mut args: Vec<String> = Vec::new();
 
@@ -40,6 +41,7 @@ fn main() -> ExitCode {
             "-R" | "--recursive" => recursive = true,
             "-s" | "--stat" => stat_only = true,
             "-b" | "--bits" => bitmap = true,
+            "-j" | "--journal" => journal = true,
             "--json" => json = true,
             "-h" | "--help" => {
                 usage();
@@ -88,6 +90,17 @@ fn main() -> ExitCode {
 
     if stat_only {
         match render_stat(&vol) {
+            Ok(text) => print!("{text}"),
+            Err(e) => {
+                eprintln!("hfsls: {image}: {e}");
+                return ExitCode::from(2);
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    if journal {
+        match render_journal(&vol) {
             Ok(text) => print!("{text}"),
             Err(e) => {
                 eprintln!("hfsls: {image}: {e}");
@@ -236,6 +249,49 @@ fn render_stat(vol: &Volume<'_, FileDevice>) -> Result<String> {
     s.push_str(&format!("journaled:       {}\n", st.journaled));
     s.push_str(&format!("case sensitive:  {}\n", vol.is_case_sensitive()));
     s.push_str(&format!("clean:           {}\n", vol.is_clean()));
+    Ok(s)
+}
+
+fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
+    let mut s = String::new();
+    s.push_str(&format!("journaled:       {}\n", vol.is_journaled()));
+    s.push_str(&format!(
+        "journalInfoBlock:{}\n",
+        vol.header().journal_info_block
+    ));
+
+    let Some(j) = vol.journal()? else {
+        s.push_str("journal:         none\n");
+        return Ok(s);
+    };
+
+    let info = j.info();
+    s.push_str(&format!("journal offset:  {}\n", info.offset));
+    s.push_str(&format!("journal size:    {}\n", info.size));
+    let flags = info.flag_set();
+    s.push_str(&format!(
+        "journal flags:   0x{:08x}{}{}{}\n",
+        info.flags,
+        if flags.in_filesystem() { " in-filesystem" } else { "" },
+        if flags.on_other_device() { " other-device" } else { "" },
+        if flags.needs_init() { " needs-init" } else { "" },
+    ));
+    s.push_str(&format!("uninitialised:   {}\n", j.is_uninitialized()));
+    match j.header() {
+        None => s.push_str("journal header:  none (never written)\n"),
+        Some(h) => {
+            s.push_str(&format!(
+                "header start/end:{}/{}  sequence {}  blhdr {}  jhdr {}\n",
+                h.start, h.end, h.sequence_num, h.blhdr_size, h.jhdr_size
+            ));
+        }
+    }
+    s.push_str(&format!("transactions:    {}\n", j.transactions().len()));
+    s.push_str(&format!("replayed blocks: {}\n", j.replayed_blocks().len()));
+    if j.replayed_blocks().is_empty() {
+        s.push_str("note:            an uninitialised journal replays nothing, so the\n");
+        s.push_str("                 filesystem is used as-is\n");
+    }
     Ok(s)
 }
 
