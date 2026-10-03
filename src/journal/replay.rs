@@ -741,6 +741,22 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 ));
             }
             if at >= size {
+                // The wrap removes exactly one `size`, so it brings an offset
+                // inside the ring only when that offset is within a lap. Anything
+                // further out is refused rather than wrapped again: two laps
+                // would subtract twice and land past the end, where `size - at`
+                // underflows.
+                //
+                // Apple never reaches this because it applies the rule to an
+                // offset it advanced by one step. The bound is here for a caller
+                // that does not.
+                if at - size >= size - ring_start {
+                    return Err(Error::out_of_range(
+                        "journal read offset",
+                        offset,
+                        size.saturating_add(size - ring_start),
+                    ));
+                }
                 at = ring_start + (at - size);
             }
             let available = (size - at) as usize;
