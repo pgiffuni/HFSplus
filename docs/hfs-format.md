@@ -2,8 +2,9 @@
 
 Working notes from mining Apple's `core/` sources. Each entry states the finding,
 why it is easy to get wrong, and the Apple source that settles it. Apple's
-repository is the authority: <https://github.com/pgiffuni/apple-hfs> at commit
-`d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`.
+repository is the authority: <https://github.com/apple-oss-distributions/hfs> at
+commit `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea` (mirrored, at the same
+commit, at <https://github.com/pgiffuni/apple-hfs>).
 
 ## Volume header placement
 

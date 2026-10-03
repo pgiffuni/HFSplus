@@ -6,9 +6,12 @@ depends on the library.
 
 ## Reference sources, in authority order
 
-1. **Apple's HFS source**, <https://github.com/pgiffuni/apple-hfs>, pinned at
-   `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`. This is the authority. Clone it
-   outside the repository and mine `core/`.
+1. **Apple's HFS source**, <https://github.com/apple-oss-distributions/hfs>,
+   pinned at `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`. This is the
+   authority. Clone it outside the repository and mine `core/`.
+   `pgiffuni/apple-hfs` is a mirror of that repository at the same commit and
+   is an acceptable substitute when the canonical one is unreachable; cite
+   the canonical URL regardless.
 2. Apple HFS documentation and format definitions.
 3. Apple's own tests, shipped in the same repository: `tests/cases/` (48 cases),
    `lib_fsck_hfs/`, `fstyp_hfs`, `hfs_util`, `newfs_hfs`.

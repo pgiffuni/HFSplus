@@ -13,8 +13,9 @@ CI plumbing.
 
 ## 2. APSL-1.2 — code derived from Apple's HFS implementation
 
-Apple's HFS source (<https://github.com/pgiffuni/apple-hfs>, commit
-`d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`) is distributed under the Apple
+Apple's HFS source (<https://github.com/apple-oss-distributions/hfs>, commit
+`d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`; mirrored at
+<https://github.com/pgiffuni/apple-hfs>) is distributed under the Apple
 Public Source License version 1.2, reproduced verbatim as
 `LICENSE-APPLE.md`. Files in this repository that translate, or that reproduce
 the layout of, Apple's on-disk structures and algorithms remain under APSL-1.2
@@ -65,7 +66,7 @@ Two distinct uses are permitted, and they carry different obligations:
 | Package / project | Licence | Role |
 | --- | --- | --- |
 | `hfsprogs` 540.1 (`mkfs.hfsplus`, `fsck.hfsplus`) | APSL-2.0, Apple Inc. | **Primary.** Image generation and the independent checker for differential testing. Apple-authored, so it also satisfies the Apple-source-first hierarchy. |
-| `pgiffuni/apple-hfs` | APSL-1.2 | **Primary.** Structures, algorithms, semantics. Mined and cited. |
+| `apple-oss-distributions/hfs` (mirror: `pgiffuni/apple-hfs`) | APSL-1.2 | **Primary.** Structures, algorithms, semantics. Mined and cited. |
 | `hfsutils` 3.2.6 (`hmount`, `hls`, `hformat`, …) | GPL-2.0 | **Executable only.** May be run to build images. Never read as a reference; never vendored. |
 | `hfsplus` 1.0.4 (`hpmount`, `hpls`, libhfsp) | GPL-2.0 | **Executable only.** Same rule. |
 | `0x09/hfsfuse` | GPL-2.0 | **Behavioural baseline only.** Defines the read-only feature set to meet or exceed. Never copied, translated, linked, or vendored. |

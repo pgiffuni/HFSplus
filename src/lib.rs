@@ -26,8 +26,10 @@
 //!
 //! # Reference sources, in priority order
 //!
-//! 1. Apple's HFS source, <https://github.com/pgiffuni/apple-hfs>, pinned at
-//!    commit `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`.
+//! 1. Apple's HFS source, <https://github.com/apple-oss-distributions/hfs>,
+//!    pinned at commit `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea`.
+//!    `pgiffuni/apple-hfs` is a mirror of that repository at the same commit
+//!    and is an acceptable substitute when the canonical one is unreachable.
 //! 2. Apple HFS documentation and format definitions.
 //! 3. Apple tests and test data shipped with that repository
 //!    (`tests/cases/`, `lib_fsck_hfs/`).

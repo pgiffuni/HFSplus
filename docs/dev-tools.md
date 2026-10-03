@@ -154,7 +154,7 @@ reference. It is also GPL-2.0. **Excluded from this project.**
 
 | Source | Commit / version |
 | --- | --- |
-| `pgiffuni/apple-hfs` | `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea` |
+| `apple-oss-distributions/hfs` (mirror: `pgiffuni/apple-hfs`) | `d1bac2f062e6e9c0dfcce302d9aacb10173d0eea` |
 | `0x09/hfsfuse` (baseline only) | `8c44b9aa80a8eba541ac3a8b86aad8eecde9277f` |
 | `hfsprogs` checker | `540.1.linux3-6build1` |
 | `mkfs.hfsplus` | `540.1.linux3` |
