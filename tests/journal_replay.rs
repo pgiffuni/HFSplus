@@ -1149,3 +1149,52 @@ fn damage_after_a_good_transaction_truncates_rather_than_aborting() {
     });
     assert!(ran, "journal-bad-bsize: the image must be built");
 }
+
+
+#[test]
+fn a_read_from_the_journal_wraps_at_its_end() {
+    // The journal is a **ring**: the writer reaches the end and starts again just
+    // after the header, so a block list's replacement data can be split across
+    // the wrap. Refusing a read that crosses the end rejects an ordinary journal
+    // -- a transaction written last is normal, not damaged.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal` --
+    // `if (offset >= jnl->jhdr->size) offset = jnl->jhdr->jhdr_size +
+    // (offset - jnl->jhdr->size);`
+    let path = common::repo_root().join("tests/images/replayed/journal-replay-be.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("a journal");
+
+    let size = journal.info().size;
+    let jhdr = u64::from(journal.header().expect("header").jhdr_size);
+    assert!(jhdr < size, "the ring needs room to wrap into");
+
+    // A read wholly inside the ring.
+    let inside = journal.read_bytes(2048, 2048).expect("a read inside the ring");
+    assert_eq!(inside.len(), 2048);
+
+    // A read that starts near the end and runs over it. The first half comes
+    // from the tail and the second from just after the header, so both are
+    // checkable against the same image read directly.
+    let tail_len = 2048usize;
+    let start = size - tail_len as u64 / 2;
+    let wrapped = journal
+        .read_bytes(start, tail_len)
+        .expect("a read across the wrap");
+    assert_eq!(wrapped.len(), tail_len);
+
+    let expect_first = journal
+        .read_bytes(start, tail_len / 2)
+        .expect("the tail half on its own");
+    let expect_second = journal
+        .read_bytes(jhdr, tail_len / 2)
+        .expect("the head half on its own");
+    assert_eq!(wrapped, [expect_first, expect_second].concat());
+}
