@@ -57,8 +57,11 @@ impl ForkType {
 /// On-disk fork description: size, clump size, block count and inline extents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ForkData {
-    /// Logical size of the fork in bytes. May exceed `total_blocks *
-    /// block_size` for a sparse file.
+    /// Logical size of the fork in bytes: the length a reader sees.
+    ///
+    /// It may be *less* than the blocks behind it -- a file of 5000 bytes occupies
+    /// two 4096-byte blocks -- but never more. An HFS+ data fork cannot be sparse,
+    /// so there is no such thing as a hole to account for the difference.
     pub logical_size: u64,
     /// Clump size in bytes: the granularity at which the fork grows.
     pub clump_size: u32,
@@ -197,6 +200,77 @@ impl ForkData {
         u64::from(self.total_blocks).saturating_sub(self.inline_blocks())
     }
 
+
+    /// Check this fork against the blocks its extents actually describe.
+    ///
+    /// `described_blocks` is the total from the inline extents *plus* any overflow
+    /// records, and `physical_size` is `total_blocks * block_size` as the record
+    /// implies it. Two independent statements, checked against the extents:
+    ///
+    /// ```text
+    /// logical_size <= physical_size
+    /// physical_size <= described_blocks * block_size
+    /// ```
+    ///
+    /// The first is the non-sparse invariant. An HFS+ data fork has no
+    /// representation for a hole: a zero-start extent descriptor is the
+    /// *attributes* file's gap marker, and `hfs_vfsops.c` has no zero-fill path
+    /// for a data fork. So a logical size beyond the physical size is not a sparse
+    /// file, it is a corrupt record, and a reader that zero-fills it is inventing
+    /// bytes rather than recovering them.
+    ///
+    /// The second says the record does not claim more blocks than its extents
+    /// account for -- the direction that would make a reader read past the end of
+    /// the file's own data.
+    ///
+    /// Mining reference: `lib_fsck_hfs/dfalib/CatalogCheck.c` `CheckFileData`,
+    /// which reports `E_LEOF` ("Incorrect size for file") for the first and
+    /// `E_PEOF` ("Incorrect block count for file") for the second. Note the
+    /// tolerance: a logical size *below* the physical size is ordinary, because the
+    /// final block of a file is normally only partly used.
+    pub fn validate(&self, described_blocks: u64, block_size: u32) -> Result<()> {
+        if self.total_blocks == 0 {
+            // A fork with no blocks must claim no bytes.
+            if self.logical_size != 0 {
+                return Err(Error::invalid(
+                    "ForkData.logicalSize",
+                    format!("{} bytes claimed by a fork with no blocks", self.logical_size),
+                ));
+            }
+            return Ok(());
+        }
+        if described_blocks > u64::from(u32::MAX) {
+            return Err(Error::overflow("fork block count"));
+        }
+        let physical_size = u64::from(self.total_blocks)
+            .checked_mul(u64::from(block_size))
+            .ok_or(Error::overflow("fork physical size"))?;
+
+        if self.logical_size > physical_size {
+            return Err(Error::invalid(
+                "ForkData.logicalSize",
+                format!(
+                    "{} bytes of data in {} blocks of {block_size} -- an HFS+ data \
+                     fork cannot be sparse, so the excess is unaccounted for",
+                    self.logical_size, self.total_blocks
+                ),
+            ));
+        }
+        let capacity = described_blocks
+            .checked_mul(u64::from(block_size))
+            .ok_or(Error::overflow("fork capacity"))?;
+        if physical_size > capacity {
+            return Err(Error::invalid(
+                "ForkData.totalBlocks",
+                format!(
+                    "{} blocks of {block_size} exceed the {} blocks its extents \
+                     describe",
+                    self.total_blocks, described_blocks
+                ),
+            ));
+        }
+        Ok(())
+    }
 
     /// Iterate the meaningful inline extents.
     pub fn iter_inline(&self) -> impl Iterator<Item = &ExtentDescriptor> {
