@@ -134,21 +134,65 @@ all. Empirically:
 Because it cannot read HFS+ at all, hfsutils is useless as an HFS+ differential
 reference. It is also GPL-2.0. **Excluded from this project.**
 
+## This project's own tools
+
+Both read only. Neither opens an image for writing anywhere in its code, so
+pointing them at real media is safe; `tests/cli.rs` asserts that running every
+option combination leaves the image byte-identical.
+
+```
+hfsls [options] <image> [path]
+  -l, --long        show mode, size, dates, CNID and Finder codes
+  -a, --all          include entries whose names begin with a dot
+  -R, --recursive    descend into directories
+  -s, --stat         print volume statistics and exit
+  -b, --bits         print the allocation bitmap summary
+  -j, --journal      report journal detection and replay state
+  --json             machine-readable output
+
+hfsinspect [options] <image>...
+  --json, --verbose, --btrees
+```
+
+Exit status is the same in both, and the three cases stay distinct so a caller
+can tell them apart:
+
+| Status | Meaning |
+| --- | --- |
+| 0 | every image inspected cleanly |
+| 1 | a usage error: no arguments, or an unknown option |
+| 2 | an image could not be parsed |
+
+A malformed image is a *result*, not a crash. `hfsinspect` reports it and
+continues to the next path, so one bad image in a batch does not hide the others;
+in `--json` mode each line is a self-contained object carrying its own `ok`
+field, so a later failure cannot truncate an earlier result.
+
+Two behaviours worth knowing before relying on the output:
+
+- **`hfsls` does not replay the journal.** It lists the filesystem as it is on
+  the disk. Replaying silently would show a user diagnosing a crash a filesystem
+  that does not match their media, so the journal report is a separate, explicit
+  request via `-j`, and `tests/cli.rs` asserts the distinction.
+- **A listed name is the catalog's spelling, not the one typed.** On a
+  case-folding volume several spellings reach the same record, and the tool
+  reports what is stored. `hfsls image .JOURNAL` prints `.journal`.
+
 ## Capability matrix
 
-| Capability | `mkfs.hfsplus` / `fsck.hfsplus` | `hpmount`/`hpls` | `hmount`/`hls` |
-| --- | --- | --- | --- |
-| Create HFS+ | yes | — | yes, but classic HFS only |
-| Create HFSX | yes (`-s`) | — | no |
-| Create journaled HFS+ | yes (`-J`) | — | no |
-| Create classic HFS | yes (`-h`) | — | yes |
-| Check/repair HFS+ | yes, incl. `-r` rebuild catalog | `hpfsck` | no |
-| Inspect HFS+ | yes (`-x` XML, `-d` debug) | partial | no |
-| Inspect catalog | yes | `hpls` | no |
-| Inspect extents | yes | — | no |
-| Modify HFS+ | no | read-only in practice | no |
-| Manipulate files/dirs | no | no | classic HFS only |
-| Metadata / xattrs | reports only | no | no |
+| Capability | `mkfs.hfsplus` / `fsck.hfsplus` | `hpmount`/`hpls` | `hmount`/`hls` | this project |
+| --- | --- | --- | --- | --- |
+| Create HFS+ | yes | — | yes, but classic HFS only | no (read-only) |
+| Create HFSX | yes (`-s`) | — | no | read |
+| Create journaled HFS+ | yes (`-J`) | — | no | read + replay |
+| Create classic HFS | yes (`-h`) | — | yes | refuses cleanly |
+| Check/repair HFS+ | yes, incl. `-r` rebuild catalog | `hpfsck` | no | no |
+| Inspect HFS+ | yes (`-x` XML, `-d` debug) | partial | no | `hfsinspect` |
+| Inspect catalog | yes | `hpls` | no | `hfsls`, `hfsinspect --btrees` |
+| Inspect extents | yes | — | no | `hfsinspect` |
+| Modify HFS+ | no | read-only in practice | no | no |
+| Manipulate files/dirs | no | no | classic HFS only | no |
+| Metadata / xattrs | reports only | no | no | reads BSD info and dates |
 
 ## Reference source versions pinned
 
