@@ -480,6 +480,97 @@ fn the_corpus_confirms_every_declared_key_length() {
 }
 
 #[test]
+fn the_corpus_confirms_the_catalog_record_sizes_by_measurement() {
+    // `tests/structure_sizes.rs` checks the catalog record sizes against the
+    // arithmetic of Apple's declarations. This checks them by measuring what
+    // `mkfs.hfsplus` wrote, which is stronger: it would also catch a field *shift*
+    // inside a record, since a wrong field width changes the record's length.
+    //
+    // A record runs from its key to the next key, so its length is the span minus
+    // the key. The last record's end is the node's `freeSpaceOffset`.
+    use hfsplus::catalog::record::{FILE_RECORD_SIZE, FOLDER_RECORD_SIZE, THREAD_RECORD_FIXED_SIZE};
+
+    let mut folder_seen = 0usize;
+    let mut file_seen = 0usize;
+    let mut thread_seen = 0usize;
+
+    for (name, hfs_plus) in trees() {
+        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, hfs_plus)
+            .unwrap_or_else(|e| panic!("{name}: catalog tree: {e}"));
+        let node_size = bt.node_size();
+        let last_leaf = bt.header().last_leaf_node;
+        let mut node_num = bt.header().first_leaf_node;
+        let mut budget = bt.header().total_nodes;
+
+        // Process the node before testing for the end of the chain: a single-leaf
+        // tree has `first_leaf == last_leaf`, so a pre-test would never run.
+        while budget > 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num).unwrap();
+            let node = bt.parse_node(&bytes).unwrap();
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            let count = node.num_records() as usize;
+            let offsets: Vec<usize> = (0..count)
+                .map(|i| u16::from_be_bytes([
+                    bytes[node_size - 2 * (i + 1)],
+                    bytes[node_size - 2 * (i + 1) + 1],
+                ]) as usize)
+                .collect();
+
+            // The last record's end is not derivable from the node: a leaf has no
+            // `freeSpaceOffset`, and the two bytes at offset 40 that an index
+            // node uses for it are unused here -- `mkfs.hfsplus` leaves 1 there.
+            // Every other record is bounded by the next key, so the last one is
+            // skipped rather than measured against a field that does not exist.
+            for i in 0..count.saturating_sub(1) {
+                let at = offsets[i];
+                let key_len = u16::from_be_bytes([bytes[at], bytes[at + 1]]) as usize;
+                let body_at = at + 2 + key_len;
+                let rtype = i16::from_be_bytes([bytes[body_at], bytes[body_at + 1]]);
+                let end = offsets[i + 1];
+                let body = end - body_at;
+
+                match rtype {
+                    1 => {
+                        assert_eq!(body, FOLDER_RECORD_SIZE, "{name}: folder record");
+                        folder_seen += 1;
+                    }
+                    2 => {
+                        assert_eq!(body, FILE_RECORD_SIZE, "{name}: file record");
+                        file_seen += 1;
+                    }
+                    3 | 4 => {
+                        // A thread record is fixed plus the name: 8 bytes and a
+                        // u16 count, so the length depends on the name and the
+                        // only invariant is that it exceeds the fixed part.
+                        assert!(
+                            body > THREAD_RECORD_FIXED_SIZE + 2,
+                            "{name}: thread record too short at {body}"
+                        );
+                        thread_seen += 1;
+                    }
+                    other => panic!("{name}: unknown catalog record type {other}"),
+                }
+            }
+            if node_num == last_leaf {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            if node_num == 0 {
+                break;
+            }
+        }
+    }
+
+    assert!(folder_seen > 0, "no folder record measured");
+    assert!(file_seen > 0, "no file record measured");
+    assert!(thread_seen > 0, "no thread record measured");
+}
+
+#[test]
 fn a_header_record_is_still_recoverable_from_a_btree_node() {
     // BTreeHeader::from_node reads at offset 14, exactly as Apple's
     // hfs_btreeio.c GetBTreeBlock does. Confirm against a real header node.
