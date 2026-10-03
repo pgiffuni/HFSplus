@@ -67,6 +67,10 @@ from mktorn import (  # noqa: E402
 )
 
 VOLUME_HEADER_OFFSET = 1024
+
+# The CNIDs `main` hands out, in the order it creates the files. Hardcoded here so
+# the in-place patcher can find a record without constructing a Writer.
+FRAGMENTED_CNID = 18
 NEXT_CATALOG_ID_OFFSET = 64
 # `struct HFSPlusVolumeHeader` has four date fields (create, modify, backup,
 # checked), so fileCount is at 32 and blockSize at 40.
@@ -140,6 +144,14 @@ def set_allocated(img: bytearray, bitmap_block: int, blocks, allocated: bool) ->
             img[at] |= mask
         else:
             img[at] &= 0xFF ^ mask
+
+
+def u16_from_be(img, at: int) -> int:
+    return struct.unpack_from(">H", img, at)[0]
+
+
+def u32_from_be(img, at: int) -> int:
+    return struct.unpack_from(">I", img, at)[0]
 
 
 def block_pattern(block_number: int, block_size: int) -> bytes:
@@ -312,6 +324,24 @@ class Writer:
         items.append(new_key)
         return len(items) - 1
 
+    def with_file_record(self, cnid, edit):
+        """Run `edit` on `cnid`'s file record body.
+
+        `edit` is handed the body's absolute offset, so a patch is written
+        straight through rather than copied out and back.
+        """
+        bs = self.block_size
+        base = (self.catalog_start + 1) * bs
+        count = u16_from_be(self.img, base + 10)
+        for i in range(count):
+            at = u16_from_be(self.img, base + bs - 2 * (i + 1))
+            key_len = u16_from_be(self.img, base + at)
+            body = base + at + 2 + key_len
+            if u32_from_be(self.img, body + 8) == cnid:
+                edit(body)
+                return
+        sys.exit(f"error: {cnid}: file record not found")
+
     def bump_root_valence(self, added: int) -> None:
         """Add `added` to the root folder record's `valence`.
 
@@ -468,20 +498,76 @@ class Writer:
         return len(self.records) - self._added
 
 
+def break_fork_rule(img, args):
+    """Break one of Apple's two fork-size inequalities, for the checker tests.
+
+    `logical <= physical` is the non-sparse rule: an HFS+ data fork has no
+    representation for a hole, so a logical size beyond the blocks behind it is a
+    corrupt record rather than a sparse file. The other direction,
+    `physical <= described_blocks * block_size`, says the record does not claim
+    more blocks than its extents account for.
+
+    Neither had a fixture, and both are invisible on the corpus: `mkfs.hfsplus`
+    creates no files, and the ones this generator makes satisfy both by
+    construction.
+
+    Patched in place rather than by re-packing the catalog leaf: only a few bytes
+    change, and rewriting the node would mean rebuilding its offset array for no
+    reason -- and getting that wrong would turn a fork fault into a catalog fault.
+
+    Mining reference: lib_fsck_hfs/dfalib/CatalogCheck.c CheckFileData, which
+    reports E_LEOF for the first and E_PEOF for the second.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    cat = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 272 + 16)[0]
+    base = (cat + 1) * bs
+    count = u16_from_be(img, base + 10)
+
+    found = False
+    for i in range(count):
+        at = u16_from_be(img, base + bs - 2 * (i + 1))
+        key_len = u16_from_be(img, base + at)
+        body = base + at + 2 + key_len
+        if u32_from_be(img, body + 8) != FRAGMENTED_CNID:
+            continue
+        found = True
+        if args.fork_logical:
+            struct.pack_into(">Q", img, body + 88, args.fork_logical)
+            print(f"  fragmented.bin: logicalSize -> {args.fork_logical} bytes "
+                  f"against {u32_from_be(img, body + 88 + 12)} allocated blocks")
+        if args.fork_total:
+            struct.pack_into(">I", img, body + 88 + 12, args.fork_total)
+            print(f"  fragmented.bin: totalBlocks -> {args.fork_total} "
+                  f"against {u32_from_be(img, body + 88 + 16)} described inline")
+    if not found:
+        sys.exit(f"error: {FRAGMENTED_CNID}: file record not found")
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source")
     ap.add_argument("dest")
     ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--fork-logical", type=int, default=0,
+                    help="set a file record's data-fork logicalSize")
+    ap.add_argument("--fork-total", type=int, default=0,
+                    help="set a file record's data-fork totalBlocks")
     args = ap.parse_args()
 
     with open(args.source, "rb") as f:
         img = bytearray(f.read())
 
-    w = Writer(img)
     if img[1024:1026] not in (b"\x48\x2b", b"\x48\x58"):
         sys.exit(f"error: {args.source} is not an HFS+ volume")
 
+    # A fork-rule patch changes a few bytes in place and needs no writer.
+    if args.fork_logical or args.fork_total:
+        return break_fork_rule(img, args)
+
+    w = Writer(img)
     bs = w.block_size
     added_before = len(w.records)
 

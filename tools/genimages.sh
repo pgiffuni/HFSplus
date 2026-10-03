@@ -194,6 +194,17 @@ if [[ -f tools/mkfiles.py ]] && [[ -f tests/images/generated/journaled-hfsplus.i
     tests/images/generated/journal-with-files.img
 fi
 
+# Two files whose data fork breaks one of Apple's two size inequalities. Neither
+# had a fixture: mkfs.hfsplus creates no files, and the ones mkfiles.py makes
+# satisfy both by construction. Patched in place, so the catalog leaf is not
+# rebuilt -- re-packing it would turn a fork fault into a catalog fault.
+if [[ -f tests/images/generated/journal-with-files.img ]]; then
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/replayed/fork-logical-too-large.img --fork-logical 100000
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/replayed/fork-total-too-large.img --fork-total 99
+fi
+
 echo "verifying every image with the independent checker"
 fail=0
 for img in "${OUT_DIR}"/*.img; do
