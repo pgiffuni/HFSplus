@@ -45,6 +45,9 @@ fn replayed() -> Vec<(&'static str, u64, &'static str)> {
     ]
 }
 
+/// Image holding three transactions, two of which rewrite the same block.
+const MULTI: &str = "journal-replay-multi";
+
 fn image_path(name: &str) -> std::path::PathBuf {
     common::repo_root().join("tests/images/replayed").join(format!("{name}.img"))
 }
@@ -263,10 +266,15 @@ fn the_independent_checker_accepts_a_replayed_image() {
 }
 
 #[test]
-fn a_corrupted_transaction_is_refused_rather_than_replayed() {
-    // A block whose recorded checksum does not match its data must stop the
-    // replay. Silently replaying it would present corrupted metadata as if it
-    // were current, which is the one failure mode a journal exists to prevent.
+fn a_corrupted_block_truncates_replay_rather_than_being_applied() {
+    // Presenting corrupted metadata as if it were current is the one failure
+    // mode a journal exists to prevent. So a block failing its recorded checksum
+    // must not reach the overlay.
+    //
+    // Apple does not abandon the whole journal here: it restarts and replays
+    // only the transactions it considers known good. Since this image has a
+    // single transaction, the observable result is that nothing is replayed and
+    // the truncation is reported.
     let source = image_path("journal-replay-be");
     if !source.exists() {
         eprintln!("skipping: {} not built", source.display());
@@ -284,9 +292,9 @@ fn a_corrupted_transaction_is_refused_rather_than_replayed() {
     let journal_offset =
         u64::from_be_bytes(broken[jib_off + 36..jib_off + 44].try_into().unwrap()) as usize;
 
-    // The block data begins after the journal header and the block list, both of
-    // which are one block. Flip a byte in it.
-    let data_at = journal_offset + bs as usize + bs as usize;
+    // The block data follows the journal header and the block list, one block
+    // each. Flip a byte in it.
+    let data_at = journal_offset + 2 * bs as usize;
     broken[data_at + 64] ^= 0xFF;
 
     let mut probe = std::env::temp_dir();
@@ -296,18 +304,26 @@ fn a_corrupted_transaction_is_refused_rather_than_replayed() {
     let dev = FileDevice::open(&probe).expect("open probe");
     let vh = VolumeHeader::read_from(&dev).unwrap();
     let result = Journal::open(&dev, vh.journal_info_block, vh.block_size);
-    // Bound the borrow so the assertion below can inspect the outcome.
     let _ = std::fs::remove_file(&probe);
 
-    let outcome = match &result {
-        Ok(None) => "no journal".to_string(),
-        Ok(Some(j)) => format!("replayed {} block(s)", j.replayed_blocks().len()),
-        Err(e) => format!("{e}"),
-    };
-    assert!(
-        result.is_err() || matches!(&result, Ok(None)),
-        "a block failing its recorded checksum must not be replayed; got {outcome}"
-    );
+    match result {
+        Err(e) => panic!("a damaged journal must not refuse to open outright: {e}"),
+        Ok(None) => panic!("the journal should still be readable, with nothing replayed"),
+        Ok(Some(j)) => {
+            assert_eq!(
+                j.replayed_blocks().len(),
+                0,
+                "the corrupted block must not reach the overlay"
+            );
+            let (_, why) = j
+                .truncation()
+                .expect("the truncation must be reported, not silent");
+            assert!(
+                why.contains("checksum"),
+                "the reason should name the checksum, got {why:?}"
+            );
+        }
+    }
 }
 
 /// Byte offset of the volume header.
@@ -320,4 +336,165 @@ fn digest(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+#[test]
+fn multiple_transactions_are_walked_and_grouped() {
+    let ran = with_journal(MULTI, |journal| {
+        // Three block lists, each flagged BLHDR_FIRST_HEADER, so three
+        // transactions. Apple does not model transaction boundaries at all
+        // during replay; the grouping here comes from that flag.
+        assert_eq!(journal.transactions().len(), 3, "three transactions");
+        assert_eq!(journal.block_lists(), 3, "one block list each");
+
+        for (i, t) in journal.transactions().iter().enumerate() {
+            assert_eq!(t.sequence_num as usize, i + 1, "sequence numbers ascend");
+            assert_eq!(t.block_lists.len(), 1, "transaction {i} has one block list");
+            assert!(t.offset < t.end, "transaction {i} advances");
+        }
+        // Offsets must be contiguous and ascending across transactions.
+        for pair in journal.transactions().windows(2) {
+            assert_eq!(pair[0].end, pair[1].offset, "transactions must abut");
+        }
+    });
+    assert!(ran, "{MULTI}: the image must be built");
+}
+
+#[test]
+fn a_later_transaction_supersedes_an_earlier_write_to_the_same_block() {
+    // Block 200 is written twice: once by the first transaction and once by the
+    // second. Replaying in journal order means the second write is the one a
+    // reader sees, which is what makes an unwound volume coherent.
+    let ran = with_journal(MULTI, |journal| {
+        // Three writes across two distinct blocks leave two overlay entries.
+        assert_eq!(journal.replayed_blocks().len(), 2, "200 and 250");
+
+        let b200 = journal
+            .replayed_blocks()
+            .iter()
+            .find(|b| b.device_block == 200)
+            .expect("block 200 must be replayed");
+        let text = String::from_utf8_lossy(&b200.data);
+        assert!(
+            text.starts_with("second write to block 200"),
+            "the later write must win, got {:?}",
+            &text[..26.min(text.len())]
+        );
+
+        let b250 = journal
+            .replayed_blocks()
+            .iter()
+            .find(|b| b.device_block == 250)
+            .expect("block 250 must be replayed");
+        assert!(String::from_utf8_lossy(&b250.data).starts_with("a third block"));
+    });
+    assert!(ran, "{MULTI}: the image must be built");
+}
+
+#[test]
+fn replaying_a_multi_transaction_journal_never_modifies_the_image() {
+    let path = image_path(MULTI);
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let before = digest(&std::fs::read(&path).unwrap());
+
+    let dev = FileDevice::open(&path).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    {
+        let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.transactions().len(), 3);
+        let overlaid = journal.into_device();
+        let mut buf = vec![0u8; 4096];
+        overlaid.read_at(200 * 4096, &mut buf).unwrap();
+        assert!(String::from_utf8_lossy(&buf).starts_with("second write to block 200"));
+    }
+    drop(dev);
+
+    assert_eq!(
+        before,
+        digest(&std::fs::read(&path).unwrap()),
+        "{MULTI}: replay modified the source image"
+    );
+}
+
+#[test]
+fn a_damaged_journal_truncates_rather_than_being_abandoned() {
+    // Apple stops at the bad block list and keeps what came before, because its
+    // own comment says replaying as much as possible leaves the filesystem in a
+    // better state than replaying nothing. A read-only mount that refused the
+    // whole journal would show a filesystem missing *every* recent change.
+    let path = image_path(MULTI);
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let mut broken = std::fs::read(&path).unwrap();
+
+    let vh_off = VOLUME_HEADER_OFFSET as usize;
+    let be32 = |buf: &[u8], at: usize| u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+    let bs = be32(&broken, vh_off + 40);
+    let jib_block = be32(&broken, vh_off + 12);
+    let jib_off = jib_block as usize * bs as usize;
+    let journal_offset =
+        u64::from_be_bytes(broken[jib_off + 36..jib_off + 44].try_into().unwrap()) as usize;
+
+    // Layout: journal header (one block), then per transaction a block list
+    // (one block) followed by its data (one block). So the *second*
+    // transaction's block list is at three blocks past the journal offset.
+    // The damaged byte is inside the header fields the checksum covers.
+    let second_blhdr = journal_offset + 3 * bs as usize;
+    broken[second_blhdr + 20] ^= 0xFF;
+
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("hfsplus-truncated-{}.img", std::process::id()));
+    std::fs::write(&probe, &broken).unwrap();
+
+    let dev = FileDevice::open(&probe).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let result = Journal::open(&dev, vh.journal_info_block, vh.block_size);
+    let _ = std::fs::remove_file(&probe);
+
+    let journal = result
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| panic!("{MULTI}: the journal before the damage is readable"));
+
+    // The first transaction survives: one block replayed, and the damage is
+    // reported rather than swallowed.
+    assert_eq!(
+        journal.transactions().len(),
+        1,
+        "replay must stop at the damaged block list"
+    );
+    assert_eq!(journal.replayed_blocks().len(), 1, "the first block survives");
+    let (at, why) = journal
+        .truncation()
+        .expect("truncation must be reported, not silent");
+    // Offsets are journal-relative, matching header.start and header.end, so
+    // the first transaction's block list is at one block.
+    assert!(
+        at >= bs as u64,
+        "truncation must be at the damage, not at the first transaction; got {at}"
+    );
+    assert!(
+        why.contains("checksum"),
+        "the reason should name the checksum, got {why:?}"
+    );
+
+    // The surviving block must be the first transaction's write, not a mixture.
+    let b200 = journal
+        .replayed_blocks()
+        .iter()
+        .find(|b| b.device_block == 200)
+        .expect("block 200 from the surviving transaction");
+    let text = String::from_utf8_lossy(&b200.data);
+    assert!(
+        text.starts_with("first write to block 200"),
+        "the surviving transaction's own data must be intact, got {:?}",
+        &text[..26.min(text.len())]
+    );
 }
