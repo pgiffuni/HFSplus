@@ -395,18 +395,47 @@ if ( btreePtr->maxKeyLength > 40 )
 
 So the threshold is **strictly greater than 40**. Measured across the corpus:
 catalog `maxKeyLength` is 516 and attributes 264, so both are big-key trees;
-the extents tree's 8-byte keys are not. `has_big_keys` in
+the extents tree's 10-byte keys are not. `has_big_keys` in
 `src/btree/key.rs` follows Apple's rule rather than the stored bit alone.
+
+No corpus volume carries an extents or attributes tree -- `mkfs.hfsplus` creates
+neither, because no file is ever large enough to overflow -- so those two values
+come from `core/hfs_format.h` rather than from measurement.
 
 ## Key maximum lengths
 
 | Tree | Constant | Value |
 | --- | --- | --- |
 | catalog | `kHFSPlusCatalogKeyMaximumLength` | 516 (`u32 parentID` + `HFSUniStr255` 512) |
-| extents | `kHFSPlusExtentKeyMaximumLength` | 8 (`u32 fileID` + `u32 startBlock`) |
+| extents | `kHFSPlusExtentKeyMaximumLength` | 10 (`u8 forkType` + `u8 pad` + `u32 fileID` + `u32 startBlock`) |
 | attributes | `kHFSPlusAttrKeyMaximumLength` | 264 |
 
 All three are defined in `core/hfs_format.h` as `sizeof(Key) - sizeof(u_int16_t)`.
+
+The extents value is the one worth stating in full, because the key is short
+enough that the two middle fields look like padding and are not:
+
+```c
+struct HFSPlusExtentKey {
+    u_int16_t  keyLength;   /* length of key, excluding this field */
+    u_int8_t   forkType;    /* 0 = data fork, FF = resource fork */
+    u_int8_t   pad;         /* make the other fields align on 32-bit */
+    u_int32_t  fileID;
+    u_int32_t  startBlock;
+} __attribute__((aligned(2), packed));
+```
+
+`forkType` is what keeps the two forks of one file apart, since both share a
+`fileID` and live in the same tree. Omitting it -- as an earlier revision here
+did -- puts `fileID` at offset 2, where the fork type and pad byte actually are,
+so every overflow lookup decodes the wrong key and matches nothing. A file past
+its eighth extent then reads as all holes.
+
+The keys are ordered by `fileID` and then `startBlock`; `forkType` is not part
+of the ordering, so a file's data and resource extents sort adjacently.
+`startBlock` is a *file* allocation block number, not a physical one, so the
+second group of a fork with eight inline extents is keyed 8, the third 16, and
+so on.
 
 ## Case sensitivity comes from keyCompareType, not the signature
 
