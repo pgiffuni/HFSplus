@@ -56,6 +56,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_debug_implementations)]
 
+pub mod alloc;
 pub mod blockdev;
 pub mod btree;
 pub mod catalog;

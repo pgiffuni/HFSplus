@@ -107,6 +107,20 @@ pub enum Error {
         message: String,
     },
 
+    /// There is no free space for the requested number of blocks.
+    ///
+    /// Distinct from [`Error::OutOfRange`] because a caller retries differently:
+    /// an out-of-range block is a bug in the caller, while a full volume is
+    /// ordinary. Mining reference: Apple `core/VolumeAllocation.c` returns
+    /// `dskFulErr` from `BlockFindAny` when no extent is large enough, and the
+    /// callers distinguish it from every other error explicitly.
+    NoSpace {
+        /// Blocks that were asked for.
+        requested: u32,
+        /// Blocks actually free.
+        available: u64,
+    },
+
     /// The operation requires write access but the device was opened
     /// read-only.
     ReadOnly,
@@ -131,6 +145,11 @@ impl Error {
     /// Map an underlying [`std::io::Error`] into [`Error::Io`].
     pub fn io(err: &std::io::Error) -> Self {
         Error::Io { message: err.to_string() }
+    }
+
+    /// Convenience constructor for [`Error::NoSpace`].
+    pub fn no_space(requested: u32, available: u64) -> Self {
+        Error::NoSpace { requested, available }
     }
 }
 
@@ -159,6 +178,10 @@ impl fmt::Display for Error {
             Error::NotFound { what } => write!(f, "{what} not present on this volume"),
             Error::NotFoundKey { key } => write!(f, "no such entry: {key}"),
             Error::Io { message } => write!(f, "i/o error: {message}"),
+            Error::NoSpace { requested, available } => write!(
+                f,
+                "no space: {requested} blocks requested, {available} free"
+            ),
             Error::ReadOnly => write!(f, "filesystem opened read-only"),
         }
     }
