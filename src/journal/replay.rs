@@ -450,7 +450,20 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         // journal reports, and the rule skips the comparison in that case.
         let mut last_sequence_num: u32 = 0;
 
-        while offset < header.end {
+        // Walk to the journal's real end, not `header.end`.
+        //
+        // Apple's loop is `while (check_past_jnl_end || jnl->jhdr->start !=
+        // jnl->jhdr->end)`, and `check_past_jnl_end` is cleared only for a
+        // pre-sequence-number journal. So when sequence numbers are in use it
+        // keeps going past `end`, printing "examining extra transactions" -- the
+        // header's `end` can be stale, which is what a crash between writing a
+        // transaction and updating the header leaves behind.
+        //
+        // Stopping at `end` here would silently under-recover exactly that case.
+        //
+        // Mining reference: `core/hfs_journal.c` `replay_journal`.
+        let mut past_end = false;
+        while offset < header.size {
             guard += 1;
             if guard > MAX_BLOCK_LISTS {
                 return Err(Error::invalid(
@@ -464,26 +477,62 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 .checked_add(blhdr_size)
                 .ok_or(Error::overflow("block list cursor"))?;
             let bytes = self.read_journal(offset, header.blhdr_size as usize)?;
+
+            // Past `end`, an empty list means the journal's real transactions
+            // have run out -- it is not damage, and `parse_at` rightly refuses it
+            // before the checks below can tell the difference. So the walk stops
+            // here rather than reporting a truncation that never happened.
+            if offset >= header.end && header.start <= header.end && bytes.len() >= 4 {
+                let raw_num = u16::from_be_bytes([bytes[2], bytes[3]]);
+                if raw_num == 0 {
+                    break;
+                }
+            }
+
             let blhdr = BlockListHeader::parse_at(&bytes, data_offset)?;
+
+            // Past `end`, a list that does not hold together is not damage: it is
+            // where the journal's real transactions stop. Apple reaches the same
+            // place by truncating there and moving `end` up, but truncating a
+            // well-formed journal at the zeroed block just past its last
+            // transaction would report damage that does not exist. Before `end` it
+            // is damage, and is truncated.
+            let at_or_past_end = offset >= header.end && header.start <= header.end;
+
+            // A pre-sequence-number journal cannot be walked past `end`: Apple
+            // clamps `start = end` and stops, because there is no sequence number
+            // to tell a real transaction from a stale header.
+            if at_or_past_end && last_sequence_num == 0 {
+                break;
+            }
 
             // Validate as Apple does, before any of its contents are used.
             if blhdr.num_blocks == 0 || blhdr.num_blocks > blhdr.max_blocks {
+                if past_end {
+                    break;
+                }
                 self.truncate_at(offset, "block list counts are inconsistent");
                 break;
             }
             if blhdr.bytes_used == 0 {
+                if past_end {
+                    break;
+                }
                 self.truncate_at(offset, "block list carries no data");
                 break;
             }
             if !blhdr.checksum_matches(&bytes) {
                 // Apple truncates here rather than abandoning the replay.
+                if past_end {
+                    break;
+                }
                 self.truncate_at(offset, "block list header checksum mismatch");
                 break;
             }
             let used = u64::from(blhdr.bytes_used);
             let runs_past_end = data_offset
                 .checked_add(used)
-                .map(|end| end > header.end)
+                .map(|end| end > header.size)
                 .unwrap_or(true);
             if runs_past_end {
                 self.truncate_at(offset, "block list data runs past the journal end");
@@ -541,6 +590,10 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                     block_lists: Vec::new(),
                 });
             }
+
+            // Mark where we are relative to the header's `end`, so the checks
+            // above can tell damage from the end of the journal.
+            past_end = data_offset > header.end;
 
             let next = data_offset.checked_add(used).ok_or(Error::overflow("block list cursor"))?;
             if next <= offset {
