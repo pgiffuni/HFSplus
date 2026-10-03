@@ -605,3 +605,56 @@ fn a_block_list_header_size_too_small_to_hold_one_is_refused() {
         "a block list header needs only its fixed part to be read"
     );
 }
+
+#[test]
+fn a_journal_header_pointing_at_its_own_header_is_refused() {
+    // `start` and `end` must both be positive and within the journal. Offset
+    // zero of a journal *is* its header, so a `start` of 0 would have the walk
+    // parse the header as a block list and report whatever counts it found.
+    //
+    // Apple's CHECK_JOURNAL panics on exactly these, so a volume reaching them is
+    // corrupt by definition rather than unusual.
+    //
+    // Mining reference: `CHECK_JOURNAL` in `core/hfs_journal.c`.
+    for (start, end, what) in [
+        (0u64, 12288u64, "start at the header"),
+        (4096, 0, "end at the header"),
+        (524288, 12288, "start beyond the journal"),
+        (4096, 524289, "end beyond the journal"),
+    ] {
+        let header = hfsplus::journal::info::JournalHeader {
+            magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
+            endian: hfsplus::journal::info::ENDIAN_MAGIC,
+            start,
+            end,
+            size: 524288,
+            blhdr_size: 4096,
+            checksum: 0,
+            jhdr_size: 4096,
+            sequence_num: 1,
+        };
+        let err = header
+            .validate(524288)
+            .expect_err(&format!("{what} must be refused"));
+        let text = err.to_string();
+        assert!(
+            text.contains("start") || text.contains("end"),
+            "{what}: the error must name the field, got {text:?}"
+        );
+    }
+
+    // And a sound header still passes, so the checks are not simply refusing
+    // everything.
+    let sound = hfsplus::journal::info::JournalHeader {
+        magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
+        endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        start: 4096,
+        end: 12288,
+        size: 524288,
+        blhdr_size: 4096,
+        checksum: 0,
+        jhdr_size: 4096,
+        sequence_num: 1,
+    };
+    assert!(sound.validate(524288).is_ok(), "a sound header must validate");
+}
