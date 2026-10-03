@@ -224,6 +224,45 @@ impl<'a> Node<'a> {
         self.desc.kind
     }
 
+    /// Node height: zero for the header and map nodes, one more than the parent
+    /// for the rest.
+    pub fn height(&self) -> u8 {
+        self.desc.height
+    }
+
+    /// The child node number stored at `index` in an index node.
+    ///
+    /// An index record is a key followed by a `u32` node number, so the child
+    /// sits immediately after the key. Refuses a leaf node, which has no
+    /// children, and an index beyond the node's records.
+    ///
+    /// Mining reference: `lib_fsck_hfs/dfalib/BTreeNodeOps.c` `GetChildNodeNum`
+    /// seeks to the record, steps past `CalcKeySize`, and reads a `UInt32`.
+    pub fn child(&self, index: u16) -> Result<u32> {
+        if self.kind() != NodeKind::Index {
+            return Err(Error::invalid(
+                "node kind",
+                "only an index node has child node numbers",
+            ));
+        }
+        let record = self.record(index)?;
+        let key_size = key_size_on_disk(record)?;
+        let at = key_size;
+        if at + 4 > record.len() {
+            return Err(Error::Truncated {
+                what: "index record",
+                needed: at + 4,
+                available: record.len(),
+            });
+        }
+        Ok(u32::from_be_bytes([
+            record[at],
+            record[at + 1],
+            record[at + 2],
+            record[at + 3],
+        ]))
+    }
+
     /// Number of records.
     pub fn num_records(&self) -> u16 {
         self.desc.num_records
@@ -333,6 +372,30 @@ impl<'a> Node<'a> {
             .u16(at)
             .map_err(|_| Error::invalid("btree offset array", "offset array runs past the node"))
     }
+}
+
+/// Byte size of the key at the head of a node record, prefix included.
+///
+/// A HFS+ key's `keyLength` excludes the length field itself, so the record's key
+/// occupies `keyLength + 2` bytes. Whether the length field is one byte or two
+/// depends on the tree's `kBTBigKeysMask`, which the caller knows and this does
+/// not -- so the *declared* size is used, and a caller walking a short-key tree
+/// must not use this for a key whose length would fit in one byte.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/BTreeNodeOps.c` `CalcKeySize` adds
+/// `sizeof(UInt16)` when `kBTBigKeysMask` is set.
+fn key_size_on_disk(record: &[u8]) -> Result<usize> {
+    if record.len() < 2 {
+        return Err(Error::Truncated {
+            what: "node record key",
+            needed: 2,
+            available: record.len(),
+        });
+    }
+    let declared = u16::from_be_bytes([record[0], record[1]]) as usize;
+    declared
+        .checked_add(2)
+        .ok_or_else(|| Error::overflow("node record key length"))
 }
 
 #[cfg(test)]
