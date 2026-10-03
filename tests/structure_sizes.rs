@@ -190,10 +190,28 @@ fn the_volume_header_is_one_sector_and_the_forks_follow_it() {
 }
 
 /// `struct JournalInfoBlock`: `u32 flags + u32 device_signature[8] + u64 offset
-/// + u64 size + uuid + char[48] + reserved`.
+/// + u64 size + uuid_string_t + char[48] + reserved`.
+///
+/// `JIB_RESERVED_SIZE` is `(32 * sizeof(u_int32_t)) - sizeof(uuid_string_t) - 48`
+/// — Apple deliberately shrank the reserved field so that adding the UUID and the
+/// serial number did not change the struct's size. With a 16-byte
+/// `uuid_string_t` that is 64.
 #[test]
-fn the_journal_info_block_is_180_bytes() {
-    let size = 4 + 8 * 4 + 8 + 8 + 16 + 48 + 64;
+fn the_journal_info_block_is_180_bytes_with_the_reserved_field_shrunk() {
+    const UUID_STRING: usize = 16;
+    const RESERVED: usize = 32 * 4 - UUID_STRING - 48;
+
+    let size = 4 + 8 * 4 + 8 + 8 + UUID_STRING + 48 + RESERVED;
+    assert_eq!(RESERVED, 64, "128 less the UUID and the 48-byte serial number");
     assert_eq!(size, 180);
     assert_eq!(JOURNAL_INFO_BLOCK_SIZE, size);
+
+    // The offsets the parser actually reads, and the two the decomposition above
+    // places. Getting the UUID's offset wrong by 21 is possible if the reserved
+    // field is assumed to be a fixed 43 or 37 bytes instead of being derived,
+    // and nothing else in the crate would notice.
+    use hfsplus::journal::info::{JIB_OFFSET_OFFSET, JIB_SIZE_OFFSET};
+    assert_eq!(JIB_OFFSET_OFFSET, 36);
+    assert_eq!(JIB_SIZE_OFFSET, 44);
+    assert_eq!(JIB_SIZE_OFFSET + 8, 52, "which is where the UUID begins");
 }

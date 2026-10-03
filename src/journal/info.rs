@@ -58,10 +58,23 @@ pub const END_BLK_NUM: u64 = 0xFFFF_FFFF;
 
 /// Byte size of `struct JournalInfoBlock`.
 ///
-/// Mining reference: `core/hfs_format.h` computes `JIB_RESERVED_SIZE` so that the
-/// struct totals `32 * sizeof(u_int32_t)` for the leading fields, plus the UUID
-/// and serial number. The whole struct occupies one allocation block; this is the
-/// length of the declared fields, not of the block.
+/// Mining reference: `core/hfs_format.h` computes `JIB_RESERVED_SIZE` as
+/// `(32 * sizeof(u_int32_t)) - sizeof(uuid_string_t) - 48`, so that adding
+/// `ext_jnl_uuid` and `machine_serial_num` did not change the struct's size. With
+/// a 16-byte `uuid_string_t` that is 128 - 16 - 48 = 64, and the fields are:
+///
+/// ```text
+/// u_int32_t  flags;                    //   0
+/// u_int32_t  device_signature[8];      //   4
+/// u_int64_t  offset;                   //  36
+/// u_int64_t  size;                     //  44
+/// uuid_string_t ext_jnl_uuid;          //  52, 16 bytes
+/// char       machine_serial_num[48];   //  68
+/// char       reserved[64];             // 116
+/// ```
+///
+/// The whole struct occupies one allocation block; this is the length of the
+/// declared fields, not of the block.
 ///
 /// What follows the struct inside that block is **not** zero, and reading it as
 /// if it were would be wrong in either direction. `newfs_hfs`'s `makehfs.c`
@@ -77,7 +90,7 @@ pub const END_BLK_NUM: u64 = 0xFFFF_FFFF;
 /// end of the 4096-byte block is zero. A reader that zero-fills the filler is
 /// fabricating bytes, and one that treats the filler as corruption is refusing a
 /// valid block.
-pub const JOURNAL_INFO_BLOCK_SIZE: usize = 4 + 32 + 8 + 8 + 37 + 48 + 43;
+pub const JOURNAL_INFO_BLOCK_SIZE: usize = 4 + 32 + 8 + 8 + 16 + 48 + 64;
 
 /// Byte offset of the journal's byte offset within the info block.
 pub const JIB_OFFSET_OFFSET: usize = 4 + 32;
