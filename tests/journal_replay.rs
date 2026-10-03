@@ -638,3 +638,130 @@ fn a_negative_block_number_is_refused() {
     }
 }
 
+
+
+#[test]
+fn a_stale_header_checksum_is_reported_but_not_fatal() {
+    // Apple computes the journal header checksum, compares it, and then mounts
+    // anyway: the `goto bad_journal` after the mismatch is commented out. So this
+    // must be a reported diagnostic, not a failure -- refusing would leave the
+    // filesystem missing every recent change.
+    //
+    // Mining reference: core/hfs_journal.c journal_open.
+    let source = image_path("journal-replay-be");
+    if !source.exists() {
+        eprintln!("skipping: {} not built", source.display());
+        return;
+    }
+    let mut stale = std::fs::read(&source).expect("read image");
+
+    let vh_off = VOLUME_HEADER_OFFSET as usize;
+    let be32 = |buf: &[u8], at: usize| {
+        u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+    };
+    let bs = be32(&stale, vh_off + 40) as usize;
+    let jib_block = be32(&stale, vh_off + 12);
+    let jib_off = jib_block as usize * bs;
+    let journal_offset =
+        u64::from_be_bytes(stale[jib_off + 36..jib_off + 44].try_into().unwrap()) as usize;
+
+    // Make the header inconsistent with its own stored checksum, without
+    // breaking the geometry checks that run first.
+    //
+    // `jhdr_size` is at offset 40, inside the 44 bytes the checksum covers.
+    // Doubling it to 8192 is still a plausible header size for a 512 KiB
+    // journal, so geometry validation passes and only the checksum notices --
+    // which is precisely the case Apple decided not to treat as fatal.
+    let current = be32(&stale, journal_offset + 40);
+    stale[journal_offset + 40..journal_offset + 44]
+        .copy_from_slice(&(current * 2).to_be_bytes());
+
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("hfsplus-stale-hdr-{}.img", std::process::id()));
+    std::fs::write(&probe, &stale).unwrap();
+
+    let dev = FileDevice::open(&probe).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let result = Journal::open(&dev, vh.journal_info_block, vh.block_size);
+    let _ = std::fs::remove_file(&probe);
+
+    let journal = match result {
+        Ok(Some(j)) => j,
+        Ok(None) => panic!("a stale header checksum must not hide the journal"),
+        Err(e) => panic!("a stale header checksum must not be fatal: {e}"),
+    };
+
+    assert_eq!(
+        journal.header_checksum_ok(),
+        Some(false),
+        "the stale checksum must be reported"
+    );
+    // The header is still structurally sound: the diagnostic is separate from
+    // geometry validation, which is the point.
+    assert_eq!(journal.header().unwrap().jhdr_size, current * 2);
+    // And the journal is still usable: the block was replayed.
+    assert_eq!(journal.replayed_blocks().len(), 1, "replay still happens");
+}
+
+#[test]
+fn a_good_header_checksum_is_reported_as_ok() {
+    let path = image_path("journal-replay-be");
+    if !path.exists() {
+        return;
+    }
+    let dev = FileDevice::open(&path).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .unwrap()
+        .unwrap();
+    assert_eq!(journal.header_checksum_ok(), Some(true));
+}
+
+#[test]
+fn an_uninitialised_journal_reports_no_header_checksum() {
+    // Nothing was written, so there is nothing to check. Reporting `false` would
+    // be a lie about a checksum that does not exist.
+    let path = common::image("journaled-hfsplus");
+    if !path.exists() {
+        return;
+    }
+    let dev = FileDevice::open(&path).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .unwrap()
+        .expect("a journaled volume has a journal");
+    assert!(journal.header().is_none());
+    assert_eq!(journal.header_checksum_ok(), None);
+}
+
+#[test]
+fn a_journal_smaller_than_the_probe_is_still_read_without_overrunning_the_image() {
+    // The header probe used to have an artificial 512-byte floor, which could ask
+    // the device for bytes a small journal near the end of an image does not
+    // contain. A journal that is smaller than the header must produce a clean
+    // "no header here", not a confusing truncation.
+    use hfsplus::blockdev::MemoryDevice;
+
+    let block_size = 4096u32;
+    let mut dev = MemoryDevice::zeroed(64 * 1024);
+
+    // A journal of 16 bytes at the very end of the device.
+    let journal_offset = 64 * 1024 - 16u64;
+    let mut info = vec![0u8; block_size as usize];
+    info[0..4].copy_from_slice(&0x0000_0001u32.to_be_bytes()); // in-filesystem
+    info[36..44].copy_from_slice(&journal_offset.to_be_bytes());
+    info[44..52].copy_from_slice(&16u64.to_be_bytes());
+    dev.as_mut_slice()[4096..8192].copy_from_slice(&info);
+
+    // The journal area is too small to hold a header, so there is nothing to
+    // replay -- but opening must not ask the device for bytes it does not have.
+    let result = Journal::open(&dev, 1, block_size);
+    match result {
+        Err(_) => {}
+        Ok(None) => {}
+        Ok(Some(j)) => assert!(
+            j.header().is_none() && j.replayed_blocks().is_empty(),
+            "a journal with no room for a header must replay nothing"
+        ),
+    }
+}
