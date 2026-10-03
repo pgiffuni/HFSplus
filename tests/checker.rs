@@ -400,6 +400,94 @@ fn a_node_nothing_points_at_that_is_not_erased_is_reported() {
     );
 }
 
+#[test]
+fn a_tree_needing_the_short_key_form_is_reported_rather_than_walked() {
+    // Every Apple-written tree sets kBTBigKeysMask, so this state cannot come
+    // from `mkfs.hfsplus` or `newfs_hfs`. It is expressible, though, and this
+    // implementation always decodes a 16-bit key length -- so walking such a tree
+    // would read a valid-looking key out of the wrong bytes.
+    //
+    // Clearing the bit alone is not enough: `has_big_keys` ORs in
+    // `maxKeyLength > 40`, and the catalog's keys are 516. Both have to go, so the
+    // tree is *consistently* short-key.
+    let image = break_image("journal-with-files", "shortkey", |img| {
+        // The extents tree, whose keys are 10 bytes -- short enough to use the
+        // 8-bit form without contradicting anything.
+        let bs = block_size(img);
+        let extents_start = u32::from_be_bytes([
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 16],
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 17],
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 18],
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 19],
+        ]);
+        let base = extents_start as usize * bs as usize;
+        // attributes sits at header offset 38, past the 14-byte descriptor.
+        let attrs_at = base + 14 + 38;
+        let attrs = u32::from_be_bytes([
+            img[attrs_at],
+            img[attrs_at + 1],
+            img[attrs_at + 2],
+            img[attrs_at + 3],
+        ]);
+        img[attrs_at..attrs_at + 4]
+            .copy_from_slice(&(attrs & !K_BT_BIG_KEYS_MASK).to_be_bytes());
+    });
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
+
+    assert_eq!(
+        report.key_width,
+        vec!["extents"],
+        "only the extents tree was made short-key, and its keys are short enough for it"
+    );
+    // And it is reported rather than walked, so the walk findings are empty --
+    // nothing was decoded from a form this implementation cannot read.
+    assert!(
+        report.node_height.is_empty() && report.child_node.is_empty(),
+        "the tree must be refused, not walked: {:?}",
+        report
+    );
+}
+
+#[test]
+fn clearing_the_bit_on_a_long_key_tree_is_not_the_same_thing() {
+    // The negative control for the case above. The catalog's keys are 516 bytes,
+    // so `maxKeyLength > 40` forces the big-key reading regardless of the stored
+    // bit -- and that is exactly the rule that stops a corrupt attribute word from
+    // desynchronising key parsing.
+    let image = break_image("journal-with-files", "longkey-bit", |img| {
+        let bs = block_size(img);
+        let catalog_start = u32::from_be_bytes([
+            img[VOLUME_HEADER_OFFSET + 272 + 16],
+            img[VOLUME_HEADER_OFFSET + 272 + 17],
+            img[VOLUME_HEADER_OFFSET + 272 + 18],
+            img[VOLUME_HEADER_OFFSET + 272 + 19],
+        ]);
+        let attrs_at = catalog_start as usize * bs as usize + 14 + 38;
+        let attrs = u32::from_be_bytes([
+            img[attrs_at],
+            img[attrs_at + 1],
+            img[attrs_at + 2],
+            img[attrs_at + 3],
+        ]);
+        img[attrs_at..attrs_at + 4]
+            .copy_from_slice(&(attrs & !K_BT_BIG_KEYS_MASK).to_be_bytes());
+    });
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
+
+    assert!(
+        report.key_width.is_empty(),
+        "a 516-byte maxKeyLength forces the big-key form whatever the bit says, \
+         so this is not a short-key tree and must not be reported as one"
+    );
+    assert!(
+        report.key_length.is_empty() && report.key_order.is_empty(),
+        "and the catalog must still read as it did: {:?}",
+        report
+    );
+}
+
 // --- Agreement with an independent implementation ------------------------
 
 /// The strongest evidence available that these checks mean what they claim: the
@@ -627,6 +715,8 @@ fn put_u16(img: &mut [u8], at: usize, v: u16) {
 const FRAGMENTED_CNID: u32 = 18;
 /// CNID of the root folder, `kHFSRootFolderID`.
 const ROOT_CNID: u32 = 2;
+/// `kBTBigKeysMask`, which selects the 16-bit key-length form.
+const K_BT_BIG_KEYS_MASK: u32 = 0x0000_0002;
 /// Offset of a node's header record: past the 14-byte `BTNodeDescriptor`.
 const BT_HEADER_RECORD_OFFSET: usize = 14;
 /// CNID of `.journal`, whose thread record will be swapped with the one below.
