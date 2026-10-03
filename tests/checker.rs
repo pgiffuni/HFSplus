@@ -26,6 +26,8 @@
 
 mod common;
 
+use std::process::Command;
+
 use hfsplus::blockdev::FileDevice;
 use hfsplus::check::{self, CheckReport};
 use hfsplus::volume::Volume;
@@ -36,7 +38,21 @@ fn check_image(name: &str) -> Option<(CheckReport, u32)> {
         eprintln!("skipping {name}: {} not built", path.display());
         return None;
     }
-    let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {name}: {e}"));
+    check_path(&path)
+}
+
+/// Check a specific image, which must exist.
+///
+/// A path rather than a name, so a broken copy can live in the temporary
+/// directory. `None` means "out of scope" -- a signature this project refuses --
+/// and nothing else. A missing file is an error, so a test cannot skip itself
+/// into a vacuous pass by mistaking a deleted file for a clean one.
+fn check_path(path: &std::path::Path) -> Option<(CheckReport, u32)> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    if !path.exists() {
+        panic!("{}: check_path was given a file that does not exist", path.display());
+    }
+    let dev = FileDevice::open(path).unwrap_or_else(|e| panic!("open {name}: {e}"));
     // A volume outside this project's scope is refused structurally, and there
     // is nothing to check on it. That refusal is its own test.
     let vol = match Volume::open(&dev) {
@@ -100,10 +116,13 @@ fn a_block_marked_but_referenced_by_nothing_is_reported_orphaned() {
     // Built the way fsck itself detects it: a block marked in use that no fork's
     // extents point at. Here a data block is freed in the catalog without the
     // bitmap being updated.
-    let image = break_image("journal-with-files", |img| {
+    let mut freed = 0;
+    let image = break_image("journal-with-files", "orphan", |img| {
+        freed = fragmented_blocks(img)[0];
         free_fragmented_extent(img);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
 
     assert!(
         report.missing.is_empty(),
@@ -111,8 +130,8 @@ fn a_block_marked_but_referenced_by_nothing_is_reported_orphaned() {
         report.missing
     );
     assert!(
-        report.orphaned.contains(&fragmented_first_block(&image)),
-        "the freed block must be reported orphaned, got {:?}",
+        report.orphaned.contains(&freed),
+        "block {freed} must be reported orphaned, got {:?}",
         report.orphaned
     );
 }
@@ -121,11 +140,13 @@ fn a_block_marked_but_referenced_by_nothing_is_reported_orphaned() {
 fn a_fork_whose_extents_werent_marked_is_reported_missing() {
     // The other direction. A fork claims blocks the bitmap does not have marked,
     // which is what happens when extents are written without updating the map.
-    let image = break_image("journal-with-files", |img| {
-        let blocks = fragmented_blocks(img);
-        mark_only_in_catalog(img, blocks[0]);
+    let mut cleared = 0;
+    let image = break_image("journal-with-files", "missing", |img| {
+        cleared = fragmented_blocks(img)[0];
+        mark_only_in_catalog(img, cleared);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
 
     assert!(
         report.orphaned.is_empty(),
@@ -133,8 +154,8 @@ fn a_fork_whose_extents_werent_marked_is_reported_missing() {
         report.orphaned
     );
     assert!(
-        report.missing.contains(&fragmented_first_block(&image)),
-        "the unmarked block must be reported missing, got {:?}",
+        report.missing.contains(&cleared),
+        "block {cleared} must be reported missing, got {:?}",
         report.missing
     );
 }
@@ -144,10 +165,11 @@ fn a_fork_declaring_more_blocks_than_its_extents_describe_is_reported() {
     // `totalBlocks` is a separate field from the extents, so it can disagree with
     // them independently -- and the difference is exactly what the file's own
     // length check would hide.
-    let image = break_image("journal-with-files", |img| {
+    let image = break_image("journal-with-files", "totalblocks", |img| {
         inflate_total_blocks(img, FRAGMENTED_CNID, 7);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
 
     let entry = report
         .fork_block_count
@@ -166,10 +188,11 @@ fn a_next_catalog_id_behind_an_existing_cnid_is_reported() {
     // The consequence is worse than a bad number: a later create would be handed
     // a CNID that already identifies an existing file, and a lookup by CNID would
     // then find the wrong one.
-    let image = break_image("journal-with-files", |img| {
+    let image = break_image("journal-with-files", "nextcnid", |img| {
         set_next_catalog_id(img, FRAGMENTED_CNID);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
 
     let (next, highest) = report
         .next_cnid_reuse
@@ -202,10 +225,11 @@ fn swapping_two_adjacent_keys_is_reported_as_out_of_order() {
     // unordered records still returns an answer, and the answer is wrong. So the
     // corruption here is subtle by construction -- both records stay valid, and
     // the catalog still parses.
-    let image = break_image("journal-with-files", |img| {
+    let image = break_image("journal-with-files", "keyorder", |img| {
         swap_two_records(img, RECORD_A, RECORD_B);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
     assert!(
         !report.key_order.is_empty(),
         "swapped keys must be reported, got a clean report"
@@ -223,10 +247,11 @@ fn a_record_with_no_thread_record_is_reported() {
     // The object stays in the catalog and stays on the bitmap, so every other
     // check still passes. What changes is that it can no longer be reached by
     // name -- which a reader walking thread records would simply not see.
-    let image = break_image("journal-with-files", |img| {
+    let image = break_image("journal-with-files", "nothread", |img| {
         zero_thread_record(img, FRAGMENTED_CNID);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
     assert!(
         report.missing_thread.contains(&FRAGMENTED_CNID),
         "the object with no thread record must be named, got {:?}",
@@ -242,10 +267,11 @@ fn a_record_with_no_thread_record_is_reported() {
 fn a_folder_whose_valence_disagrees_is_reported() {
     // Valence is a count the folder record declares and the thread records imply.
     // Two independent statements about one fact, so a mismatch is real evidence.
-    let image = break_image("journal-with-files", |img| {
+    let image = break_image("journal-with-files", "valence", |img| {
         inflate_root_valence(img, 3);
     });
-    let Some((report, _)) = check_image(&image) else { return };
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
     let entry = report
         .valence
         .iter()
@@ -295,6 +321,139 @@ fn every_malformed_image_is_either_refused_or_flagged() {
     );
 }
 
+// --- Agreement with an independent implementation ------------------------
+
+/// The strongest evidence available that these checks mean what they claim: the
+/// two implementations agree about the same damage.
+///
+/// It is agreement, not proof. `fsck_hfs` is Apple's own code, but only as
+/// ported by `hfsprogs`, and `docs/dev-tools.md` records the checks that port
+/// does not carry. Where this project checks something the port does not, there
+/// is nothing to agree with, and the test says so rather than skipping quietly.
+#[test]
+fn the_checker_and_the_independent_checker_agree_about_damage() {
+    let Some(fsck) = common::fsck_available() else {
+        eprintln!("skipping: fsck.hfsplus not installed");
+        return;
+    };
+    if !common::image("journal-with-files").exists() {
+        eprintln!("skipping: journal-with-files not built");
+        return;
+    }
+
+    // Each case: a description, the bytes to break, and a phrase Apple's checker
+    // uses when it notices. The phrase is what makes this a comparison rather
+    // than two independent "not OK"s -- and it has to be Apple's wording, not
+    // ours, which is why valence matches on "Invalid directory item count".
+    struct Case {
+        what: &'static str,
+        break_it: fn(&mut [u8]),
+        apple_says: &'static str,
+    }
+
+    let cases = [
+        Case {
+            what: "a fork's block cleared from the bitmap",
+            break_it: clear_first_fragmented_block_bit,
+            apple_says: "under-allocation",
+        },
+        Case {
+            what: "two catalog keys swapped",
+            break_it: |img| swap_two_records(img, RECORD_A, RECORD_B),
+            apple_says: "Keys out of order",
+        },
+        Case {
+            what: "the root folder's valence inflated",
+            break_it: inflate_root_valence_raw,
+            // Apple calls the same finding a directory's "item count" rather
+            // than its valence. `valence` is the field name in
+            // `struct HFSPlusCatalogFolder`; the message is the checker's word for
+            // it, and matching on the field name would have failed.
+            apple_says: "Invalid directory item count",
+        },
+        Case {
+            what: "a thread record's type destroyed",
+            break_it: destroy_thread_record,
+            apple_says: "Invalid catalog record type",
+        },
+    ];
+
+    for case in cases {
+        let path = break_image("journal-with-files", "agree", |img| (case.break_it)(img));
+
+        // Ours first: an image we cannot even read is not a disagreement.
+        let ours = run_hfsck(&path);
+        assert_eq!(
+            ours, 3,
+            "{}: hfsck should report a finding, got exit {ours}",
+            case.what
+        );
+
+        let mut probe = std::env::temp_dir();
+        probe.push(format!("agree-probe-{}.img", std::process::id()));
+        std::fs::copy(&path, &probe).expect("copy for fsck");
+        let out = common::run_fsck(&fsck, &probe);
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_file(&probe);
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            !text.contains("appears to be OK"),
+            "{}: the independent checker accepted damage we rejected:\n{text}",
+            case.what
+        );
+        assert!(
+            text.contains(case.apple_says),
+            "{}: the independent checker did not report {:?}, only:\n{text}",
+            case.what,
+            case.apple_says
+        );
+    }
+}
+
+/// Run the `hfsck` binary and return its exit status.
+///
+/// Uses the binary Cargo built for this test rather than one on `PATH`, so this
+/// is testing the code in this repository.
+fn run_hfsck(path: &std::path::Path) -> i32 {
+    Command::new(env!("CARGO_BIN_EXE_hfsck"))
+        .arg(path)
+        .output()
+        .expect("run hfsck")
+        .status
+        .code()
+        .unwrap_or(-1)
+}
+
+/// Clear the bitmap bit for `fragmented.bin`'s first block, leaving the catalog
+/// alone -- the under-allocation direction.
+fn clear_first_fragmented_block_bit(img: &mut [u8]) {
+    let block = fragmented_blocks(img)[0];
+    let bs = block_size(img);
+    let allocation_block = u32::from_be_bytes([
+        img[VOLUME_HEADER_OFFSET + 112 + 16],
+        img[VOLUME_HEADER_OFFSET + 112 + 17],
+        img[VOLUME_HEADER_OFFSET + 112 + 18],
+        img[VOLUME_HEADER_OFFSET + 112 + 19],
+    ]);
+    let at = (allocation_block as usize) * (bs as usize) + (block / 8) as usize;
+    img[at] &= 0xFFu8 ^ (0x80u8 >> (block % 8));
+}
+
+/// Inflate the root folder's declared valence, for the agreement case.
+fn inflate_root_valence_raw(img: &mut [u8]) {
+    inflate_root_valence(img, 3);
+}
+
+/// Set a thread record's type to an unassigned value.
+fn destroy_thread_record(img: &mut [u8]) {
+    zero_thread_record(img, FRAGMENTED_CNID);
+}
+
 // --- Helpers for building broken copies ---------------------------------
 //
 // Each break is applied to a *copy* in the temporary directory, so the corpus
@@ -304,8 +463,6 @@ fn every_malformed_image_is_either_refused_or_flagged() {
 const FRAGMENTED_CNID: u32 = 18;
 /// CNID of the root folder, `kHFSRootFolderID`.
 const ROOT_CNID: u32 = 2;
-/// `sizeof(struct BTNodeDescriptor)`: where a leaf node's records begin.
-const NODE_DESCRIPTOR_SIZE: usize = 14;
 /// CNID of `.journal`, whose thread record will be swapped with the one below.
 const RECORD_A: u32 = 16;
 /// CNID of `.journal_info_block`.
@@ -335,25 +492,26 @@ fn catalog_start(img: &[u8]) -> u32 {
 ///
 /// The copy lives in the temp directory and is removed by the caller's image
 /// lookup failing on a second run, which is why each test re-derives its own.
-fn break_image(name: &str, break_it: impl FnOnce(&mut [u8])) -> String {
+/// Apply `break_it` to a copy of `name` in the temporary directory.
+///
+/// Returns the path. The copy is *not* removed: an earlier version deleted it
+/// immediately, and every caller then failed to find it and skipped its own
+/// assertions -- so four breakage tests passed without running. A caller that
+/// wants the file gone must say so, by removing it.
+fn break_image(name: &str, label: &str, break_it: impl FnOnce(&mut [u8])) -> std::path::PathBuf {
     let src = common::image(name);
-    if !src.exists() {
-        return name.to_string();
-    }
+    assert!(
+        src.exists(),
+        "{}: the source image must exist before it can be broken",
+        src.display()
+    );
     let mut img = std::fs::read(&src).unwrap_or_else(|e| panic!("read {name}: {e}"));
     break_it(&mut img);
 
-    // A stable name derived from the modification, so repeated runs do not collide.
-    let mut tag: u64 = 0xcbf2_9ce4_8422_2325;
-    for b in &img {
-        tag ^= *b as u64;
-        tag = tag.wrapping_mul(0x100_0000_01b3);
-    }
-    let stem = format!("{name}-broken-{tag:016x}");
-    let dest = common::image(&stem);
-    std::fs::write(&dest, &img).unwrap_or_else(|e| panic!("write {stem}: {e}"));
-    let _ = std::fs::remove_file(&dest);
-    stem
+    let mut dest = std::env::temp_dir();
+    dest.push(format!("hfsplus-{label}-{name}-{}.img", std::process::id()));
+    std::fs::write(&dest, &img).unwrap_or_else(|e| panic!("write {}: {e}", dest.display()));
+    dest
 }
 
 /// The eight physical blocks `fragmented.bin` occupies.
@@ -394,16 +552,6 @@ fn fragmented_blocks(img: &[u8]) -> Vec<u32> {
             .collect();
     }
     panic!("{FRAGMENTED_CNID}: fragmented.bin not found in the catalog");
-}
-
-/// The first block of `fragmented.bin`, read back from the broken copy.
-fn fragmented_first_block(broken: &str) -> u32 {
-    // The tests that need this know the block they broke, so read it from the
-    // image rather than hardcoding it: block numbers depend on the allocation
-    // order, which the generator is free to change.
-    let path = common::image(broken);
-    let img = std::fs::read(&path).unwrap_or_else(|e| panic!("read {broken}: {e}"));
-    fragmented_blocks(&img)[0]
 }
 
 /// Set `fragmented.bin`'s first extent to zero blocks, leaving the bitmap alone.
@@ -505,88 +653,41 @@ fn record_span(img: &[u8], cnid: u32) -> Option<(usize, usize)> {
     None
 }
 
-/// Swap two adjacent records in the catalog leaf, moving them with their keys.
+/// Swap the *keys* of two adjacent catalog records.
 ///
-/// The records differ in length, so this shifts everything between them and
-/// rewrites the offset array accordingly. Both records remain individually
-/// valid: only their order changes, which is what makes this the check the
-/// reader cannot perform on itself.
+/// Keys only, and only where the two are the same length, so nothing after them
+/// moves and the node's offset array stays correct. Every thread record's key is
+/// `(fileID, "")` -- six bytes -- whatever its name, so any two of them qualify
+/// while their bodies differ.
+///
+/// Swapping the whole record instead would need the records to be the same
+/// length too, and they are not: a thread record's body holds the name, so
+/// `.journal` and `.journal_info_block` differ by 22 bytes. Rebuilding the offset
+/// array to suit that is a lot of machinery for a fixture that does not need it.
+///
+/// The result is the fault the reader cannot detect in itself. Both records stay
+/// individually valid and the catalog still parses; only the two keys are now the
+/// wrong way round.
 fn swap_two_records(img: &mut [u8], a: u32, b: u32) {
-    let bs = block_size(img);
-    let leaf = catalog_start(img) + 1;
-    let base = (leaf as usize) * (bs as usize);
-
-    let (a_at, a_len) = record_span(img, a).expect("record A");
-    let (b_at, b_len) = record_span(img, b).expect("record B");
+    let (a_at, _) = record_span(img, a).expect("record A");
+    let (b_at, _) = record_span(img, b).expect("record B");
     assert!(
-        b_at == a_at + a_len,
-        "this helper only handles adjacent records, got {a_at}+{a_len} then {b_at}"
+        b_at > a_at,
+        "records {a} and {b} must be distinct positions, got {a_at} and {b_at}"
     );
 
-    let a_bytes = img[a_at..a_at + a_len].to_vec();
-    let b_bytes = img[b_at..b_at + b_len].to_vec();
+    let a_key_len = u16::from_be_bytes([img[a_at], img[a_at + 1]]) as usize + 2;
+    let b_key_len = u16::from_be_bytes([img[b_at], img[b_at + 1]]) as usize + 2;
+    assert_eq!(
+        a_key_len, b_key_len,
+        "the two keys must be the same length for a plain swap, got {a_key_len} and {b_key_len}"
+    );
 
-    // Put B where A was and A where B was. Because the lengths differ, B's
-    // neighbours shift by the difference.
-    let delta = b_len as isize - a_len as isize;
-    let after = base + bs as usize;
-    for slot in img.iter_mut().take(after).skip(b_at + b_len) {
-        *slot = slot.wrapping_add(delta as u8);
-    }
-    img[a_at..a_at + b_len].copy_from_slice(&b_bytes);
-    img[a_at + b_len..a_at + b_len + a_len].copy_from_slice(&a_bytes);
-
-    // Rebuild the offset array from the keys, which the swap left in place but
-    // at the wrong offsets.
-    rebuild_offset_array(img);
+    let a_key = img[a_at..a_at + a_key_len].to_vec();
+    let b_key = img[b_at..b_at + b_key_len].to_vec();
+    img[a_at..a_at + a_key_len].copy_from_slice(&b_key);
+    img[b_at..b_at + b_key_len].copy_from_slice(&a_key);
 }
-
-/// Recompute the leaf node's offset array by walking its records in order.
-///
-/// The array is the only thing that says where each record starts, so after
-/// moving records it has to agree with the new layout. Records are variable
-/// length and self-delimiting -- a key declares its own size, and a thread or
-/// folder record is fixed -- so walking forward from the descriptor is enough.
-fn rebuild_offset_array(img: &mut [u8]) {
-    let bs = block_size(img);
-    let leaf = catalog_start(img) + 1;
-    let base = (leaf as usize) * (bs as usize);
-    let count = u16::from_be_bytes([img[base + 10], img[base + 11]]) as usize;
-
-    // Walk forward from the descriptor. A record is self-delimiting -- a key
-    // declares its own size, and a thread, folder or file record is fixed -- so
-    // the layout can be rebuilt without consulting the old offsets.
-    let mut starts = Vec::with_capacity(count);
-    let mut cursor = NODE_DESCRIPTOR_SIZE;
-    for _ in 0..count {
-        starts.push(cursor);
-        let key_len = u16::from_be_bytes([
-            img[base + cursor],
-            img[base + cursor + 1],
-        ]) as usize;
-        let body_at = cursor + 2 + key_len;
-        let rtype = i16::from_be_bytes([img[base + body_at], img[base + body_at + 1]]);
-        let body = match rtype {
-            1 => 88,
-            2 => 248,
-            _ => {
-                // Thread record: fixed part plus a u16 name count.
-                8 + 2 + 2 * u16::from_be_bytes([
-                    img[base + body_at + 8],
-                    img[base + body_at + 9],
-                ]) as usize
-            }
-        };
-        cursor = body_at + body;
-    }
-    for (i, at) in starts.iter().enumerate() {
-        let pos = base + bs as usize - 2 * (i + 1);
-        img[pos..pos + 2].copy_from_slice(&(*at as u16).to_be_bytes());
-    }
-    let free = base + bs as usize - 2 * (count + 1);
-    img[free..free + 2].copy_from_slice(&(cursor as u16).to_be_bytes());
-}
-
 /// Turn the thread record for `cnid` into one that decodes as nothing.
 ///
 /// A thread record's key parentID is the object's CNID. Setting the record type
