@@ -454,7 +454,25 @@ impl JournalHeader {
                 format!("{} is not a plausible header size", self.jhdr_size),
             ));
         }
-        if self.blhdr_size == 0 || u64::from(self.blhdr_size) > journal_size {
+        // A block-list header has five fixed fields before its `binfo[]`, so a
+        // size smaller than that cannot hold one. Without this the walk reads
+        // `blhdr_size` bytes and fails on a truncated field, which says
+        // something about the bytes rather than about the header.
+        //
+        // Mining reference: `struct block_list_header` in `core/hfs_journal.h` is
+        // `max_blocks`, `num_blocks`, `bytes_used`, `checksum` and `flags` before
+        // the array.
+        if u64::from(self.blhdr_size) < crate::journal::replay::BLHDR_PREFIX_SIZE as u64 {
+            return Err(Error::invalid(
+                "journal_header.blhdr_size",
+                format!(
+                    "{} is smaller than a {} byte block-list header",
+                    self.blhdr_size,
+                    crate::journal::replay::BLHDR_PREFIX_SIZE
+                ),
+            ));
+        }
+        if u64::from(self.blhdr_size) > journal_size {
             return Err(Error::invalid(
                 "journal_header.blhdr_size",
                 format!("{} is not a plausible block-list header size", self.blhdr_size),
