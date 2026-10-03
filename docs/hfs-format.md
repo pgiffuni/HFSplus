@@ -861,6 +861,33 @@ What the resulting image verifies, in `tests/journal_recovery.rs`:
   it.
 - Recovery is **idempotent** and leaves the image **byte-identical**.
 
+### The journal is a ring, and `bnum` is in journal blocks
+
+Two things about the replay that are invisible on every image this project can
+generate, and both of which were wrong here before being measured.
+
+**The journal wraps.** When the writer reaches the end it starts again just
+after the header, so a block list's replacement data can be split across the
+wrap. A read that crosses the end is ordinary and must succeed:
+
+```c
+if (offset >= jnl->jhdr->size) {
+    offset = jnl->jhdr->jhdr_size + (offset - jnl->jhdr->size);
+}
+```
+
+A ring that wrapped is a *full* ring — the writer only laps itself once every
+block has been used — so there is no small fixture for it. `Journal::read_bytes`
+exposes the wrapping read and `tests/journal_replay.rs` exercises it against a
+real image.
+
+**`bnum` is measured in `jhdr_size`, not the volume's block size.**
+`add_block` computes `block_start = block_num * jhdr_size`. The two agree on
+every volume Apple writes and on every image here, so a volume whose logical
+block size differs from its journal's — which is what `journal_open` calls a
+resized volume — is the only place the difference shows, and there it moves every
+replayed block.
+
 ### `binfo[0]` is the sequence slot, not a block
 
 The single most consequential detail of the replay algorithm, and the easiest to

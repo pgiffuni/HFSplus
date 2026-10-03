@@ -541,7 +541,8 @@ def main() -> None:
         return write_external_journal(img, journal_info_block, args)
     if args.legacy_header:
         return write_legacy_header(img, args)
-    if args.short_end or args.bad_sequence or args.bad_max_blocks or args.bad_bsize:
+    if args.short_end or args.bad_sequence \
+            or args.bad_max_blocks or args.bad_bsize:
         return patch_replay_rules(img, args)
 
     # --- Journal info block ------------------------------------------------
