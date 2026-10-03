@@ -87,6 +87,12 @@ pub struct BlockListHeader {
     pub checksum: u32,
     /// Flags; see [`BLHDR_FIRST_HEADER`] and [`BLHDR_CHECK_CHECKSUMS`].
     pub flags: u32,
+    /// Byte offset within the journal where this list's block data begins.
+    ///
+    /// Recorded while walking rather than recomputed later: the data follows the
+    /// block list, and deriving it again from the header sizes is where an
+    /// off-by-a-header-size bug hides.
+    pub data_offset: u64,
     /// The blocks described.
     pub blocks: Vec<RecordedBlock>,
 }
@@ -107,6 +113,11 @@ impl BlockListHeader {
     /// `num_blocks` and `max_blocks` are attacker-controlled, so the array size
     /// is bounds-checked against the buffer before any of it is read.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_at(bytes, 0)
+    }
+
+    /// Parse a block list header, taking its data offset from `data_offset`.
+    pub fn parse_at(bytes: &[u8], data_offset: u64) -> Result<Self> {
         if bytes.len() < BLHDR_PREFIX_SIZE {
             return Err(Error::Truncated {
                 what: "block list header",
@@ -146,7 +157,15 @@ impl BlockListHeader {
             blocks.push(RecordedBlock { bnum, bsize, cksum });
         }
 
-        Ok(BlockListHeader { max_blocks, num_blocks, bytes_used, checksum, flags, blocks })
+        Ok(BlockListHeader {
+            max_blocks,
+            num_blocks,
+            bytes_used,
+            checksum,
+            flags,
+            data_offset,
+            blocks,
+        })
     }
 
     /// Verify the header's own checksum.
@@ -344,34 +363,36 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         let sequence_num = header.sequence_num;
 
         for _ in 0..MAX_BLOCK_LISTS {
+            // The block list occupies one blhdr_size block; its data follows.
+            let data_offset = data_cursor
+                .checked_add(u64::from(header.blhdr_size))
+                .ok_or(Error::overflow("transaction cursor"))?;
             let bytes = self.read_journal(data_cursor, header.blhdr_size as usize)?;
-            let blhdr = BlockListHeader::parse(&bytes)?;
+            let blhdr = BlockListHeader::parse_at(&bytes, data_offset)?;
             if blhdr.num_blocks == 0 {
                 return Err(Error::invalid(
                     "block_list_header",
                     format!("empty block list at journal offset {data_cursor}"),
                 ));
             }
-            let used_bytes = blhdr.bytes_used;
-            block_lists.push(blhdr);
 
-            // The data for this block list follows it, and `bytes_used` says how
-            // much of the transaction buffer it occupies.
-            let used = u64::from(used_bytes);
+            // `bytes_used` says how much data this list carries.
+            let used = u64::from(blhdr.bytes_used);
             if used == 0 {
                 return Err(Error::invalid(
                     "block_list_header.bytes_used",
                     "a block list with no data cannot be replayed",
                 ));
             }
-            data_cursor = data_cursor
-                .checked_add(u64::from(header.blhdr_size))
-                .and_then(|v| v.checked_add(used))
+            block_lists.push(blhdr);
+
+            data_cursor = data_offset
+                .checked_add(used)
                 .ok_or(Error::overflow("transaction cursor"))?;
             if data_cursor > header.end {
                 return Err(Error::out_of_range("transaction", data_cursor, header.end));
             }
-            // Stop when the next header would start a new transaction.
+            // Stop when no further block list fits before the end of the journal.
             if data_cursor + u64::from(header.blhdr_size) >= header.end {
                 break;
             }
@@ -411,7 +432,10 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                     if size == 0 {
                         continue;
                     }
-                    let start = self.data_start(transaction, list, data_cursor)?;
+                    let start = list
+                        .data_offset
+                        .checked_add(data_cursor)
+                        .ok_or(Error::overflow("replayed block data"))?;
                     let data = self.read_journal(start, size)?;
                     data_cursor += size as u64;
 
@@ -449,36 +473,6 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         }
         self.overlay.sort_by_key(|b| b.device_offset);
         Ok(())
-    }
-
-    /// Where a transaction's block data begins for one block list.
-    fn data_start(
-        &self,
-        transaction: &Transaction,
-        list: &BlockListHeader,
-        consumed: u64,
-    ) -> Result<u64> {
-        // Each block list is followed by its own copy of the data, so the data for
-        // list N begins after the lists 0..N and their data.
-        let mut offset = transaction.offset;
-        for earlier in &transaction.block_lists {
-            offset = offset
-                .checked_add(u64::from(self.header_size()))
-                .and_then(|v| v.checked_add(earlier.bytes_used as u64))
-                .ok_or(Error::overflow("transaction data offset"))?;
-            if std::ptr::eq(earlier, list) {
-                break;
-            }
-        }
-        offset
-            .checked_add(consumed)
-            .filter(|v| *v < self.info.size)
-            .ok_or_else(|| Error::out_of_range("transaction data", offset, self.info.size))
-    }
-
-    /// Size of the journal header block.
-    fn header_size(&self) -> u32 {
-        self.header.map(|h| h.jhdr_size).unwrap_or(512)
     }
 
     /// The volume's `JournalInfoBlock`.
