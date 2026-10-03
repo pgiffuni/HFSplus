@@ -142,6 +142,10 @@ if [[ -f tests/images/replayed/journal-replay-multi.img ]]; then
     tests/images/replayed/journal-bad-max-blocks.img --bad-max-blocks 1
   python3 tools/makejournal.py tests/images/replayed/journal-replay-be.img \
     tests/images/replayed/journal-bad-bsize.img --bad-bsize 1
+  # A crash between journalling a transaction and updating the header: the
+  # journal holds more than its header claims.
+  python3 tools/makejournal.py tests/images/replayed/journal-replay-multi.img \
+    tests/images/replayed/journal-short-end.img --short-end
 fi
 
 echo "TORN METADATA"

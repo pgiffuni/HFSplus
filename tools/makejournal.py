@@ -366,6 +366,41 @@ def patch_max_blocks(img: bytearray, at_list: int, value: int) -> None:
     print(f"  block list {at_list}: max_blocks set to {value}, checksum refreshed")
 
 
+def shorten_header_end(img: bytearray, args) -> None:
+    """Cut `journal_header.end` back so real transactions lie past it.
+
+    Apple's replay loop is `while (check_past_jnl_end || jnl->jhdr->start !=
+    jnl->jhdr->end)`, and `check_past_jnl_end` is cleared only for a
+    pre-sequence-number journal. So when sequence numbers are in use the walk
+    continues past `end` and recovers what it finds there.
+
+    That is the crash case: a transaction journalled, and the header's `end`
+    never updated because the machine stopped in between. A reader that stops at
+    `end` under-recovers it, silently -- the file it returns is shorter than the
+    journal says nothing about.
+
+    Cutting `end` back to after the first transaction produces exactly that state
+    from a journal that is otherwise sound.
+
+    Mining reference: `core/hfs_journal.c` `replay_journal`, the loop condition
+    and the "examining extra transactions" branch.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    vh = VOLUME_HEADER_OFFSET
+    jib_off = struct.unpack_from(">I", img, vh + 12)[0] * bs
+    journal_offset = struct.unpack_from(">Q", img, jib_off + JIB_OFFSET_OFFSET)[0]
+    start = struct.unpack_from(">Q", img, journal_offset + 8)[0]
+    blhdr_size = struct.unpack_from(">I", img, journal_offset + 32)[0]
+
+    used = struct.unpack_from(">I", img, journal_offset + start + 4)[0]
+    first_end = start + blhdr_size + used
+
+    struct.pack_into(">Q", img, journal_offset + 16, first_end)
+    print(f"  journal_header.end cut from its value to {first_end}")
+    print(f"  transaction 1 ends there; the rest now lie past it, as they would")
+    print("  after a crash between journalling a transaction and updating the header")
+
+
 def patch_zero_bsize(img: bytearray, args) -> None:
     """Zero one block list entry's `bsize`, as `replay_journal` refuses.
 
@@ -423,6 +458,8 @@ def patch_replay_rules(img: bytearray, args) -> None:
         # case Apple truncates.
         values = [1] + [9] * (n - 1)
         patch_sequences(img, values)
+    if args.short_end:
+        shorten_header_end(img, args)
     if args.bad_bsize:
         patch_zero_bsize(img, args)
     if args.bad_max_blocks:
@@ -451,6 +488,8 @@ def main() -> None:
                     help="write the journal header little-endian, as x86 hosts do")
     ap.add_argument("--bad-sequence", dest="bad_sequence", action="store_true",
                     help="rewrite the transaction sequence numbers so they jump")
+    ap.add_argument("--short-end", dest="short_end", action="store_true",
+                    help="cut journal_header.end back so transactions lie past it")
     ap.add_argument("--bad-bsize", dest="bad_bsize", type=int, default=0,
                     metavar="LIST",
                     help="zero block list LIST's first entry bsize")
@@ -491,7 +530,7 @@ def main() -> None:
         return write_external_journal(img, journal_info_block, args)
     if args.legacy_header:
         return write_legacy_header(img, args)
-    if args.bad_sequence or args.bad_max_blocks or args.bad_bsize:
+    if args.short_end or args.bad_sequence or args.bad_max_blocks or args.bad_bsize:
         return patch_replay_rules(img, args)
 
     # --- Journal info block ------------------------------------------------
