@@ -936,6 +936,41 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         self.info.flag_set().needs_init()
     }
 
+    /// Whether the journal holds no outstanding transactions.
+    ///
+    /// This is Apple's own predicate, and it is exactly `start == end`:
+    ///
+    /// > if the start and end are equal then the journal is clean. otherwise it's
+    /// > not clean and therefore an error.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `journal_is_clean`, which returns
+    /// 0 for equal and `EBUSY` otherwise "so the caller can differentiate an
+    /// invalid journal from a busy one".
+    ///
+    /// Distinct from [`Journal::is_uninitialized`], which reports the
+    /// `kJIJournalNeedInitMask` flag -- a journal nobody has written to yet. A
+    /// journal can be initialised and still be dirty, which is the ordinary state
+    /// after a crash.
+    ///
+    /// # Why it is exposed
+    ///
+    /// Apple uses this to *refuse* a read-only mount: `hfs_vfsutils.c` checks
+    /// `journal_is_clean` when the mount is read-only and not the root filesystem,
+    /// and fails if the journal is busy.
+    ///
+    /// This crate takes the other branch. It replays the journal and serves the
+    /// recovered view, which is what a read-only filesystem wants: the
+    /// alternative is refusing to mount a volume whose filesystem is perfectly
+    /// recoverable. The predicate is here so a caller that wants Apple's policy
+    /// -- refuse rather than recover -- can implement it.
+    pub fn is_clean(&self) -> bool {
+        match self.header {
+            // No header means nothing was ever written, which is clean.
+            None => true,
+            Some(h) => h.start == h.end,
+        }
+    }
+
     /// The transactions found, in journal order.
     ///
     /// Grouped by `BLHDR_FIRST_HEADER`, which is the flag the journal sets to
