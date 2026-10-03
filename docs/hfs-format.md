@@ -695,7 +695,20 @@ if (orig_checksum != checksum) {
 
 The `goto` is commented out, so a volume with a stale journal-header checksum
 still mounts. Reporting it as information rather than refusing the mount is
-deliberate.
+deliberate: refusing would leave the filesystem missing every recent change.
+
+Two details matter for a reimplementation, and both produce false mismatches on
+perfectly good journals if missed:
+
+- The comparison is guarded by `if (jhdr->magic == JOURNAL_HEADER_MAGIC)`, so a
+  legacy `JHDR` journal is not judged on a checksum written before the field
+  existed. `Journal::header_checksum_ok()` returns `None` in that case rather
+  than `Some(false)`, because reporting a mismatch for a checksum that was never
+  computed would be a lie.
+- The checksum is computed over the bytes **as stored**, before any swapping.
+  Apple's verifier runs `calc_checksum` over the raw buffer and swaps the saved
+  value separately. So a checksum must be taken over the on-disk bytes with the
+  checksum field zeroed, and compared against the numerically-decoded value.
 
 ### Every `mkfs_hfsplus -J` volume has an uninitialised journal
 
