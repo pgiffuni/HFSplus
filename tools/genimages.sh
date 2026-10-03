@@ -130,6 +130,18 @@ if [[ -x tools/makejournal.py || -f tools/makejournal.py ]]; then
     --data "journal replayed block 300 on a 1k volume"
 fi
 
+echo "TORN METADATA"
+# makejournal.py rewrites a block the filesystem does not reference, which
+# proves the overlay wins but not that replay repairs anything. mktorn.py writes
+# a *catalog* change into the journal instead: a file the on-disk catalog does
+# not have. The image is then a real crash-consistent volume -- sound but stale
+# -- and correct replay is the only way to see the file. See
+# tests/journal_recovery.rs.
+if [[ -f tools/mktorn.py ]] && [[ -f tests/images/generated/journaled-hfsplus.img ]]; then
+  python3 tools/mktorn.py tests/images/generated/journaled-hfsplus.img \
+    tests/images/replayed/journal-torn-catalog.img --name torn.txt --cnid 18
+fi
+
 echo "verifying every image with the independent checker"
 fail=0
 for img in "${OUT_DIR}"/*.img; do
