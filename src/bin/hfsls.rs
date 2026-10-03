@@ -11,6 +11,7 @@
 //!   -R, --recursive    descend into directories
 //!   -s, --stat         print volume statistics and exit
 //!   -b, --bits         print the allocation bitmap summary
+//!   -j, --journal      report journal detection and replay state
 //!   --json             machine-readable output
 //! ```
 //!
@@ -134,7 +135,7 @@ fn main() -> ExitCode {
 
 fn usage() {
     eprintln!(
-        "usage: hfsls [-l] [-a] [-R] [-s] [-b] [--json] <image> [path]\n\
+        "usage: hfsls [-l] [-a] [-R] [-s] [-b] [-j] [--json] <image> [path]\n\
          \n\
          Lists an HFS+ or HFSX image without mounting it. Paths are resolved\n\
          through the volume's own name comparison."
