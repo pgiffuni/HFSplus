@@ -48,6 +48,36 @@ pub const SPECIAL_FORK_SENTINEL: u32 = 0;
 /// side is wrong.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CheckReport {
+    /// Keys inside a leaf node that are not strictly increasing.
+    ///
+    /// Node number and the index of the offending record. This is the check the
+    /// reader cannot perform on itself: a binary search over unordered records
+    /// returns an answer, and the answer is wrong. Mining reference:
+    /// `lib_fsck_hfs/dfalib/SVerify2.c` compares each key with its predecessor
+    /// and reports `E_KeyOrd` when `CompareKeys(prev, key) >= 0` -- so equal keys
+    /// are an error too, not merely unsorted ones.
+    pub key_order: Vec<(u32, usize)>,
+    /// A key longer than the tree's `maxKeyLength`.
+    ///
+    /// Node number and index. Mining reference: the same function rejects
+    /// `keyLength > btcb->maxKeyLength` before comparing, so an over-long key is
+    /// a structural fault rather than a comparison that happens to work.
+    pub key_length: Vec<(u32, usize)>,
+    /// A file or folder record with no matching thread record.
+    ///
+    /// Such an object exists in the catalog but cannot be reached by name, so a
+    /// reader that walked thread records -- which is what `all_objects` does --
+    /// would never see it. That makes it invisible damage rather than visible
+    /// damage. Mining reference: `lib_fsck_hfs/dfalib/SVerify1.c`'s catalog
+    /// hierarchy pass requires a thread record for every object, and
+    /// `core/hfs_catalog.c` resolves names through them.
+    pub missing_thread: Vec<u32>,
+    /// A folder whose `valence` disagrees with the thread records naming it.
+    ///
+    /// `(folder CNID, declared, counted)`. The count comes from thread records,
+    /// which are the only place a parent is recorded for its children, so the two
+    /// are independent statements about the same fact.
+    pub valence: Vec<(u32, u32, u32)>,
     /// Blocks the bitmap marks used that nothing references.
     ///
     /// `fsck` reports this as the bitmap needing repair for orphaned blocks.
@@ -78,6 +108,10 @@ impl CheckReport {
             && self.missing.is_empty()
             && self.next_cnid_reuse.is_none()
             && self.fork_block_count.is_empty()
+            && self.key_order.is_empty()
+            && self.key_length.is_empty()
+            && self.missing_thread.is_empty()
+            && self.valence.is_empty()
     }
 
     /// A one-line summary per disagreement, for a tool to print.
@@ -96,6 +130,26 @@ impl CheckReport {
         if let Some((next, highest)) = self.next_cnid_reuse {
             out.push(format!(
                 "nextCatalogID is {next} but CNID {highest} is already in use"
+            ));
+        }
+        for (node, index) in &self.key_order {
+            out.push(format!(
+                "node {node} record {index}: its key does not follow the previous one"
+            ));
+        }
+        for (node, index) in &self.key_length {
+            out.push(format!(
+                "node {node} record {index}: its key is longer than maxKeyLength"
+            ));
+        }
+        for cnid in &self.missing_thread {
+            out.push(format!(
+                "CNID {cnid} has a record but no thread record, so it cannot be reached by name"
+            ));
+        }
+        for (cnid, declared, counted) in &self.valence {
+            out.push(format!(
+                "folder {cnid} declares valence {declared} but has {counted} children"
             ));
         }
         for (cnid, declared, described) in &self.fork_block_count {
@@ -334,9 +388,148 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
         report.next_cnid_reuse = Some((header.next_catalog_id, highest_cnid));
     }
 
+    // --- Catalog structure ---------------------------------------------
+    //
+    // Separate from the bitmap work because these catch a different class: the
+    // bitmap checks find a disagreement between two structures, while these find
+    // a fault *within* the catalog that the reader cannot notice on its own. A
+    // binary search over unordered keys returns an answer, and the answer is
+    // wrong.
+    check_catalog_structure(vol, &mut report)?;
+
     // Keep `map` borrowed so the borrow checker proves nothing above wrote to it.
     let _ = &mut map;
     Ok(report)
+}
+
+/// Check the catalog's own structure: key order, key lengths, thread records
+/// and folder valence.
+///
+/// Nothing here needs the bitmap, and nothing repairs anything -- a catalog that
+/// fails these is reported with the node and record index so a repair can be
+/// attempted deliberately.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/SVerify2.c` for key order and key
+/// length, and `SVerify1.c`'s catalog hierarchy pass for thread records and
+/// valence.
+fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
+    vol: &Volume<'_, D>,
+    report: &mut CheckReport,
+) -> Result<()> {
+    let cat = vol.catalog();
+    let tree = cat.tree();
+    let max_key_length = tree.header().max_key_length as usize;
+    let last_leaf = tree.header().last_leaf_node;
+    let mut node_num = tree.header().first_leaf_node;
+    let mut budget = tree.header().total_nodes;
+
+    // CNIDs seen with their own record, and thread records seen.
+    let mut objects: Vec<u32> = Vec::new();
+    let mut threads: Vec<(u32, u32)> = Vec::new();
+    // Declared child counts, from folder records.
+    let mut declared_valence: Vec<(u32, u32)> = Vec::new();
+
+    while budget > 0 {
+        budget -= 1;
+        let bytes = tree.read_node_bytes(node_num)?;
+        let node = tree.parse_node(&bytes)?;
+        if node.kind() != crate::btree::node::NodeKind::Leaf {
+            break;
+        }
+
+        let mut previous: Option<crate::catalog::key::CatalogKey> = None;
+        for index in 0..node.num_records() {
+            let record = node
+                .record(index)
+                .map_err(|_| Error::invalid("catalog node", "a record offset ran past the node"))?;
+
+            // Key length first, as Apple does: an over-long key is a structural
+            // fault, and comparing it anyway would be comparing garbage.
+            match crate::catalog::key::CatalogKey::from_record(record, max_key_length) {
+                Ok(key) => {
+                    let declared = key_length(record)?;
+                    if declared > max_key_length {
+                        report.key_length.push((node_num, index as usize));
+                        continue;
+                    }
+                    if let Some(prev) = &previous {
+                        if cat.compare_keys(prev, &key) != crate::unicode::Ordering::Less {
+                            report.key_order.push((node_num, index as usize));
+                        }
+                    }
+                    previous = Some(key);
+                }
+                Err(_) => {
+                    report.key_length.push((node_num, index as usize));
+                    continue;
+                }
+            }
+
+            let Some((key, body)) = crate::catalog::lookup::split_record(record) else {
+                continue;
+            };
+            let Ok(parsed) = crate::catalog::record::parse_record(body) else {
+                continue;
+            };
+            match parsed {
+                CatalogRecord::File(f) => objects.push(f.file_id.0),
+                CatalogRecord::Folder(f) => {
+                    objects.push(f.folder_id.0);
+                    declared_valence.push((f.folder_id.0, f.valence));
+                }
+                // The thread record's own CNID lives in its *key*, not its body:
+                // `struct HFSPlusCatalogThread` names the object's parent, and
+                // the key's parentID is the object itself. So the pairing is
+                // (parent from the body, object from the key).
+                CatalogRecord::Thread(t) => {
+                    threads.push((t.parent_id.0, key.parent_id.0));
+                }
+            }
+        }
+
+        if node_num == last_leaf {
+            break;
+        }
+        let next = node.descriptor().f_link;
+        if next == 0 {
+            break;
+        }
+        node_num = next;
+    }
+
+    // Every object needs a thread record keyed on its own CNID with an empty
+    // name. That pairing is the only route from a name to an object, so an object
+    // without one is unreachable however sound the rest of the volume is.
+    let has_thread = |cnid: u32| -> bool { threads.iter().any(|(_, t)| *t == cnid) };
+    for cnid in &objects {
+        if !has_thread(*cnid) {
+            report.missing_thread.push(*cnid);
+        }
+    }
+
+    // Valence: the declared count against the number of thread records naming
+    // this folder as parent.
+    for (cnid, declared) in &declared_valence {
+        let counted = threads.iter().filter(|(parent, _)| parent == cnid).count() as u32;
+        if counted != *declared {
+            report.valence.push((*cnid, *declared, counted));
+        }
+    }
+
+    Ok(())
+}
+
+/// The declared byte length of a key, prefix included.
+fn key_length(record: &[u8]) -> Result<usize> {
+    if record.len() < 2 {
+        return Err(Error::Truncated {
+            what: "catalog key",
+            needed: 2,
+            available: record.len(),
+        });
+    }
+    let declared = u16::from_be_bytes([record[0], record[1]]) as usize;
+    Ok(declared + 2)
 }
 
 #[cfg(test)]
@@ -390,13 +583,21 @@ mod tests {
             missing: vec![9],
             next_cnid_reuse: Some((18, 20)),
             fork_block_count: vec![(19, 10, 8)],
+            key_order: vec![(1, 4)],
+            key_length: vec![(1, 2)],
+            missing_thread: vec![22],
+            valence: vec![(2, 9, 8)],
         };
         assert!(!report.is_clean());
         let lines = report.describe();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 8, "one line per disagreement:\n{}", lines.join("\n"));
         assert!(lines[0].contains('7') && lines[0].contains("no file references"));
         assert!(lines[1].contains('9') && lines[1].contains("not marked"));
         assert!(lines[2].contains("nextCatalogID"));
-        assert!(lines[3].contains("19") && lines[3].contains("declares 10"));
+        assert!(lines.iter().any(|l| l.contains("19") && l.contains("declares 10")));
+        assert!(lines.iter().any(|l| l.contains("does not follow")));
+        assert!(lines.iter().any(|l| l.contains("maxKeyLength")));
+        assert!(lines.iter().any(|l| l.contains("no thread record")));
+        assert!(lines.iter().any(|l| l.contains("valence")));
     }
 }
