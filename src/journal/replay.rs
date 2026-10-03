@@ -555,6 +555,32 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         &mut self,
         transaction: &Transaction,
     ) -> std::result::Result<(), ApplyFailure> {
+        // Apple's sanity pass over the whole list, before any of its contents
+        // are used. A negative block number that is not the killed sentinel is
+        // bogus, and letting it through would compute a device offset far
+        // outside the image.
+        //
+        // Mining reference: core/hfs_journal.c
+        //
+        // ```c
+        // if (blhdr->binfo[i].bnum < 0 && blhdr->binfo[i].bnum != (off_t)-1) {
+        //     printf("... bogus block number 0x%llx\n", ...);
+        //     bad_blocks = 1;
+        //     goto bad_txn_handling;
+        // }
+        // ```
+        for list in &transaction.block_lists {
+            for block in &list.blocks {
+                let negative = block.bnum > i64::MAX as u64;
+                if negative && !block.is_killed() {
+                    return Err(ApplyFailure::Truncate {
+                        at: transaction.offset,
+                        reason: format!("bogus block number {:#018x}", block.bnum),
+                    });
+                }
+            }
+        }
+
         for list in &transaction.block_lists {
             let mut data_cursor = 0u64;
             for block in &list.blocks {
@@ -741,9 +767,22 @@ impl<D: BlockDevice + ?Sized> BlockDevice for OverlaidDevice<'_, '_, D> {
                     written += slice.len();
                 }
                 None => {
-                    // The rest of the request is not replayed; one read covers it.
-                    self.inner.read_at(at, &mut buf[written..])?;
-                    written = buf.len();
+                    // Past the replayed region. Read only what the device
+                    // actually has and then stop.
+                    //
+                    // Propagating a short read as an error would be wrong here
+                    // even though it is right for `BlockDevice`: a request that
+                    // begins inside a replayed block and runs past the end of
+                    // the device has already been partly answered, and POSIX
+                    // read reports end of file by returning fewer bytes rather
+                    // than by failing.
+                    let device_len = self.inner.len()?;
+                    if at >= device_len {
+                        break;
+                    }
+                    let want = ((device_len - at) as usize).min(buf.len() - written);
+                    self.inner.read_at(at, &mut buf[written..written + want])?;
+                    written += want;
                 }
             }
         }
