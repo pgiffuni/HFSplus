@@ -396,7 +396,18 @@ def shorten_header_end(img: bytearray, args) -> None:
     first_end = start + blhdr_size + used
 
     struct.pack_into(">Q", img, journal_offset + 16, first_end)
-    print(f"  journal_header.end cut from its value to {first_end}")
+
+    # `end` is inside the header's checksummed range -- JOURNAL_HEADER_CKSUM_SIZE
+    # is offsetof(sequence_num), so it covers everything before it. Refresh it, or
+    # the fixture would report a stale checksum and stop being the sound journal
+    # it is meant to be.
+    struct.pack_into(">I", img, journal_offset + 36, 0)
+    cksum = checksum_with_zeroed_field(
+        img[journal_offset:journal_offset + JOURNAL_HEADER_CKSUM_SIZE], 36,
+        JOURNAL_HEADER_CKSUM_SIZE)
+    struct.pack_into(">I", img, journal_offset + 36, cksum)
+
+    print(f"  journal_header.end cut from its value to {first_end}, checksum refreshed")
     print(f"  transaction 1 ends there; the rest now lie past it, as they would")
     print("  after a crash between journalling a transaction and updating the header")
 
