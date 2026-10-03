@@ -102,6 +102,22 @@ pub struct CheckReport {
     /// truncates the walk. Mining reference: the same function compares each
     /// node's `fLink` against the node the traversal expected to follow.
     pub sibling_link: Vec<(u8, u32)>,
+    /// A node nothing points at that is not erased.
+    ///
+    /// `(tree, node number)`. Every node the file contains is either reachable
+    /// from the root or unused, and an unused node must be entirely zero --
+    /// otherwise it holds stale data from whatever the file used to contain, which
+    /// is the signal that a tree was edited rather than rebuilt.
+    ///
+    /// This is the check that catches a *partly* rebuilt tree, and it caught one
+    /// while building this crate's own images: a new leaf written into the extents
+    /// tree without the header's root node pointing at it left the old nodes
+    /// unerased, and `fsck.hfsplus` reported "Unused node is not erased" while
+    /// this check did not exist to say anything.
+    ///
+    /// Mining reference: `BTCheckUnusedNodes` requires all `nodeSize` bytes of an
+    /// unvisited node to be zero.
+    pub unerased_node: Vec<(u8, u32)>,
     /// Blocks the bitmap marks used that nothing references.
     ///
     /// `fsck` reports this as the bitmap needing repair for orphaned blocks.
@@ -139,6 +155,7 @@ impl CheckReport {
             && self.node_height.is_empty()
             && self.child_node.is_empty()
             && self.sibling_link.is_empty()
+            && self.unerased_node.is_empty()
     }
 
     /// A one-line summary per disagreement, for a tool to print.
@@ -185,6 +202,11 @@ impl CheckReport {
         for (tree, node) in &self.sibling_link {
             out.push(format!(
                 "{tree} node {node}: its forward link disagrees with the node before it"
+            ));
+        }
+        for (tree, node) in &self.unerased_node {
+            out.push(format!(
+                "{tree} node {node}: nothing points at it and it is not erased"
             ));
         }
         for (cnid, declared, counted) in &self.valence {
@@ -554,7 +576,12 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
         if node_num == last_leaf {
             break;
         }
-        let next = node.descriptor().f_link;
+        let next = u32::from_be_bytes([
+            node.raw()[4],
+            node.raw()[5],
+            node.raw()[6],
+            node.raw()[7],
+        ]);
         if next == 0 {
             break;
         }
@@ -608,8 +635,10 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
     let total_nodes = header.total_nodes;
 
     // An empty tree still has a header node and nothing else, and `rootNode` is 0
-    // -- which is the header. There is nothing to walk.
+    // -- which is the header. There is nothing to walk, but the unused-node check
+    // still applies: every other node must be erased.
     if tree_depth == 0 {
+        check_unused_nodes(&bt, &[0], tree, report);
         return Ok(());
     }
 
@@ -638,7 +667,45 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
 
         match node.kind() {
             crate::btree::node::NodeKind::Leaf => {
-                // Reached the bottom: nothing below to check.
+                // Reached the bottom. Walk the sibling chain, which is how leaves
+                // at this level are enumerated, and check each link against the
+                // node we expect to come next.
+                let mut reached = vec![0u32, node_num];
+                let mut expected = node_num;
+                let mut cursor = node_num;
+                let mut budget = total_nodes;
+                while budget > 0 {
+                    budget -= 1;
+                    let next = f_link(&bt, cursor)?;
+                    if next == 0 {
+                        break;
+                    }
+                    if next == expected {
+                        report.sibling_link.push((name_u8(tree), next));
+                        break;
+                    }
+                    if next >= total_nodes {
+                        report.child_node.push((name_u8(tree), expected, next));
+                        break;
+                    }
+                    let bytes = bt.read_node_bytes(next)?;
+                    let next_node = bt.parse_node(&bytes)?;
+                    if next_node.kind() != crate::btree::node::NodeKind::Leaf {
+                        report.sibling_link.push((name_u8(tree), next));
+                        break;
+                    }
+                    let expected_height = (tree_depth as i32 - level as i32 + 1) as u8;
+                    if next_node.height() != expected_height {
+                        report.node_height.push((name_u8(tree), next));
+                    }
+                    reached.push(next);
+                    expected = next;
+                    cursor = next;
+                }
+                reached.extend(reached_from_index_children(
+                    &bt, node_num, total_nodes,
+                )?);
+                check_unused_nodes(&bt, &reached, tree, report);
             }
             crate::btree::node::NodeKind::Index => {
                 level -= 1;
@@ -664,6 +731,100 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
         }
     }
     Ok(())
+}
+
+/// Every node reachable from an index node's children, one level down.
+///
+/// The unused-node check needs the whole reachable set, and on a depth-*n* tree
+/// that is every level. Recursing here rather than threading a set through the
+/// caller keeps the walk in one place.
+fn reached_from_index_children<D: crate::blockdev::BlockDevice + ?Sized>(
+    bt: &BTreeFile<'_, D>,
+    node_num: u32,
+    total_nodes: u32,
+) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    if node_num == 0 || node_num >= total_nodes {
+        return Ok(out);
+    }
+    let bytes = bt.read_node_bytes(node_num)?;
+    let node = bt.parse_node(&bytes)?;
+    if node.kind() != crate::btree::node::NodeKind::Index {
+        return Ok(out);
+    }
+    for index in 0..node.num_records() {
+        let child = node.child(index)?;
+        if child == 0 || child >= total_nodes {
+            continue;
+        }
+        out.push(child);
+        out.extend(reached_from_index_children(bt, child, total_nodes)?);
+        // Children at every level also enumerate through sibling links.
+        out.extend(sibling_chain(bt, child, total_nodes)?);
+    }
+    Ok(out)
+}
+
+/// A node's right siblings, following `fLink` until it ends.
+fn sibling_chain<D: crate::blockdev::BlockDevice + ?Sized>(
+    bt: &BTreeFile<'_, D>,
+    from: u32,
+    total_nodes: u32,
+) -> Result<Vec<u32>> {
+    let mut out = Vec::new();
+    let mut cursor = from;
+    let mut budget = total_nodes;
+    while budget > 0 {
+        budget -= 1;
+        let next = f_link(bt, cursor)?;
+        if next == 0 || next >= total_nodes || out.contains(&next) {
+            break;
+        }
+        out.push(next);
+        cursor = next;
+    }
+    Ok(out)
+}
+
+/// A node's `fLink`: the next node to its right at the same level.
+fn f_link<D: crate::blockdev::BlockDevice + ?Sized>(
+    bt: &BTreeFile<'_, D>,
+    node_num: u32,
+) -> Result<u32> {
+    let bytes = bt.read_node_bytes(node_num)?;
+    if bytes.len() < 8 {
+        return Err(Error::Truncated {
+            what: "BTNodeDescriptor",
+            needed: 8,
+            available: bytes.len(),
+        });
+    }
+    Ok(u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]))
+}
+
+/// Report every node of the file that nothing reaches and that is not erased.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/SVerify2.c` `BTCheckUnusedNodes`
+/// requires all `nodeSize` bytes of an unvisited node to be zero, and stops at
+/// the first that are not.
+fn check_unused_nodes<D: crate::blockdev::BlockDevice + ?Sized>(
+    bt: &BTreeFile<'_, D>,
+    reached: &[u32],
+    tree: &'static str,
+    report: &mut CheckReport,
+) {
+    let total_nodes = bt.header().total_nodes;
+    for node_num in 0..total_nodes {
+        if reached.contains(&node_num) {
+            continue;
+        }
+        let Ok(bytes) = bt.read_node_bytes(node_num) else {
+            continue;
+        };
+        if bytes.iter().any(|b| *b != 0) {
+            report.unerased_node.push((name_u8(tree), node_num));
+        }
+    }
 }
 
 /// Walk one level down, checking the child's height.
@@ -772,10 +933,11 @@ mod tests {
             node_height: vec![(1, 7)],
             child_node: vec![(1, 3, 900)],
             sibling_link: vec![(2, 5)],
+            unerased_node: vec![(1, 9)],
         };
         assert!(!report.is_clean());
         let lines = report.describe();
-        assert_eq!(lines.len(), 11, "one line per disagreement:\n{}", lines.join("\n"));
+        assert_eq!(lines.len(), 12, "one line per disagreement:\n{}", lines.join("\n"));
         assert!(lines[0].contains('7') && lines[0].contains("no file references"));
         assert!(lines[1].contains('9') && lines[1].contains("not marked"));
         assert!(lines[2].contains("nextCatalogID"));
@@ -787,5 +949,6 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("height contradicts")));
         assert!(lines.iter().any(|l| l.contains("points at node 900")));
         assert!(lines.iter().any(|l| l.contains("forward link disagrees")));
+        assert!(lines.iter().any(|l| l.contains("not erased")));
     }
 }
