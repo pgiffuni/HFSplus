@@ -284,7 +284,22 @@ fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
                 "header start/end:{}/{}  sequence {}  blhdr {}  jhdr {}\n",
                 h.start, h.end, h.sequence_num, h.blhdr_size, h.jhdr_size
             ));
+            // Apple reports a stale header checksum but still mounts, so this is
+            // printed as a warning rather than treated as a failure.
+            match j.header_checksum_ok() {
+                None => s.push_str("header checksum: not checked (legacy magic)\n"),
+                Some(true) => s.push_str("header checksum: ok\n"),
+                Some(false) => s.push_str(
+                    "header checksum: MISMATCH -- a stale checksum is not fatal; \
+                     Apple mounts anyway\n",
+                ),
+            }
         }
+    }
+    if let Some((at, why)) = j.truncation() {
+        s.push_str(&format!(
+            "replay truncated at journal offset {at}: {why}\n"
+        ));
     }
     s.push_str(&format!("transactions:    {}\n", j.transactions().len()));
     s.push_str(&format!("replayed blocks: {}\n", j.replayed_blocks().len()));
