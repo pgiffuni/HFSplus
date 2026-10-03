@@ -114,6 +114,15 @@ if [[ -x tools/makejournal.py || -f tools/makejournal.py ]]; then
     tests/images/replayed/journal-replay-le.img --block 201 --little-endian \
     --data "journal replayed block 201"
 
+  # Three transactions, two of which rewrite the same block, so the walk across
+  # transaction boundaries and the later-write-wins rule are both exercised.
+  [[ -f tests/images/generated/journaled-hfsplus.img ]] && python3 tools/makejournal.py \
+    tests/images/generated/journaled-hfsplus.img \
+    tests/images/replayed/journal-replay-multi.img \
+    --block 200 --data "first write to block 200" \
+    --extra "200:second write to block 200" \
+    --extra "250:a third block"
+
   # A different volume block size, so the geometry is not only exercised at 4K.
   [[ -f tests/images/generated/journaled-hfsplus-1k.img ]] && python3 tools/makejournal.py \
     tests/images/generated/journaled-hfsplus-1k.img \
