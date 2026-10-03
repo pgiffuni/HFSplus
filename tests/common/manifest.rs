@@ -151,12 +151,18 @@ impl Manifest {
     /// Keys inside an array entry are stored under `<name>.<index>.<key>`,
     /// counting from 1, so entries never overwrite each other.
     pub fn array_len(&self, name: &str) -> usize {
-        self.values
+        // Distinct indices, not key count: an entry with eight keys is one
+        // entry, and counting keys made this report 8 for a single `[[files]]`.
+        let mut indices: Vec<usize> = self
+            .values
             .keys()
             .filter_map(|k| k.strip_prefix(&format!("{name}.")))
             .filter_map(|rest| rest.split('.').next())
-            .filter(|seg| seg.parse::<usize>().is_ok())
-            .count()
+            .filter_map(|seg| seg.parse::<usize>().ok())
+            .collect();
+        indices.sort_unstable();
+        indices.dedup();
+        indices.len()
     }
 
     /// Read the `key` of entry `index` (1-based) of array `name`.
@@ -251,6 +257,25 @@ path = "b"
 
     #[test]
     fn array_entries_are_indexed_and_do_not_overwrite_each_other() {
+        // Several keys per entry, because counting keys instead of entries
+        // looks correct when every entry has exactly one.
+        let m = Manifest::parse(
+            "[[files]]\nname = \"a\"\nsize = 1\n\n[[files]]\nname = \"b\"\nsize = 2\n",
+        );
+        assert_eq!(m.array_len("files"), 2);
+        assert_eq!(m.array_item("files", 1, "name"), Some("a"));
+        assert_eq!(m.array_item("files", 2, "name"), Some("b"));
+    }
+
+    #[test]
+    fn array_len_counts_entries_not_keys() {
+        let m = Manifest::parse("[[files]]\nname = \"a\"\nsize = 1\nkind = \"file\"\n");
+        assert_eq!(m.array_len("files"), 1, "one entry with three keys");
+        assert_eq!(m.array_len("absent"), 0);
+    }
+
+    #[test]
+    fn _old_array_entries_test() {
         let m = Manifest::parse(SAMPLE);
         assert!(m.has("forks.catalogFile.logical_size"));
         // An array entry must not collide with a plain table of the same name.
