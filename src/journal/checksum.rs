@@ -82,7 +82,15 @@ pub fn verify_checksum(bytes: &[u8], at: usize, len: usize) -> Option<u32> {
 ///
 /// Returns the checksum of the zeroed buffer, which is what a writer stores.
 pub fn checksum_with_zeroed_field(bytes: &[u8], at: usize, len: usize) -> Option<u32> {
-    if bytes.len() < len || at + 4 > bytes.len() {
+    // The field must lie inside the range being hashed, not merely inside
+    // `bytes`. Checking it against `bytes.len()` alone let `at` past `len` reach
+    // the slice assignment below and panic -- a field offset is read from the
+    // structure being checksummed, so it is exactly the sort of untrusted value
+    // this has to survive.
+    //
+    // `at + 4` is written rather than `at.checked_add(4)` so that an absurd `at`
+    // wraps into a rejection rather than back into a plausible range.
+    if bytes.len() < len || len < 4 || at > len - 4 {
         return None;
     }
     let mut scratch = bytes[..len].to_vec();
