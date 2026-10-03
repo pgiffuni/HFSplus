@@ -51,6 +51,15 @@ fn cases() -> Vec<(&'static str, &'static str)> {
         ("truncated-header", "truncated"),
         ("truncated-half-header", "truncated"),
         ("all-zero", "unrecognised volume signature"),
+        // journalInfoBlock is a block number and nothing else constrains it, so a
+        // volume naming one at or past its own end is damaged. The error must name
+        // the field: the bytes found there would otherwise be parsed as a journal
+        // info block and produce a complaint about *those* instead.
+        ("journal-info-block-out-of-volume", "journalInfoBlock"),
+        // A value large enough that the block offset would overflow, told apart
+        // from the range check by the same message -- both are refused, and both
+        // for the same reason.
+        ("journal-info-block-huge", "journalInfoBlock"),
     ]
 }
 

@@ -17,6 +17,7 @@ mod common;
 use hfsplus::blockdev::{BlockDevice, FileDevice};
 use hfsplus::format::volume_header::VolumeHeader;
 use hfsplus::journal::Journal;
+use hfsplus::volume::Volume;
 
 /// Images the corpus builds with `mkfs_hfsplus -J`.
 ///
@@ -277,4 +278,172 @@ fn journal_info_blocks_are_validated_before_use() {
     info2[36..44].copy_from_slice(&0u64.to_be_bytes());
     dev.as_mut_slice()[8192..12288].copy_from_slice(&info2);
     assert!(Journal::open(&dev, 2, block_size).is_err());
+}
+// --- The journal info block is bounded by the volume ---------------------
+
+#[test]
+fn the_journal_info_block_is_bounded_by_the_volume() {
+    // `journalInfoBlock` is a `u32` that nothing else constrains. A volume
+    // naming a block at or past its own end is damaged, and refusing it beats
+    // parsing whatever lives there, because the resulting complaint would be
+    // about those bytes rather than about the volume.
+    //
+    // Without the bound the refusal is a *coincidence* of what is found at that
+    // offset: pointed at the last block of a real volume it failed with "size 0
+    // must be non-zero", which is true of the bytes there and of nothing in the
+    // header.
+    let dir = common::repo_root().join("tests/images/malformed");
+    let mut checked = 0;
+    for name in [
+        "journal-info-block-out-of-volume",
+        "journal-info-block-huge",
+    ] {
+        let path = dir.join(format!("{name}.img"));
+        if !path.exists() {
+            eprintln!("skipping {name}: not built");
+            continue;
+        }
+        let dev = FileDevice::open(&path).expect("open");
+        let err = VolumeHeader::read_from(&dev).expect_err("must be refused");
+        let text = err.to_string();
+        assert!(
+            text.contains("journalInfoBlock"),
+            "{name}: the error must name the field, got {text:?}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no malformed journal images were checked");
+}
+
+#[test]
+fn an_unjournaled_volume_is_not_held_to_the_journal_bound() {
+    // The negative control, and it matters: the bound applies only where there is
+    // a journal to point at. An unjournaled volume carries whatever it carries in
+    // that field -- zero, in practice -- and refusing it would reject images that
+    // have never been journaled, which is most of the corpus.
+    let path = common::image("basic-hfsplus");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let header = VolumeHeader::read_from(&dev).expect("an unjournaled volume must mount");
+    assert!(!header.is_journaled());
+    assert_eq!(header.journal_info_block, 0, "the field is simply zero");
+}
+
+// --- A journal on another device -----------------------------------------
+
+#[test]
+fn a_journal_on_another_device_is_declined_rather_than_missed() {
+    // `kJIJournalOnOtherDeviceMask` names the journal by a GPT UUID on a partition
+    // this reader is not given. The right answer is "no journal in this image",
+    // not a search that finds nothing and reports the volume as unjournaled.
+    //
+    // Mining reference: `core/hfs_vfsutils.c` `hfs_mount_hfsplus` branches on
+    // `kJIJournalInFSMask` and, on the other path, calls `open_journal_dev` with
+    // `ext_jnl_uuid` and `machine_serial_num`. When that device cannot be opened
+    // Apple fails with `EROFS` -- the volume becomes read-only rather than
+    // unopenable.
+    let path = common::repo_root().join("tests/images/replayed/journal-external.img");
+    if !path.exists() {
+        eprintln!(
+            "skipping: {} not built; run makejournal.py --external-journal",
+            path.display()
+        );
+        return;
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("the volume itself must still mount");
+
+    // The header still says journaled: this is a journaled volume whose journal
+    // lives elsewhere, not a volume with no journal.
+    assert!(vol.is_journaled(), "the header still has kHFSVolumeJournaledBit");
+
+    // No journal to replay, and that is not an error.
+    assert!(
+        vol.journal().expect("journal open must not fail").is_none(),
+        "an external journal must not be reported as replayable"
+    );
+
+    // But the info block is readable, and it says where the journal is.
+    let info = vol
+        .external_journal()
+        .expect("reading the info block must succeed")
+        .expect("the journal must be reported as external");
+    let flags = info.flag_set();
+    assert!(!flags.in_filesystem(), "kJIJournalInFSMask must be clear");
+    assert!(flags.on_other_device(), "kJIJournalOnOtherDeviceMask must be set");
+    assert_eq!(info.offset, 0, "offset means nothing for a journal that is not here");
+    assert_eq!(info.size, 524288, "size still describes the journal, and Apple uses it");
+
+    // And the volume reads normally: a journal elsewhere changes nothing about
+    // what is on this filesystem.
+    let mut names: Vec<String> = vol
+        .read_dir(vol.root_cnid())
+        .expect("read_dir")
+        .iter()
+        .map(|o| o.name_string())
+        .collect();
+    names.sort();
+    assert_eq!(names, vec![".journal", ".journal_info_block"]);
+}
+
+#[test]
+fn an_in_filesystem_journal_is_not_reported_as_external() {
+    // The converse, so `external_journal` cannot drift into reporting every
+    // journaled volume as external.
+    let path = common::image("journaled-hfsplus");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(
+        vol.external_journal()
+            .expect("reading the info block")
+            .is_none(),
+        "a journal inside the filesystem must not be reported as external"
+    );
+    assert!(
+        vol.journal().expect("journal open").is_some(),
+        "and it must still be replayable"
+    );
+}
+
+#[test]
+fn the_independent_checker_accepts_the_external_journal_image() {
+    // This is not an exotic state -- it is what a Time Machine volume looks like
+    // -- so the checker should accept a volume whose journal it cannot replay
+    // rather than call it damaged.
+    let Some(fsck) = common::fsck_available() else {
+        eprintln!("skipping: fsck.hfsplus not installed");
+        return;
+    };
+    let path = common::repo_root().join("tests/images/replayed/journal-external.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("hfsplus-external-{}.img", std::process::id()));
+    std::fs::copy(&path, &probe).expect("copy for fsck");
+
+    let out = common::run_fsck(&fsck, &probe);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = std::fs::read(&probe).expect("read the probe back");
+    let _ = std::fs::remove_file(&probe);
+
+    assert!(text.contains("appears to be OK"), "expected a sound volume:\n{text}");
+    assert_eq!(
+        digest(&std::fs::read(&path).expect("read the original")),
+        digest(&after),
+        "the checker modified the image:\n{text}"
+    );
 }

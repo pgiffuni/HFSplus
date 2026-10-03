@@ -93,6 +93,29 @@ struct.pack_into(">I", data, 1024 + 44, 0xFFFFFFFF)  # totalBlocks
 '
 
 
+# 5b. journalInfoBlock naming a block at or past the end of the volume.
+#
+#     The field is a block number and nothing else constrains it, so a volume
+#     naming one outside itself is damaged. Refusing it is better than parsing
+#     whatever happens to live at that offset -- which could be catalog data, or
+#     the journal's own blocks. Without the bound the refusal is a coincidence of
+#     the bytes found there rather than a statement about the volume.
+patch_with_python "${OUT_DIR}/journal-info-block-out-of-volume.img" '
+import struct
+total = struct.unpack_from(">I", data, 1024 + 44)[0]
+struct.pack_into(">I", data, 1024 + 4, 0x00002000)     # kHFSVolumeJournaledBit
+struct.pack_into(">I", data, 1024 + 12, total)         # journalInfoBlock == totalBlocks
+'
+
+# 5c. The same, with a value large enough to overflow the block offset in any
+#     case. Checked here so the arithmetic guard and the range guard are told
+#     apart by something other than which message appears.
+patch_with_python "${OUT_DIR}/journal-info-block-huge.img" '
+import struct
+struct.pack_into(">I", data, 1024 + 4, 0x00002000)     # kHFSVolumeJournaledBit
+struct.pack_into(">I", data, 1024 + 12, 0x7FFFFFFF)
+'
+
 # 6. Volume header truncated: the image ends part way through the header.
 truncate_image() {
   local out="$1" size="$2"
