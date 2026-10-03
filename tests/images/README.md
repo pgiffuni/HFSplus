@@ -20,10 +20,10 @@ tests/images/
 ## Reproducing everything
 
 ```sh
-tools/genimages.sh          # 9 good images
+tools/genimages.sh          # 9 good images + 3 with real journal transactions
 tools/genmanifests.sh       # one manifest per image, from ground truth
 tools/genmalformed.sh       # 11 deliberately corrupted images
-cargo test                  # 71 tests
+cargo test                  # 293 tests
 ```
 
 `genimages.sh` skips images that already exist; pass `--force` to rebuild. The
@@ -140,6 +140,41 @@ Nine generated images, all accepted by `fsck.hfsplus`:
 | `journaled-hfsplus` | journaled HFS+, `journalInfoBlock` set |
 | `journaled-hfsplus-1k` | journaled HFS+ with 1024-byte blocks |
 | `classic-hfs` | classic HFS, signature `0x4244`: must be recognised and refused |
+
+### Journal replay
+
+Every image `mkfs.hfsplus -J` produces has `kJIJournalNeedInitMask` set and a
+zeroed journal header, because no transaction has ever been written. So the
+generated corpus proves journal *detection* but cannot exercise *replay* at all:
+there is nothing in the journal.
+
+`tools/makejournal.py` closes that gap. It writes a real journal header, a real
+transaction, a real block list and real replacement data into a journaled image,
+following Apple `core/hfs_journal.c`'s layout:
+
+```text
+journal + 0                 journal_header    (jhdr_size bytes)
+journal + jhdr_size         block_list_header  (blhdr_size bytes)
+journal + jhdr_size + blhdr_size   the replacement block data
+```
+
+Three images are produced, so the reader's byte-order detection and the geometry
+are both exercised:
+
+| Image | Exercises |
+| --- | --- |
+| `journal-replay-be` | big-endian journal header |
+| `journal-replay-le` | little-endian journal header, as an x86 or ARM host writes |
+| `journal-replay-1k` | a 1 KiB volume, so a different block geometry |
+
+Each rewrites a block the filesystem does not currently reference. That is
+deliberate: a *crash-consistent* image, where the journal is newer than the
+filesystem because the machine died mid-write, cannot be produced without macOS
+or fault injection. So the overlay is verified for **precedence** (a replayed
+block reads from the journal, and differs from the device), for
+**non-interference** (an untouched block still reads from the device, and the
+volume still mounts through the overlay) and for **refusal** (a block failing its
+recorded checksum stops the replay). Repairing a torn catalog is not covered.
 
 Eleven malformed images, none of which may mount.
 

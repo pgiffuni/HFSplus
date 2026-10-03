@@ -716,7 +716,36 @@ The corpus therefore proves detection, validation and the empty replay path, and
 **cannot** prove transaction replay: that needs a volume crashed mid-transaction,
 which cannot be produced without macOS or fault injection. `tests/journal_conformance.rs`
 asserts that gap so it stays visible rather than being implied by the absence of
-a test, and the transaction walk is covered by synthetic journals instead.
+a test.
+
+### Closing the gap: tools/makejournal.py
+
+That gap is closed by writing a real journal into a journaled image rather than by
+hand-waving it. `tools/makejournal.py` emits a journal header, one transaction,
+one block list and the replacement block data, following the layout above, and
+clears `kJIJournalNeedInitMask`. Three images are produced, covering both header
+byte orders and two block geometries.
+
+Writing that tool found a bug in the reader: the offset of a block list's data
+was being recomputed later by walking the earlier block lists, and it advanced by
+the *journal header* size where it had to advance by the *block-list header*
+size. Nothing had ever read a real transaction, so it went unnoticed. Each block
+list now records its own `data_offset` while the walk runs, which removes the
+re-derivation entirely rather than fixing the arithmetic in place.
+
+What these images verify:
+
+- **Precedence**: a replayed block reads from the journal and differs from the
+  device.
+- **Non-interference**: an untouched block still reads from the device, and the
+  volume still mounts and reads its catalog through the overlaid device.
+- **Refusal**: a block whose recorded checksum does not match its data stops the
+  replay rather than presenting corrupted metadata as current.
+- **Byte order**: the little-endian header is detected, not assumed.
+- **Read-only**: the image is byte-identical afterwards.
+
+What they do **not** verify: repairing a torn catalog, or any property that needs
+a genuinely crash-consistent volume.
 
 ### Journal replay is read-only by construction
 
