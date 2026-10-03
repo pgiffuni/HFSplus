@@ -511,14 +511,14 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 if past_end {
                     break;
                 }
-                self.truncate_at(offset, "block list counts are inconsistent");
+                self.truncate_at(offset, "block list counts are inconsistent")?;
                 break;
             }
             if blhdr.bytes_used == 0 {
                 if past_end {
                     break;
                 }
-                self.truncate_at(offset, "block list carries no data");
+                self.truncate_at(offset, "block list carries no data")?;
                 break;
             }
             if !blhdr.checksum_matches(&bytes) {
@@ -526,7 +526,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 if past_end {
                     break;
                 }
-                self.truncate_at(offset, "block list header checksum mismatch");
+                self.truncate_at(offset, "block list header checksum mismatch")?;
                 break;
             }
             let used = u64::from(blhdr.bytes_used);
@@ -535,7 +535,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 .map(|end| end > header.size)
                 .unwrap_or(true);
             if runs_past_end {
-                self.truncate_at(offset, "block list data runs past the journal end");
+                self.truncate_at(offset, "block list data runs past the journal end")?;
                 break;
             }
 
@@ -562,7 +562,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 self.truncate_at(
                     offset,
                     "block list sequence number is out of order",
-                );
+                )?;
                 break;
             }
             last_sequence_num = blhdr.sequence_num;
@@ -577,7 +577,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
             let jhdr_size = u64::from(header.jhdr_size);
             let capacity = header.size / jhdr_size;
             if u64::from(blhdr.max_blocks) > capacity {
-                self.truncate_at(offset, "block list claims more blocks than the journal holds");
+                self.truncate_at(offset, "block list claims more blocks than the journal holds")?;
                 break;
             }
 
@@ -597,7 +597,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
 
             let next = data_offset.checked_add(used).ok_or(Error::overflow("block list cursor"))?;
             if next <= offset {
-                self.truncate_at(offset, "block list does not advance");
+                self.truncate_at(offset, "block list does not advance")?;
                 break;
             }
 
@@ -618,12 +618,56 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     /// blhdr_offset` and continues, which is exactly this. The reason is
     /// recorded in Apple's own comment: replaying as much as possible leaves the
     /// filesystem in a better state than replaying nothing.
-    fn truncate_at(&mut self, offset: u64, reason: &str) {
+    /// Note that replay stopped short at `offset`, keeping what came before.
+    ///
+    /// Returns an error when there is nothing to keep, because that is the case
+    /// Apple refuses rather than tolerates: if no transaction start was ever
+    /// found, `replay_journal` prints "no known good txn start offset! aborting
+    /// journal replay" and returns -1, and `journal_open` then returns NULL,
+    /// which `core/hfs_vfsops.c` `hfs_mount_existing` treats as `EINVAL` -- the
+    /// volume does not mount.
+    ///
+    /// The alternative is worse than an error. A journal that yields no
+    /// transactions leaves the on-disk filesystem exactly as it was, and that
+    /// filesystem is *stale*: every write in the journal is missing. Returning it
+    /// as a successful mount serves a catalog that is out of date with no
+    /// indication that anything is missing.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `replay_journal`, the
+    /// `txn_start_offset == 0` test at `bad_txn_handling`.
+    ///
+    /// # The retry rule, and why it is not implemented
+    ///
+    /// Apple's other response to damage is to retry: `jhdr->start = orig_jnl_start`
+    /// and `jhdr->end = txn_start_offset`, then replay again, giving up after
+    /// `replay_retry_count == 3`. That produces the same transactions as
+    /// truncating in one pass, because the retry walks exactly the prefix that
+    /// was already found. It differs only for a *transient* device error, where a
+    /// second attempt might succeed.
+    ///
+    /// So there is nothing to gain here from looping, and a loop that re-parsed
+    /// the same bytes could only obscure which check rejected what. Recorded
+    /// rather than omitted silently, since Apple's rule is real.
+    ///
+    /// The order of the checks also matches Apple's exactly, which is what makes
+    /// the abort land in the same place: `max_blocks`, `num_blocks` and the
+    /// sequence rule are all tested *before* `BLHDR_FIRST_HEADER` sets
+    /// `txn_start_offset`, while a block's zero `bsize` is found after it. So
+    /// damage in the first block list's header aborts, and damage in its blocks
+    /// truncates -- the same split Apple makes.
+    fn truncate_at(&mut self, offset: u64, reason: &str) -> Result<()> {
+        if self.transactions.is_empty() {
+            return Err(Error::invalid(
+                "journal",
+                format!("no good transaction could be replayed before {offset}: {reason}"),
+            ));
+        }
         self.truncated_at = Some(offset);
         self.truncation_reason = Some(reason.to_string());
         if let Some(last) = self.transactions.last_mut() {
             last.end = offset.min(last.end);
         }
+        Ok(())
     }
 
     /// Read `len` bytes at `offset` within the journal.
@@ -662,7 +706,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
             match self.apply_transaction(&transaction) {
                 Ok(()) => {}
                 Err(ApplyFailure::Truncate { at, reason }) => {
-                    self.truncate_at(at, &reason);
+                    self.truncate_at(at, &reason)?;
                     self.transactions.truncate(index);
                     break;
                 }
