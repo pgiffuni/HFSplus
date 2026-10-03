@@ -80,8 +80,8 @@ CATALOG_KEY_NAME_OFFSET = CATALOG_KEY_NAME_LEN_OFFSET + CATALOG_KEY_NAME_LEN_SIZ
 
 # `struct BTNodeDescriptor` is 14 bytes, and a leaf node's records start there.
 NODE_DESCRIPTOR_SIZE = 14
-# Offset of `freeSpaceOffset` within the node descriptor.
-NODE_FREE_SPACE_OFFSET = 40
+# Height of a leaf node at the bottom of a depth-1 tree.
+LEAF_NODE_HEIGHT = 1
 
 # The node kinds are a signed byte, so `kBTLeafNode` is -1 and lands on disk as
 # 0xFF, not 0. Writing 0 would make a leaf indistinguishable from an index node,
@@ -236,14 +236,22 @@ def pack_leaf(template: bytes, records: list[bytes]) -> bytes:
     free space, which is where the next record would be.
 
     Everything outside those two regions is left exactly as the formatter wrote
-    it. The reserved fields past `numRecords` are not padding to be tidied -- a
-    leaf node carries no `nodeSize` of its own, and inventing one would be
-    writing a field that means nothing in this node type.
+    it, including the two bytes at offset 40. Those are *not* a leaf node's
+    `freeSpaceOffset`: `struct BTNodeDescriptor` is 14 bytes, so 40 falls in the
+    free space, and mkfs.hfsplus leaves 1 there. Apple maintains no such field
+    for leaves -- only index nodes have one -- so writing a "correct" value would
+    be inventing a field that means nothing in this node type.
     """
     node = bytearray(template)
     node_size = len(node)
     node[8] = K_BT_LEAF_NODE
-    node[9] = 0                      # height
+    # A leaf node's height is one more than its parent's, so at the bottom of a
+    # depth-1 tree it is 1. Writing 0 makes the node look like a header or map
+    # node, and fsck.hfsplus rejects the whole catalog with "Invalid node
+    # height" -- which is how the mistake was found. Mining reference:
+    # `struct BTNodeDescriptor` in `core/BTree.h` says "zero for header, map;
+    # child is one more than parent", and `kBTLeafNode` is -1.
+    node[9] = LEAF_NODE_HEIGHT
     put16(node, 10, len(records))
 
     offset = NODE_DESCRIPTOR_SIZE
@@ -252,8 +260,6 @@ def pack_leaf(template: bytes, records: list[bytes]) -> bytes:
         offsets.append(offset)
         node[offset:offset + len(rec)] = rec
         offset += len(rec)
-    put16(node, NODE_FREE_SPACE_OFFSET, offset)   # freeSpaceOffset
-
     for i, off in enumerate(offsets):
         struct.pack_into(">H", node, node_size - 2 * (i + 1), off)
     struct.pack_into(">H", node, node_size - 2 * (len(records) + 1), offset)
