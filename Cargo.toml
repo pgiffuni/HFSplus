@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "hfsinspect"
 path = "src/bin/hfsinspect.rs"
 
+[[bin]]
+name = "hfsls"
+path = "src/bin/hfsls.rs"
+
 # No third-party dependencies are used by the library at this stage.
 # The format, B-tree and catalog layers are pure Rust so that every
 # on-disk field is decoded explicitly and bounds-checked, which is a
