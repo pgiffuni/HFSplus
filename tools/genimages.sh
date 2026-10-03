@@ -140,6 +140,8 @@ if [[ -f tests/images/replayed/journal-replay-multi.img ]]; then
     tests/images/replayed/journal-bad-sequence.img --bad-sequence
   python3 tools/makejournal.py tests/images/replayed/journal-replay-be.img \
     tests/images/replayed/journal-bad-max-blocks.img --bad-max-blocks 1
+  python3 tools/makejournal.py tests/images/replayed/journal-replay-be.img \
+    tests/images/replayed/journal-bad-bsize.img --bad-bsize 1
 fi
 
 echo "TORN METADATA"

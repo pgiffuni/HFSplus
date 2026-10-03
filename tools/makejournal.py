@@ -366,6 +366,36 @@ def patch_max_blocks(img: bytearray, at_list: int, value: int) -> None:
     print(f"  block list {at_list}: max_blocks set to {value}, checksum refreshed")
 
 
+def patch_zero_bsize(img: bytearray, args) -> None:
+    """Zero one block list entry's `bsize`, as `replay_journal` refuses.
+
+    The data cursor through a block list advances by each entry's size, so a zero
+    here desynchronises every *later* entry in the same list: they would be read
+    from the wrong offset and replay plausible nonsense. Apple prints "invalid
+    bsize" and truncates the transaction; a reader that skips the entry instead
+    produces garbage that looks like a successful replay.
+
+    Mining reference: `core/hfs_journal.c` `replay_journal`, the `size == 0`
+    test inside the block loop.
+    """
+    journal_offset, lists = _block_list_offsets(img)
+    at_list = args.bad_bsize - 1
+    if at_list >= len(lists):
+        sys.exit(f"error: block list {at_list} does not exist ({len(lists)} present)")
+    blhdr_size = struct.unpack_from(">I", img, journal_offset + 32)[0]
+    start = struct.unpack_from(">Q", img, journal_offset + 8)[0]
+    at = start
+    for _ in range(at_list):
+        used = struct.unpack_from(">I", img, journal_offset + at + 4)[0]
+        at += blhdr_size + used
+
+    # binfo[0] is the sequence slot, so the first block entry is index 1.
+    bsize_at = journal_offset + at + BLHDR_PREFIX_SIZE + BLHDR_PREFIX_SIZE + 8
+    struct.pack_into(">I", img, bsize_at, 0)
+    _refresh_blhdr_checksum(img, journal_offset + at, blhdr_size)
+    print(f"  block list {at_list}: first entry's bsize set to 0, checksum refreshed")
+
+
 def patch_replay_rules(img: bytearray, args) -> None:
     """Build a journal that breaks one of the replay rules, for the tests.
 
@@ -393,6 +423,8 @@ def patch_replay_rules(img: bytearray, args) -> None:
         # case Apple truncates.
         values = [1] + [9] * (n - 1)
         patch_sequences(img, values)
+    if args.bad_bsize:
+        patch_zero_bsize(img, args)
     if args.bad_max_blocks:
         bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
         vh = VOLUME_HEADER_OFFSET
@@ -419,6 +451,9 @@ def main() -> None:
                     help="write the journal header little-endian, as x86 hosts do")
     ap.add_argument("--bad-sequence", dest="bad_sequence", action="store_true",
                     help="rewrite the transaction sequence numbers so they jump")
+    ap.add_argument("--bad-bsize", dest="bad_bsize", type=int, default=0,
+                    metavar="LIST",
+                    help="zero block list LIST's first entry bsize")
     ap.add_argument("--bad-max-blocks", dest="bad_max_blocks", type=int,
                     default=0, metavar="LIST",
                     help="inflate block list LIST's max_blocks beyond the journal")
@@ -456,7 +491,7 @@ def main() -> None:
         return write_external_journal(img, journal_info_block, args)
     if args.legacy_header:
         return write_legacy_header(img, args)
-    if args.bad_sequence or args.bad_max_blocks:
+    if args.bad_sequence or args.bad_max_blocks or args.bad_bsize:
         return patch_replay_rules(img, args)
 
     # --- Journal info block ------------------------------------------------
