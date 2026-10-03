@@ -439,6 +439,41 @@ impl JournalHeader {
                 format!("header says {} but the info block says {journal_size}", self.size),
             ));
         }
+        // `start` and `end` must both be positive and within the journal. A
+        // `start` of 0 is the dangerous one: offset zero of the journal is the
+        // journal *header*, so the walk would parse the header as a block list
+        // and report whatever counts it found there.
+        //
+        // Mining reference: `CHECK_JOURNAL` in `core/hfs_journal.c` panics on
+        // `jhdr->start <= 0 || jhdr->start > jnl->jhdr->size`, and the same for
+        // `end`. Those are assertions rather than errors, so a volume reaching
+        // them is corrupt by definition.
+        if self.start == 0 {
+            return Err(Error::invalid(
+                "journal_header.start",
+                "0 is the journal header itself, not a transaction",
+            ));
+        }
+        if self.end == 0 {
+            return Err(Error::invalid(
+                "journal_header.end",
+                "0 is the journal header itself, not a transaction",
+            ));
+        }
+        if self.start > self.size {
+            return Err(Error::out_of_range(
+                "journal_header.start",
+                self.start,
+                self.size,
+            ));
+        }
+        if self.end > self.size {
+            return Err(Error::out_of_range(
+                "journal_header.end",
+                self.end,
+                self.size,
+            ));
+        }
         if self.start > self.end {
             return Err(Error::invalid(
                 "journal_header",
