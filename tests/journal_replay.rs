@@ -768,3 +768,171 @@ fn a_journal_smaller_than_the_probe_is_still_read_without_overrunning_the_image(
         ),
     }
 }
+
+// --- Replay rules taken from replay_journal ------------------------------
+
+/// Read every property of a journal, inside a closure that owns the device.
+///
+/// The journal borrows the device and the overlay borrows the journal, so
+/// neither can outlive this function -- which is why the caller gets a closure
+/// rather than a `Journal` back.
+fn with_fixture(
+    name: &str,
+    f: impl FnOnce(&Journal<'_, FileDevice>),
+) -> bool {
+    let path = common::repo_root()
+        .join("tests/images/replayed")
+        .join(format!("{name}.img"));
+    if !path.exists() {
+        eprintln!("skipping {name}: {} not built", path.display());
+        return false;
+    }
+    let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {name}: {e}"));
+    let vh = VolumeHeader::read_from(&dev).unwrap_or_else(|e| panic!("header {name}: {e}"));
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .unwrap_or_else(|e| panic!("journal {name}: {e}"))
+        .unwrap_or_else(|| panic!("{name}: expected a journal to replay"));
+    f(&journal);
+    true
+}
+
+#[test]
+fn a_transaction_sequence_number_that_jumps_truncates_the_replay() {
+    // Sequence numbers are the only record of which *generation* a transaction
+    // belongs to. A journal that was reset and appended to carries numbers that
+    // jump, and replaying across the reset would apply stale writes over newer
+    // data -- so Apple truncates at the jump and keeps what came before.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal` compares each list's
+    // sequence with `last_sequence_num` and sets
+    // `txn_start_offset = jnl->jhdr->end = blhdr_offset` when it is neither that
+    // value nor one more.
+    let ran = with_fixture("journal-bad-sequence", |journal| {
+    // The first transaction survives; the jump is not.
+    assert_eq!(
+        journal.transactions().len(),
+        1,
+        "only the transaction before the jump may be replayed"
+    );
+    assert_eq!(journal.replayed_blocks().len(), 1);
+    let (offset, reason) = journal
+        .truncation()
+        .expect("a sequence jump must truncate, not be ignored");
+    assert_eq!(offset, 12288, "the truncation is at the second block list");
+    assert!(
+        reason.contains("sequence"),
+        "the reason must name the sequence rule, got {reason:?}"
+    );
+    });
+    assert!(ran, "journal-bad-sequence: the image must be built");
+}
+
+#[test]
+fn consecutive_sequence_numbers_are_accepted_in_full() {
+    // The rule allows the previous number or one more, and skips the comparison
+    // when either side is zero. So +1 replays in full -- and a test that only
+    // covered the jump would pass against an implementation that truncated on
+    // every list.
+    let path = common::repo_root()
+        .join("tests/images/replayed/journal-replay-multi.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("a journal");
+
+    let numbers: Vec<u32> = journal.transactions().iter().map(|t| t.sequence_num).collect();
+    assert_eq!(numbers, vec![1, 2, 3], "the generator writes +1 each time");
+    assert!(
+        journal.truncation().is_none(),
+        "a well-ordered journal must replay in full, got {:?}",
+        journal.truncation()
+    );
+    assert_eq!(journal.transactions().len(), 3);
+
+    // Three transactions over *two* distinct blocks: the fixture writes block 200
+    // twice and block 250 once. That is the point of the fixture, not a
+    // bookkeeping accident -- a later transaction must win for a block an earlier
+    // one also wrote, and the overlay holds one entry per block.
+    assert_eq!(
+        journal.replayed_blocks().len(),
+        2,
+        "the overlay holds one entry per block, however many transactions wrote it"
+    );
+    let blocks: Vec<u64> = journal
+        .replayed_blocks()
+        .iter()
+        .map(|b| b.device_block)
+        .collect();
+    assert_eq!(blocks, vec![200, 250], "the blocks the fixture writes");
+}
+
+#[test]
+fn a_block_list_claiming_more_blocks_than_the_journal_holds_is_refused() {
+    // `max_blocks` is how many blocks a list could hold, so it cannot exceed the
+    // blocks the journal has. Apple's bound is plain integer division --
+    // `max_blocks > (jhdr->size / jhdr->jhdr_size)` -- so rounding up would be one
+    // block looser than Apple's, and a list claiming that many blocks would be
+    // accepted here and refused there.
+    let ran = with_fixture("journal-bad-max-blocks", |journal| {
+    assert!(
+        journal.transactions().is_empty(),
+        "nothing may be replayed from a list claiming more blocks than exist"
+    );
+    let (offset, reason) = journal
+        .truncation()
+        .expect("an impossible max_blocks must truncate");
+    assert_eq!(offset, 4096, "at the first block list");
+    assert!(
+        reason.contains("more blocks than the journal holds"),
+        "the reason must state the bound, got {reason:?}"
+    );
+    });
+    assert!(ran, "journal-bad-max-blocks: the image must be built");
+}
+
+#[test]
+fn every_replay_fixture_opens_without_panicking_and_without_writing() {
+    // A journal header is untrusted input. Whatever a fixture contains, opening
+    // it must produce a result rather than a panic -- and reading must leave the
+    // image alone, which is the guarantee the whole milestone rests on.
+    let dir = common::repo_root().join("tests/images/replayed");
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let mut checked = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("img") {
+            continue;
+        }
+        let name = path.file_stem().unwrap().to_string_lossy().to_string();
+        if name == "journal-external" {
+            // Deliberately has no journal to replay; its own suite covers that.
+            continue;
+        }
+        let before = std::fs::read(&path).expect("read before");
+        {
+            let dev = FileDevice::open(&path).expect("open");
+            let vh = VolumeHeader::read_from(&dev).expect("header");
+            if let Ok(Some(journal)) =
+                Journal::open(&dev, vh.journal_info_block, vh.block_size)
+            {
+                let _ = journal.transactions();
+                let _ = journal.replayed_blocks();
+                let _ = journal.truncation();
+                let _ = journal.header_checksum_ok();
+            }
+        }
+        let after = std::fs::read(&path).expect("read after");
+        assert_eq!(
+            digest(&before),
+            digest(&after),
+            "{name}: opening the journal modified the image"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no replay fixtures were checked");
+}
