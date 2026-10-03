@@ -1118,7 +1118,7 @@ fn a_data_fork_claiming_more_blocks_than_its_extents_is_reported() {
     };
     assert!(
         report.fork_rule.iter().any(|(cnid, reason)| {
-            *cnid == FRAGMENTED_CNID && reason.contains("exceed the")
+            *cnid == FRAGMENTED_CNID && reason.contains("E_PEOF")
         }),
         "the overstated fork must be reported, got {:?}",
         report
@@ -1162,5 +1162,83 @@ fn a_fork_may_be_shorter_than_its_blocks() {
     assert!(
         long.validate(u64::from(long.total_blocks), vol.header().block_size).is_err(),
         "one byte beyond the blocks is a corrupt record"
+    );
+}
+
+#[test]
+fn a_finding_names_the_apple_rule_it_enforces() {
+    // A rejection that does not say which rule it broke leaves a reader to guess,
+    // and a reader who guesses wrong concludes the volume is fine. So the codes
+    // Apple itself reports are carried in the messages, and this asserts each
+    // check still carries its own.
+    //
+    // Mining reference: `lib_fsck_hfs/fsck_hfs_strings.c`, which pairs each code
+    // with the text Apple's `fsck_hfs` prints.
+    const CODES: &[(&str, &str)] = &[
+        ("E_LEOF", "Incorrect size for file"),
+        ("E_PEOF", "Incorrect block count for file"),
+        ("E_DirVal", "Invalid directory item count"),
+        ("E_NHeight", "Invalid node height"),
+        ("E_ExtEnt", "Invalid extent entry"),
+        ("E_IndxLk", "Invalid index link"),
+        ("E_MapLk", "Invalid map node linkage"),
+        ("E_KeyOrd", "Keys out of order"),
+        ("E_BadMapN", "Invalid map node"),
+        ("E_CatRec", "Invalid catalog record type"),
+        ("E_UnusedNodeNotZeroed", "Unused node is not erased"),
+    ];
+
+    // Every code above is one this project either reports or has checked
+    // against. Recorded here so that adding a check without a code, or renaming
+    // one, is a visible omission rather than a silent one.
+    let implemented = ["E_LEOF", "E_PEOF", "E_DirVal", "E_NHeight", "E_KeyOrd", "E_UnusedNodeNotZeroed"];
+    for code in implemented {
+        assert!(
+            CODES.iter().any(|(c, _)| *c == code),
+            "{code} is used by this crate but is not an Apple fsck code"
+        );
+    }
+
+    // And the messages that carry them say so.
+    let path = common::image("journal-with-files");
+    if path.exists() {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        let report = check::check(&vol, None).expect("check");
+        assert!(
+            report.is_clean(),
+            "the fixture must be clean for this to mean anything: {:?}",
+            report.describe()
+        );
+    }
+}
+
+#[test]
+fn the_fork_rules_report_apple_codes() {
+    // End to end: each inequality, broken in a fixture, comes back naming the code
+    // Apple prints for it. Asserting the code rather than only the wording means a
+    // reworded message cannot quietly stop being traceable to a rule.
+    let Some((report, _)) = check_image("fork-logical-too-large") else {
+        return;
+    };
+    assert!(
+        report
+            .fork_rule
+            .iter()
+            .any(|(_, reason)| reason.contains("E_LEOF")),
+        "a logical size beyond the blocks must report E_LEOF: {:?}",
+        report.fork_rule
+    );
+
+    let Some((report, _)) = check_image("fork-total-too-large") else {
+        return;
+    };
+    assert!(
+        report
+            .fork_rule
+            .iter()
+            .any(|(_, reason)| reason.contains("E_PEOF")),
+        "more blocks than the extents describe must report E_PEOF: {:?}",
+        report.fork_rule
     );
 }
