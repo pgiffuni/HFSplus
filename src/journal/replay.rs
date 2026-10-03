@@ -57,6 +57,31 @@ pub const BLHDR_PREFIX_SIZE: usize = 16;
 /// `off_t` that is 8 + 4 + 4.
 pub const BLOCK_INFO_SIZE: usize = 16;
 
+/// Index of the `binfo` entry that is **not** a block.
+///
+/// This is the most consequential detail of the replay algorithm and it is easy
+/// to miss. `binfo[0]` holds the transaction's sequence number, unioned with the
+/// checksum word:
+///
+/// ```c
+/// typedef struct _blk_info {
+///     int32_t    bsize;
+///     union { int32_t cksum; uint32_t sequence_num; } b;
+/// } _blk_info;
+/// ```
+///
+/// Apple's replay loop starts at index 1:
+///
+/// ```c
+/// for (i = 1; i < blhdr->num_blocks; i++) { ... add_block(...) }
+/// ```
+///
+/// so `num_blocks` counts the sequence slot. Replaying `binfo[0]` as a block
+/// would fabricate a filesystem block out of a transaction counter, silently, on
+/// a real macOS journal. A list describing one block therefore has
+/// `num_blocks == 2`.
+pub const FIRST_BLOCK_INDEX: usize = 1;
+
 /// `BLHDR_FIRST_HEADER`: this block list begins a transaction.
 pub const BLHDR_FIRST_HEADER: u32 = 0x0000_0002;
 
@@ -67,11 +92,26 @@ pub const BLHDR_CHECK_CHECKSUMS: u32 = 0x0000_0001;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RecordedBlock {
     /// Block number on the filesystem device.
+    ///
+    /// `0xFFFF_FFFF_FFFF_FFFF` means "killed": Apple skips such a block rather
+    /// than replaying it, and so does this.
     pub bnum: u64,
     /// Size of the block in bytes.
     pub bsize: u32,
-    /// Checksum of the block's contents.
+    /// Checksum of the block's contents, or the transaction's sequence number
+    /// when [`BlockListHeader::checks_blocks`] is clear, because the two share
+    /// one word on disk.
     pub cksum: u32,
+}
+
+impl RecordedBlock {
+    /// Whether this block was killed and must not be replayed.
+    ///
+    /// Mining reference: `core/hfs_journal.c` skips `number == (off_t)-1` with
+    /// the comment "don't add \"killed\" blocks".
+    pub fn is_killed(&self) -> bool {
+        self.bnum == END_BLK_NUM
+    }
 }
 
 /// A block list header and the blocks it describes.
@@ -87,6 +127,12 @@ pub struct BlockListHeader {
     pub checksum: u32,
     /// Flags; see [`BLHDR_FIRST_HEADER`] and [`BLHDR_CHECK_CHECKSUMS`].
     pub flags: u32,
+    /// The transaction's sequence number, taken from `binfo[0]`.
+    ///
+    /// Only meaningful when [`BlockListHeader::checks_blocks`] is clear, because
+    /// otherwise the same word is the sequence slot's checksum. Either way it is
+    /// never a block.
+    pub sequence_num: u32,
     /// Byte offset within the journal where this list's block data begins.
     ///
     /// Recorded while walking rather than recomputed later: the data follows the
@@ -148,8 +194,19 @@ impl BlockListHeader {
             ));
         }
 
-        let mut blocks = Vec::with_capacity(usize::from(num_blocks));
-        for i in 0..usize::from(num_blocks) {
+        // binfo[0] is the sequence-number slot, so a list needs at least that
+        // plus one block.
+        if usize::from(num_blocks) <= FIRST_BLOCK_INDEX {
+            return Err(Error::invalid(
+                "block_list_header.num_blocks",
+                format!("{num_blocks} is too small to hold the sequence slot and a block"),
+            ));
+        }
+
+        let sequence_num = be.u32(BLHDR_PREFIX_SIZE + 12)?;
+
+        let mut blocks = Vec::with_capacity(usize::from(num_blocks) - FIRST_BLOCK_INDEX);
+        for i in FIRST_BLOCK_INDEX..usize::from(num_blocks) {
             let off = BLHDR_PREFIX_SIZE + i * BLOCK_INFO_SIZE;
             let bnum = be.u64(off)?;
             let bsize = be.u32(off + 8)?;
@@ -164,6 +221,7 @@ impl BlockListHeader {
             checksum,
             flags,
             data_offset,
+            sequence_num,
             blocks,
         })
     }
@@ -256,6 +314,10 @@ pub struct Journal<'a, D: ?Sized> {
     overlay: Vec<ReplayedBlock>,
     /// The volume's allocation block size, which `bnum` is measured in.
     block_size: u32,
+    /// Where replay stopped short, if it did.
+    truncated_at: Option<u64>,
+    /// Why replay stopped short.
+    truncation_reason: Option<String>,
     device: &'a D,
 }
 
@@ -265,6 +327,7 @@ impl<'a, D: BlockDevice + ?Sized> std::fmt::Debug for Journal<'a, D> {
             .field("offset", &self.info.offset)
             .field("size", &self.info.size)
             .field("transactions", &self.transactions.len())
+            .field("truncated_at", &self.truncated_at)
             .field("replayed_blocks", &self.overlay.len())
             .field("has_header", &self.header.is_some())
             .finish()
@@ -309,6 +372,8 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
             transactions: Vec::new(),
             overlay: Vec::new(),
             block_size,
+            truncated_at: None,
+            truncation_reason: None,
             device,
         };
 
@@ -322,83 +387,120 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         Ok(Some(journal))
     }
 
-    /// Walk the journal's transactions and build the overlay.
+    /// Walk the journal's block lists and build the overlay.
+    ///
+    /// Apple does not model transaction boundaries during replay: it reads block
+    /// list headers from `start` to `end` and applies each in order, using
+    /// `BLHDR_FIRST_HEADER` only to note where a transaction began. This walks
+    /// the same way and then groups the block lists into transactions using that
+    /// flag, so the reported grouping is the one the journal itself records
+    /// rather than one invented from offsets.
+    ///
+    /// On damage Apple **truncates** rather than abandoning: it stops at the bad
+    /// block list, keeps everything replayed before it, and adjusts the journal's
+    /// end. Its own comment says why:
+    ///
+    /// ```c
+    /// XXXdbg - if these checks fail, we should replay as much
+    /// ///         as we can in the hopes that it will still leave the
+    /// ///         drive in a better state than if we didn't replay
+    /// ///         anything
+    /// ```
+    ///
+    /// A read-only mount that refused the whole journal would instead show a
+    /// filesystem missing every recent change, which is a worse state than one
+    /// missing changes from the damage point onwards.
     fn replay(&mut self) -> Result<()> {
         let Some(header) = self.header else {
             // No header means no transactions. Treated as an empty journal rather
-            // than an error, because an uninitialized journal is a normal state.
+            // than an error, because an uninitialised journal is a normal state.
             return Ok(());
         };
         header.validate(self.info.size)?;
 
+        let blhdr_size = u64::from(header.blhdr_size);
         let mut offset = header.start;
         let mut guard = 0u32;
+
         while offset < header.end {
             guard += 1;
-            if guard > MAX_TRANSACTIONS {
+            if guard > MAX_BLOCK_LISTS {
                 return Err(Error::invalid(
                     "journal",
-                    "transaction walk exceeded the transaction limit",
+                    "block list walk exceeded the block list limit",
                 ));
             }
-            let transaction = self.read_transaction(offset, &header)?;
-            let end = transaction.end;
-            if end <= offset {
-                return Err(Error::invalid(
-                    "journal",
-                    format!("transaction at {offset} does not advance"),
-                ));
+
+            // The block list occupies one blhdr_size block; its data follows.
+            let data_offset = offset
+                .checked_add(blhdr_size)
+                .ok_or(Error::overflow("block list cursor"))?;
+            let bytes = self.read_journal(offset, header.blhdr_size as usize)?;
+            let blhdr = BlockListHeader::parse_at(&bytes, data_offset)?;
+
+            // Validate as Apple does, before any of its contents are used.
+            if blhdr.num_blocks == 0 || blhdr.num_blocks > blhdr.max_blocks {
+                self.truncate_at(offset, "block list counts are inconsistent");
+                break;
             }
-            offset = end;
-            self.transactions.push(transaction);
+            if blhdr.bytes_used == 0 {
+                self.truncate_at(offset, "block list carries no data");
+                break;
+            }
+            if !blhdr.checksum_matches(&bytes) {
+                // Apple truncates here rather than abandoning the replay.
+                self.truncate_at(offset, "block list header checksum mismatch");
+                break;
+            }
+            let used = u64::from(blhdr.bytes_used);
+            let runs_past_end = data_offset
+                .checked_add(used)
+                .map(|end| end > header.end)
+                .unwrap_or(true);
+            if runs_past_end {
+                self.truncate_at(offset, "block list data runs past the journal end");
+                break;
+            }
+
+            // A first header starts a new transaction.
+            if blhdr.is_first() || self.transactions.is_empty() {
+                self.transactions.push(Transaction {
+                    sequence_num: blhdr.sequence_num,
+                    offset,
+                    end: data_offset,
+                    block_lists: Vec::new(),
+                });
+            }
+
+            let next = data_offset.checked_add(used).ok_or(Error::overflow("block list cursor"))?;
+            if next <= offset {
+                self.truncate_at(offset, "block list does not advance");
+                break;
+            }
+
+            if let Some(current) = self.transactions.last_mut() {
+                current.block_lists.push(blhdr);
+                current.end = next;
+            }
+            offset = next;
         }
+
         self.build_overlay()?;
         Ok(())
     }
 
-    /// Read one transaction starting at `offset` within the journal.
-    fn read_transaction(&mut self, offset: u64, header: &JournalHeader) -> Result<Transaction> {
-        let mut block_lists = Vec::new();
-        let mut data_cursor = offset;
-        let sequence_num = header.sequence_num;
-
-        for _ in 0..MAX_BLOCK_LISTS {
-            // The block list occupies one blhdr_size block; its data follows.
-            let data_offset = data_cursor
-                .checked_add(u64::from(header.blhdr_size))
-                .ok_or(Error::overflow("transaction cursor"))?;
-            let bytes = self.read_journal(data_cursor, header.blhdr_size as usize)?;
-            let blhdr = BlockListHeader::parse_at(&bytes, data_offset)?;
-            if blhdr.num_blocks == 0 {
-                return Err(Error::invalid(
-                    "block_list_header",
-                    format!("empty block list at journal offset {data_cursor}"),
-                ));
-            }
-
-            // `bytes_used` says how much data this list carries.
-            let used = u64::from(blhdr.bytes_used);
-            if used == 0 {
-                return Err(Error::invalid(
-                    "block_list_header.bytes_used",
-                    "a block list with no data cannot be replayed",
-                ));
-            }
-            block_lists.push(blhdr);
-
-            data_cursor = data_offset
-                .checked_add(used)
-                .ok_or(Error::overflow("transaction cursor"))?;
-            if data_cursor > header.end {
-                return Err(Error::out_of_range("transaction", data_cursor, header.end));
-            }
-            // Stop when no further block list fits before the end of the journal.
-            if data_cursor + u64::from(header.blhdr_size) >= header.end {
-                break;
-            }
+    /// Record that replay stopped short at `offset`, keeping what came before.
+    ///
+    /// Mining reference: `core/hfs_journal.c` sets `jnl->jhdr->end =
+    /// blhdr_offset` and continues, which is exactly this. The reason is
+    /// recorded in Apple's own comment: replaying as much as possible leaves the
+    /// filesystem in a better state than replaying nothing.
+    fn truncate_at(&mut self, offset: u64, reason: &str) {
+        self.truncated_at = Some(offset);
+        self.truncation_reason = Some(reason.to_string());
+        if let Some(last) = self.transactions.last_mut() {
+            last.end = offset.min(last.end);
         }
-
-        Ok(Transaction { sequence_num, offset, end: data_cursor, block_lists })
     }
 
     /// Read `len` bytes at `offset` within the journal.
@@ -418,62 +520,104 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     }
 
     /// Replace every block the transactions rewrote with its journal contents.
+    ///
+    /// Transactions are applied in journal order, so a later transaction
+    /// supersedes an earlier write to the same block. A block whose recorded
+    /// checksum does not match its data truncates the replay at the start of
+    /// the transaction that owns it, which is what Apple does: it restarts and
+    /// replays only the transactions it considers known good.
+    ///
+    /// Mining reference: `core/hfs_journal.c` sets `bad_blocks = 1; goto
+    /// bad_txn_handling;` from inside the block loop, and `bad_txn_handling`
+    /// then sets `jhdr->end = txn_start_offset` and restarts replay from the
+    /// original start -- so the damaged transaction and everything after it are
+    /// dropped while everything before survives. Apple bounds this to three
+    /// retries before abandoning the journal entirely.
     fn build_overlay(&mut self) -> Result<()> {
-        // Later transactions win, so blocks are applied in order and an earlier
-        // write to the same block is overwritten.
-        for transaction in &self.transactions {
-            for list in &transaction.block_lists {
-                let mut data_cursor = 0u64;
-                for block in &list.blocks {
-                    if block.bnum == END_BLK_NUM {
-                        break;
-                    }
-                    let size = block.bsize as usize;
-                    if size == 0 {
-                        continue;
-                    }
-                    let start = list
-                        .data_offset
-                        .checked_add(data_cursor)
-                        .ok_or(Error::overflow("replayed block data"))?;
-                    let data = self.read_journal(start, size)?;
-                    data_cursor += size as u64;
-
-                    if list.checks_blocks() && calc_checksum(&data) != block.cksum {
-                        return Err(Error::invalid(
-                            "journal block checksum",
-                            format!("block {} failed its recorded checksum", block.bnum),
-                        ));
-                    }
-
-                    let device_offset = block
-                        .bnum
-                        .checked_mul(u64::from(self.block_size))
-                        .ok_or(Error::overflow("replayed block offset"))?;
-                    match self
-                        .overlay
-                        .iter_mut()
-                        .find(|b| b.device_block == block.bnum)
-                    {
-                        // A later transaction supersedes an earlier write to the
-                        // same block, so this is a replacement rather than an
-                        // append.
-                        Some(existing) => {
-                            existing.device_offset = device_offset;
-                            existing.data = data;
-                        }
-                        None => self.overlay.push(ReplayedBlock {
-                            device_block: block.bnum,
-                            device_offset,
-                            data,
-                        }),
-                    }
+        for index in 0..self.transactions.len() {
+            let transaction = self.transactions[index].clone();
+            match self.apply_transaction(&transaction) {
+                Ok(()) => {}
+                Err(ApplyFailure::Truncate { at, reason }) => {
+                    self.truncate_at(at, &reason);
+                    self.transactions.truncate(index);
+                    break;
                 }
+                Err(ApplyFailure::Fatal(e)) => return Err(e),
             }
         }
         self.overlay.sort_by_key(|b| b.device_offset);
         Ok(())
     }
+
+    /// Apply one transaction's blocks to the overlay.
+    fn apply_transaction(
+        &mut self,
+        transaction: &Transaction,
+    ) -> std::result::Result<(), ApplyFailure> {
+        for list in &transaction.block_lists {
+            let mut data_cursor = 0u64;
+            for block in &list.blocks {
+                if block.is_killed() {
+                    // Mining reference: core/hfs_journal.c skips a killed block
+                    // with "don't add \"killed\" blocks", and still steps the
+                    // data cursor by its size.
+                    data_cursor += u64::from(block.bsize);
+                    continue;
+                }
+                let size = block.bsize as usize;
+                if size == 0 {
+                    continue;
+                }
+                let start = list
+                    .data_offset
+                    .checked_add(data_cursor)
+                    .ok_or_else(|| ApplyFailure::Fatal(Error::overflow("replayed block data")))?;
+                let data = self.read_journal(start, size).map_err(ApplyFailure::Fatal)?;
+                data_cursor += size as u64;
+
+                // A zero recorded checksum means "do not verify", which Apple
+                // checks for explicitly before comparing.
+                if list.checks_blocks()
+                    && block.cksum != 0
+                    && calc_checksum(&data) != block.cksum
+                {
+                    return Err(ApplyFailure::Truncate {
+                        at: transaction.offset,
+                        reason: format!(
+                            "block {} failed its recorded checksum",
+                            block.bnum
+                        ),
+                    });
+                }
+
+                let device_offset = block
+                    .bnum
+                    .checked_mul(u64::from(self.block_size))
+                    .ok_or_else(|| ApplyFailure::Fatal(Error::overflow("replayed block offset")))?;
+                match self
+                    .overlay
+                    .iter_mut()
+                    .find(|b| b.device_block == block.bnum)
+                {
+                    // A later transaction supersedes an earlier write to the
+                    // same block, so this is a replacement rather than an append.
+                    Some(existing) => {
+                        existing.device_offset = device_offset;
+                        existing.data = data;
+                    }
+                    None => self.overlay.push(ReplayedBlock {
+                        device_block: block.bnum,
+                        device_offset,
+                        data,
+                    }),
+                }
+            }
+        }
+        Ok(())
+    }
+
+
 
     /// The volume's `JournalInfoBlock`.
     pub fn info(&self) -> &JournalInfoBlock {
@@ -491,8 +635,28 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     }
 
     /// The transactions found, in journal order.
+    ///
+    /// Grouped by `BLHDR_FIRST_HEADER`, which is the flag the journal sets to
+    /// mark where each transaction begins.
     pub fn transactions(&self) -> &[Transaction] {
         &self.transactions
+    }
+
+    /// Every block list replayed, in journal order.
+    pub fn block_lists(&self) -> usize {
+        self.transactions.iter().map(|t| t.block_lists.len()).sum()
+    }
+
+    /// Where replay stopped short, and why.
+    ///
+    /// `Some((offset, reason))` means the journal was damaged partway and
+    /// everything before that point was replayed, which is what Apple does
+    /// rather than refusing the whole journal.
+    pub fn truncation(&self) -> Option<(u64, &str)> {
+        match (self.truncated_at, self.truncation_reason.as_deref()) {
+            (Some(at), Some(why)) => Some((at, why)),
+            _ => None,
+        }
     }
 
     /// The blocks replayed on top of the filesystem.
@@ -509,11 +673,25 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     }
 }
 
-/// Cap on transactions walked per journal.
-const MAX_TRANSACTIONS: u32 = 1 << 16;
-
 /// Cap on block lists within one transaction.
 const MAX_BLOCK_LISTS: u32 = 1 << 12;
+
+/// Why applying a transaction failed.
+///
+/// Mining reference: Apple splits replay failures into "discard this transaction
+/// and carry on" and "abandon the journal", which is exactly these two variants.
+/// See `build_overlay`.
+enum ApplyFailure {
+    /// Drop this transaction and everything after it.
+    Truncate {
+        /// Journal offset at which replay stops.
+        at: u64,
+        /// Human-readable cause, reported rather than swallowed.
+        reason: String,
+    },
+    /// Structural damage that stops replay entirely.
+    Fatal(Error),
+}
 
 /// A read-only device that consults a journal overlay first.
 pub struct OverlaidDevice<'o, 'j, D: ?Sized> {
@@ -588,53 +766,101 @@ mod tests {
         assert_eq!(super::super::checksum::BLHDR_CHECKSUM_SIZE, 32);
     }
 
-    #[test]
-    fn block_list_header_round_trips() {
-        let mut raw = vec![0u8; BLHDR_PREFIX_SIZE + 2 * BLOCK_INFO_SIZE];
-        raw[0..2].copy_from_slice(&16u16.to_be_bytes()); // max_blocks
-        raw[2..4].copy_from_slice(&2u16.to_be_bytes()); // num_blocks
-        raw[4..8].copy_from_slice(&8192u32.to_be_bytes()); // bytes_used
-        raw[12..16].copy_from_slice(&BLHDR_FIRST_HEADER.to_be_bytes());
-        for (i, (bnum, bsize)) in [(100u64, 4096u32), (101, 4096)].iter().enumerate() {
-            let off = BLHDR_PREFIX_SIZE + i * BLOCK_INFO_SIZE;
+    /// Build a block list header holding `blocks`, with `binfo[0]` as the
+    /// sequence slot, exactly as `makejournal.py` writes it.
+    fn make_blhdr(blocks: &[(u64, u32, u32)], flags: u32, blhdr_size: usize) -> Vec<u8> {
+        let prefix = BLHDR_PREFIX_SIZE;
+        let num_entries = blocks.len() + FIRST_BLOCK_INDEX;
+        let mut raw = vec![0u8; blhdr_size];
+        raw[0..2].copy_from_slice(&(num_entries as u16).to_be_bytes()); // max_blocks
+        raw[2..4].copy_from_slice(&(num_entries as u16).to_be_bytes()); // num_blocks
+        let bytes_used = (blocks.len() * 4096) as u32;
+        raw[4..8].copy_from_slice(&bytes_used.to_be_bytes());
+        raw[12..16].copy_from_slice(&flags.to_be_bytes());
+        // binfo[0] is the sequence slot: bsize 0 and the sequence number.
+        raw[prefix + 8..prefix + 12].copy_from_slice(&0u32.to_be_bytes());
+        raw[prefix + 12..prefix + 16].copy_from_slice(&1u32.to_be_bytes());
+        for (i, (bnum, bsize, cksum)) in blocks.iter().enumerate() {
+            let off = prefix + (i + FIRST_BLOCK_INDEX) * BLOCK_INFO_SIZE;
             raw[off..off + 8].copy_from_slice(&bnum.to_be_bytes());
             raw[off + 8..off + 12].copy_from_slice(&bsize.to_be_bytes());
+            raw[off + 12..off + 16].copy_from_slice(&cksum.to_be_bytes());
         }
-        let cksum = crate::journal::checksum::checksum_with_zeroed_field(&raw, 8, BLHDR_CHECKSUM_SIZE)
-            .expect("the buffer is long enough")
-            .to_be_bytes();
-        raw[8..12].copy_from_slice(&cksum);
+        let cksum = super::super::checksum::checksum_with_zeroed_field(&raw, 8, BLHDR_CHECKSUM_SIZE)
+            .expect("long enough");
+        raw[8..12].copy_from_slice(&cksum.to_be_bytes());
+        raw
+    }
+
+    #[test]
+    fn block_list_header_round_trips() {
+        let blocks = [(100u64, 4096u32, 0xAAAA_AAAAu32), (101, 4096, 0xBBBB_BBBB)];
+        let raw = make_blhdr(&blocks, BLHDR_FIRST_HEADER, 4096);
 
         let h = BlockListHeader::parse(&raw).unwrap();
-        assert_eq!(h.max_blocks, 16);
-        assert_eq!(h.num_blocks, 2);
-        assert_eq!(h.bytes_used, 8192);
+        // num_blocks counts the sequence slot, so two blocks means three.
+        assert_eq!(h.max_blocks, 3);
+        assert_eq!(h.num_blocks, 3);
+        assert_eq!(h.blocks.len(), 2);
         assert!(h.is_first());
         assert!(!h.checks_blocks());
-        assert_eq!(h.blocks.len(), 2);
+        assert_eq!(h.sequence_num, 1);
         assert_eq!(h.blocks[0].bnum, 100);
-        assert_eq!(h.blocks[1].bsize, 4096);
+        assert_eq!(h.blocks[0].bsize, 4096);
+        assert_eq!(h.blocks[0].cksum, 0xAAAA_AAAA);
+        assert_eq!(h.blocks[1].bnum, 101);
         assert!(h.checksum_matches(&raw));
     }
 
     #[test]
-    fn block_list_header_rejects_impossible_counts() {
-        let mut raw = vec![0u8; BLHDR_PREFIX_SIZE + BLOCK_INFO_SIZE];
-        raw[0..2].copy_from_slice(&4u16.to_be_bytes()); // max_blocks
-        raw[2..4].copy_from_slice(&100u16.to_be_bytes()); // num_blocks > capacity
-        assert!(matches!(
-            BlockListHeader::parse(&raw),
-            Err(Error::Truncated { .. })
-        ));
+    fn the_sequence_slot_is_never_replayed_as_a_block() {
+        // The bug this guards: treating binfo[0] as a block would fabricate a
+        // filesystem block out of a transaction counter. Apple iterates from 1.
+        let blocks = [(100u64, 4096u32, 0u32)];
+        let raw = make_blhdr(&blocks, BLHDR_FIRST_HEADER, 4096);
+        let h = BlockListHeader::parse(&raw).unwrap();
+        assert_eq!(h.blocks.len(), 1);
+        assert_eq!(h.blocks[0].bnum, 100);
+        assert!(
+            h.blocks.iter().all(|b| b.bnum != 100 - 1),
+            "the sequence slot must not appear as a block"
+        );
+    }
 
-        // num_blocks above max_blocks is corrupt even when the bytes are there.
-        let mut big = vec![0u8; BLHDR_PREFIX_SIZE + 8 * BLOCK_INFO_SIZE];
-        big[0..2].copy_from_slice(&2u16.to_be_bytes());
-        big[2..4].copy_from_slice(&8u16.to_be_bytes());
-        assert!(matches!(
-            BlockListHeader::parse(&big),
-            Err(Error::InvalidField { .. })
-        ));
+    #[test]
+    fn a_list_too_small_to_hold_a_block_is_rejected() {
+        // num_blocks == 1 is the sequence slot alone, which describes nothing.
+        for n in [0u16, 1] {
+            let mut raw = vec![0u8; BLHDR_PREFIX_SIZE + 2 * BLOCK_INFO_SIZE];
+            raw[0..2].copy_from_slice(&n.max(1).to_be_bytes());
+            raw[2..4].copy_from_slice(&n.to_be_bytes());
+            assert!(
+                matches!(
+                    BlockListHeader::parse(&raw),
+                    Err(Error::InvalidField { field: "block_list_header.num_blocks", .. })
+                ),
+                "num_blocks {n} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_killed_block_is_recognised() {
+        let killed = RecordedBlock { bnum: END_BLK_NUM, bsize: 4096, cksum: 0 };
+        assert!(killed.is_killed());
+        let normal = RecordedBlock { bnum: 200, bsize: 4096, cksum: 0 };
+        assert!(!normal.is_killed());
+    }
+
+    #[test]
+    fn the_checks_flag_selects_how_the_union_word_is_read() {
+        // The same word is a checksum with BLHDR_CHECK_CHECKSUMS and a sequence
+        // number without it. Mining reference: _blk_info's union.
+        let blocks = [(100u64, 4096u32, 0x1234_5678u32)];
+        let with = make_blhdr(&blocks, BLHDR_CHECK_CHECKSUMS, 4096);
+        assert!(BlockListHeader::parse(&with).unwrap().checks_blocks());
+        let without = make_blhdr(&blocks, 0, 4096);
+        assert!(!BlockListHeader::parse(&without).unwrap().checks_blocks());
     }
 
     #[test]
@@ -649,16 +875,14 @@ mod tests {
 
     #[test]
     fn a_corrupt_block_list_checksum_is_detected() {
-        let mut raw = vec![0u8; BLHDR_PREFIX_SIZE + BLOCK_INFO_SIZE];
-        raw[2..4].copy_from_slice(&1u16.to_be_bytes());
-        raw[0..2].copy_from_slice(&1u16.to_be_bytes());
-        let cksum = crate::journal::checksum::checksum_with_zeroed_field(&raw, 8, BLHDR_CHECKSUM_SIZE)
-            .expect("the buffer is long enough")
-            .to_be_bytes();
-        raw[8..12].copy_from_slice(&cksum);
+        // Long enough for BLHDR_CHECKSUM_SIZE, since that is how much of the
+        // header the checksum covers.
+        let size = BLHDR_CHECKSUM_SIZE + 4 * BLOCK_INFO_SIZE;
+        let raw = make_blhdr(&[(100u64, 4096u32, 0u32)], BLHDR_FIRST_HEADER, size);
         let h = BlockListHeader::parse(&raw).unwrap();
         assert!(h.checksum_matches(&raw));
-        raw[BLHDR_PREFIX_SIZE] ^= 0xFF;
-        assert!(!h.checksum_matches(&raw));
+        let mut corrupt = raw.clone();
+        corrupt[BLHDR_PREFIX_SIZE] ^= 0xFF;
+        assert!(!h.checksum_matches(&corrupt), "a corrupted field must fail the checksum");
     }
 }
