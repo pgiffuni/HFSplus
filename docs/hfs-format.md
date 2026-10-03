@@ -733,6 +733,12 @@ size. Nothing had ever read a real transaction, so it went unnoticed. Each block
 list now records its own `data_offset` while the walk runs, which removes the
 re-derivation entirely rather than fixing the arithmetic in place.
 
+A fourth image, `journal-replay-multi`, holds **three** transactions, two of
+which rewrite the same block. It exists because a single-transaction journal
+cannot show whether the walk crosses transaction boundaries, whether a later
+transaction supersedes an earlier write to the same block, or whether replay
+truncates at damage. Writing it found the `binfo[0]` bug above.
+
 What these images verify:
 
 - **Precedence**: a replayed block reads from the journal and differs from the
@@ -746,6 +752,73 @@ What these images verify:
 
 What they do **not** verify: repairing a torn catalog, or any property that needs
 a genuinely crash-consistent volume.
+
+### `binfo[0]` is the sequence slot, not a block
+
+The single most consequential detail of the replay algorithm, and the easiest to
+miss. `_blk_info` is:
+
+```c
+typedef struct _blk_info {
+    int32_t    bsize;
+    union { int32_t cksum; uint32_t sequence_num; } b;
+} _blk_info;
+```
+
+and Apple's replay loop starts at index **1**:
+
+```c
+for (i = 1; i < blhdr->num_blocks; i++) { ... add_block(...) }
+```
+
+So `binfo[0]` holds the transaction's sequence number and `num_blocks` counts
+that slot. A block list describing one block has `num_blocks == 2`. Replaying
+`binfo[0]` as a block would fabricate a filesystem block out of a transaction
+counter, silently, on a real macOS journal.
+
+The same word is read as a checksum when `BLHDR_CHECK_CHECKSUMS` is set and as a
+sequence number otherwise, and a recorded checksum of zero means "do not verify".
+
+A `bnum` of `-1` means the block was *killed* and must be skipped rather than
+replayed, while its size still steps the data cursor.
+
+### Replay truncates on damage rather than being abandoned
+
+Apple does not model transaction boundaries during replay at all: it reads block
+list headers from `start` to `end` and applies each in order, using
+`BLHDR_FIRST_HEADER` only to note where a transaction began. On any failure it
+goes to `bad_txn_handling`:
+
+```c
+/* Journal replay got error before it found any valid transations, abort replay */
+if (txn_start_offset == 0) { ... goto bad_replay; }
+/* Repeated error during journal replay, abort replay */
+if (replay_retry_count == 3) { ... goto bad_replay; }
+replay_retry_count++;
+
+/* ... retry replaying all the good transactions that we found before
+ * getting the error. */
+jnl->jhdr->start = orig_jnl_start;
+jnl->jhdr->end = txn_start_offset;
+goto restart_replay;
+```
+
+So a damaged block list or block **truncates** the replay at the start of the
+transaction that owns it, keeps everything before it, and retries — abandoning
+the journal only if nothing good was found or after three failures. Apple's
+reason is stated in its own comment above the checksum test:
+
+```c
+// XXXdbg - if these checks fail, we should replay as much
+//         as we can in the hopes that it will still leave the
+//         drive in a better state than if we didn't replay
+//         anything
+```
+
+A read-only mount that refused the whole journal would instead show a
+filesystem missing *every* recent change, which is a worse state than one
+missing changes from the damage point onwards. This crate therefore reports
+truncation through `Journal::truncation()` rather than raising an error.
 
 ### Journal replay is read-only by construction
 

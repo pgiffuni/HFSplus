@@ -166,6 +166,13 @@ are both exercised:
 | `journal-replay-be` | big-endian journal header |
 | `journal-replay-le` | little-endian journal header, as an x86 or ARM host writes |
 | `journal-replay-1k` | a 1 KiB volume, so a different block geometry |
+| `journal-replay-multi` | three transactions, two rewriting the same block |
+
+The multi image is the one that matters most: a single-transaction journal cannot
+show whether the walk crosses transaction boundaries, whether a later transaction
+supersedes an earlier write to the same block, or whether replay truncates at
+damage. Writing it is what found the `binfo[0]` sequence-slot bug described in
+`docs/hfs-format.md`.
 
 Each rewrites a block the filesystem does not currently reference. That is
 deliberate: a *crash-consistent* image, where the journal is newer than the
