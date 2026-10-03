@@ -663,7 +663,19 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 }
                 let size = block.bsize as usize;
                 if size == 0 {
-                    continue;
+                    // A zero size is not an empty block to skip; it means the
+                    // list is inconsistent. The data cursor advances by each
+                    // block's size, so a zero here desynchronises every *later*
+                    // block in the same list -- they would be read from the wrong
+                    // offset and replay plausible nonsense. Apple refuses the
+                    // transaction instead.
+                    //
+                    // Mining reference: `core/hfs_journal.c` `replay_journal`
+                    // prints "invalid bsize" and goes to `bad_txn_handling`.
+                    return Err(ApplyFailure::Truncate {
+                        at: transaction.offset,
+                        reason: "block list entry has a zero size".to_string(),
+                    });
                 }
                 let start = list
                     .data_offset
