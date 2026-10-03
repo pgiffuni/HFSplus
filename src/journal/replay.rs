@@ -445,6 +445,10 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         let blhdr_size = u64::from(header.blhdr_size);
         let mut offset = header.start;
         let mut guard = 0u32;
+        // The sequence number of the previous block list, for the ordering rule
+        // below. Zero means "not yet seen", which is also what a pre-sequence
+        // journal reports, and the rule skips the comparison in that case.
+        let mut last_sequence_num: u32 = 0;
 
         while offset < header.end {
             guard += 1;
@@ -483,6 +487,48 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 .unwrap_or(true);
             if runs_past_end {
                 self.truncate_at(offset, "block list data runs past the journal end");
+                break;
+            }
+
+            // Apple's sequence-number rule, which is what tells a journal that
+            // continues from one that was reset.
+            //
+            // Mining reference: `core/hfs_journal.c` `replay_journal` keeps
+            // `last_sequence_num` and, when a block list's sequence is neither
+            // that value nor one more -- and both are non-zero -- it sets
+            // `txn_start_offset = jnl->jhdr->end = blhdr_offset` and continues.
+            // That is the same truncation this code already does for a bad
+            // checksum, and for the same reason: replaying as much as possible
+            // leaves the filesystem in a better state than replaying nothing.
+            //
+            // The zeros matter. A sequence of 0 means "written before
+            // sequence numbers existed", and Apple's guard skips the comparison
+            // rather than treating 0 as out of order -- otherwise every
+            // pre-sequence journal would truncate at its first block list.
+            if last_sequence_num != 0
+                && blhdr.sequence_num != 0
+                && blhdr.sequence_num != last_sequence_num
+                && blhdr.sequence_num != last_sequence_num.wrapping_add(1)
+            {
+                self.truncate_at(
+                    offset,
+                    "block list sequence number is out of order",
+                );
+                break;
+            }
+            last_sequence_num = blhdr.sequence_num;
+
+            // `max_blocks` is how many blocks this list could hold, so it cannot
+            // exceed the blocks the journal has. Mining reference: the same
+            // function rejects `blhdr->max_blocks > (jhdr->size / jhdr->jhdr_size)`.
+            // Plain integer division, as Apple writes it: `max_blocks >
+            // (jhdr->size / jhdr->jhdr_size)`. Rounding up would make the bound
+            // one block looser than Apple's, and a list claiming that many blocks
+            // would be accepted here and refused there.
+            let jhdr_size = u64::from(header.jhdr_size);
+            let capacity = header.size / jhdr_size;
+            if u64::from(blhdr.max_blocks) > capacity {
+                self.truncate_at(offset, "block list claims more blocks than the journal holds");
                 break;
             }
 
