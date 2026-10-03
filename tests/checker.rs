@@ -364,6 +364,42 @@ fn an_index_record_pointing_nowhere_is_reported() {
     );
 }
 
+#[test]
+fn a_node_nothing_points_at_that_is_not_erased_is_reported() {
+    // The fault that caught this project out earlier: a leaf written into the
+    // extents tree while the header's root node still pointed elsewhere. Apple
+    // reported "Unused node is not erased"; this check did not exist then, and the
+    // generator's only clue was fsck's message.
+    let image = break_image("journal-with-files", "unerased", |img| {
+        // Node 2 of the extents tree is unused, and the formatter zeroed it.
+        // Writing into it makes it look edited rather than erased.
+        let bs = block_size(img);
+        let extents_start =
+            u32::from_be_bytes([
+                img[VOLUME_HEADER_OFFSET + 112 + 80 + 16],
+                img[VOLUME_HEADER_OFFSET + 112 + 80 + 17],
+                img[VOLUME_HEADER_OFFSET + 112 + 80 + 18],
+                img[VOLUME_HEADER_OFFSET + 112 + 80 + 19],
+            ]);
+        let at = (extents_start as usize + 2) * bs as usize;
+        img[at] = 0xFF;
+    });
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
+
+    assert!(
+        report.unerased_node.iter().any(|(tree, node)| *tree == 2 && *node == 2),
+        "the unerased extents-tree node must be reported, got {:?}",
+        report.unerased_node
+    );
+    // And the catalog is untouched by this, which shows the check is per-tree.
+    assert!(
+        !report.unerased_node.iter().any(|(tree, _)| *tree == 1),
+        "only the extents tree was damaged: {:?}",
+        report.unerased_node
+    );
+}
+
 // --- Agreement with an independent implementation ------------------------
 
 /// The strongest evidence available that these checks mean what they claim: the
@@ -423,6 +459,11 @@ fn the_checker_and_the_independent_checker_agree_about_damage() {
             what: "a leaf node's height wrong",
             break_it: wrong_leaf_height,
             apple_says: "Invalid node height",
+        },
+        Case {
+            what: "an unused extents-tree node not erased",
+            break_it: unerase_extents_node,
+            apple_says: "Unused node is not erased",
         },
     ];
 
@@ -495,6 +536,19 @@ fn clear_first_fragmented_block_bit(img: &mut [u8]) {
 /// Inflate the root folder's declared valence, for the agreement case.
 fn inflate_root_valence_raw(img: &mut [u8]) {
     inflate_root_valence(img, 3);
+}
+
+/// Write into an unused node of the extents tree.
+fn unerase_extents_node(img: &mut [u8]) {
+    let bs = block_size(img);
+    let extents_start = u32::from_be_bytes([
+        img[VOLUME_HEADER_OFFSET + 112 + 80 + 16],
+        img[VOLUME_HEADER_OFFSET + 112 + 80 + 17],
+        img[VOLUME_HEADER_OFFSET + 112 + 80 + 18],
+        img[VOLUME_HEADER_OFFSET + 112 + 80 + 19],
+    ]);
+    let at = (extents_start as usize + 2) * bs as usize;
+    img[at] = 0xFF;
 }
 
 /// Set a thread record's type to an unassigned value.
