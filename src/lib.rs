@@ -62,6 +62,7 @@ pub mod error;
 pub mod extent;
 pub mod file;
 pub mod format;
+pub mod journal;
 pub mod timestamp;
 pub mod unicode;
 pub mod volume;
