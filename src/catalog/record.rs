@@ -300,6 +300,34 @@ pub struct FolderRecord {
 }
 
 impl FolderRecord {
+    /// An all-zero folder record.
+    ///
+    /// Only for constructing a placeholder in code paths that already filtered
+    /// thread records out; a real folder record is never zero.
+    pub const EMPTY: FolderRecord = FolderRecord {
+        record_type: K_HFS_PLUS_FOLDER_RECORD,
+        flags: 0,
+        valence: 0,
+        folder_id: Cnid(0),
+        create_date: 0,
+        content_mod_date: 0,
+        attribute_mod_date: 0,
+        access_date: 0,
+        backup_date: 0,
+        bsd_info: BsdInfo {
+            owner_id: 0,
+            group_id: 0,
+            admin_flags: 0,
+            owner_flags: 0,
+            file_mode: 0,
+            special: 0,
+        },
+        user_info: [0; 16],
+        finder_info: [0; 16],
+        text_encoding: 0,
+        folder_count: 0,
+    };
+
     /// Parse a 88-byte folder record body.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < FOLDER_RECORD_SIZE {
@@ -386,6 +414,36 @@ pub struct FileRecord {
 }
 
 impl FileRecord {
+    /// An all-zero file record.
+    ///
+    /// Only for constructing a placeholder where a thread record has already been
+    /// filtered out; a real file record is never zero.
+    pub const EMPTY: FileRecord = FileRecord {
+        record_type: K_HFS_PLUS_FILE_RECORD,
+        flags: 0,
+        reserved1: 0,
+        file_id: Cnid(0),
+        create_date: 0,
+        content_mod_date: 0,
+        attribute_mod_date: 0,
+        access_date: 0,
+        backup_date: 0,
+        bsd_info: BsdInfo {
+            owner_id: 0,
+            group_id: 0,
+            admin_flags: 0,
+            owner_flags: 0,
+            file_mode: 0,
+            special: 0,
+        },
+        user_info: [0; 16],
+        finder_info: [0; 16],
+        text_encoding: 0,
+        reserved2: 0,
+        data_fork: ForkData::EMPTY,
+        resource_fork: ForkData::EMPTY,
+    };
+
     /// Parse a 248-byte file record body.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < FILE_RECORD_SIZE {
