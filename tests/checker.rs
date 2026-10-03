@@ -196,6 +196,65 @@ fn a_file_with_no_thread_record_is_still_visited() {
     );
 }
 
+#[test]
+fn swapping_two_adjacent_keys_is_reported_as_out_of_order() {
+    // The check the reader cannot perform on itself: a binary search over
+    // unordered records still returns an answer, and the answer is wrong. So the
+    // corruption here is subtle by construction -- both records stay valid, and
+    // the catalog still parses.
+    let image = break_image("journal-with-files", |img| {
+        swap_two_records(img, RECORD_A, RECORD_B);
+    });
+    let Some((report, _)) = check_image(&image) else { return };
+    assert!(
+        !report.key_order.is_empty(),
+        "swapped keys must be reported, got a clean report"
+    );
+    // And nothing else: the volumes are still structurally sound otherwise.
+    assert!(
+        report.missing_thread.is_empty(),
+        "a reordering must not invent a missing thread record: {:?}",
+        report.missing_thread
+    );
+}
+
+#[test]
+fn a_record_with_no_thread_record_is_reported() {
+    // The object stays in the catalog and stays on the bitmap, so every other
+    // check still passes. What changes is that it can no longer be reached by
+    // name -- which a reader walking thread records would simply not see.
+    let image = break_image("journal-with-files", |img| {
+        zero_thread_record(img, FRAGMENTED_CNID);
+    });
+    let Some((report, _)) = check_image(&image) else { return };
+    assert!(
+        report.missing_thread.contains(&FRAGMENTED_CNID),
+        "the object with no thread record must be named, got {:?}",
+        report.missing_thread
+    );
+    assert!(
+        report.orphaned.is_empty() && report.missing.is_empty(),
+        "its blocks are still accounted for; only reachability changed"
+    );
+}
+
+#[test]
+fn a_folder_whose_valence_disagrees_is_reported() {
+    // Valence is a count the folder record declares and the thread records imply.
+    // Two independent statements about one fact, so a mismatch is real evidence.
+    let image = break_image("journal-with-files", |img| {
+        inflate_root_valence(img, 3);
+    });
+    let Some((report, _)) = check_image(&image) else { return };
+    let entry = report
+        .valence
+        .iter()
+        .find(|(cnid, _, _)| *cnid == ROOT_CNID)
+        .unwrap_or_else(|| panic!("a wrong valence must be reported, got {:?}", report));
+    assert_eq!(entry.1, expected_valence() + 3, "the inflated declared count");
+    assert_eq!(entry.2, expected_valence(), "the count actually implied");
+}
+
 // --- The malformed corpus -----------------------------------------------
 
 #[test]
@@ -243,6 +302,14 @@ fn every_malformed_image_is_either_refused_or_flagged() {
 
 /// CNID of `fragmented.bin` in `journal-with-files`.
 const FRAGMENTED_CNID: u32 = 18;
+/// CNID of the root folder, `kHFSRootFolderID`.
+const ROOT_CNID: u32 = 2;
+/// `sizeof(struct BTNodeDescriptor)`: where a leaf node's records begin.
+const NODE_DESCRIPTOR_SIZE: usize = 14;
+/// CNID of `.journal`, whose thread record will be swapped with the one below.
+const RECORD_A: u32 = 16;
+/// CNID of `.journal_info_block`.
+const RECORD_B: u32 = 17;
 const VOLUME_HEADER_OFFSET: usize = 1024;
 const CATALOG_FORK_OFFSET: usize = 272;
 
@@ -399,6 +466,222 @@ fn inflate_total_blocks(img: &mut [u8], cnid: u32, by: u32) {
 fn set_next_catalog_id(img: &mut [u8], value: u32) {
     let at = VOLUME_HEADER_OFFSET + 64;
     img[at..at + 4].copy_from_slice(&value.to_be_bytes());
+}
+
+/// Absolute offset of `cnid`'s file record body.
+/// Byte offset of the record whose key parentID is `cnid`, plus its length.
+fn record_span(img: &[u8], cnid: u32) -> Option<(usize, usize)> {
+    let bs = block_size(img);
+    let leaf = catalog_start(img) + 1;
+    let base = (leaf as usize) * (bs as usize);
+    let count = u16::from_be_bytes([img[base + 10], img[base + 11]]) as usize;
+    let mut offsets = Vec::with_capacity(count);
+    for i in 0..count {
+        let at = u16::from_be_bytes([
+            img[base + bs as usize - 2 * (i + 1)],
+            img[base + bs as usize - 2 * (i + 1) + 1],
+        ]) as usize;
+        offsets.push(at);
+    }
+    for (i, at) in offsets.iter().enumerate() {
+        if u32::from_be_bytes([
+            img[base + at + 2],
+            img[base + at + 3],
+            img[base + at + 4],
+            img[base + at + 5],
+        ]) != cnid
+        {
+            continue;
+        }
+        let end = if i + 1 < offsets.len() {
+            offsets[i + 1]
+        } else {
+            u16::from_be_bytes([img[base + 40], img[base + 41]]) as usize
+        };
+        // The offset array lives at the end of the node and must move with the
+        // records, so the swap has to rewrite it too.
+        return Some((base + at, end - at));
+    }
+    None
+}
+
+/// Swap two adjacent records in the catalog leaf, moving them with their keys.
+///
+/// The records differ in length, so this shifts everything between them and
+/// rewrites the offset array accordingly. Both records remain individually
+/// valid: only their order changes, which is what makes this the check the
+/// reader cannot perform on itself.
+fn swap_two_records(img: &mut [u8], a: u32, b: u32) {
+    let bs = block_size(img);
+    let leaf = catalog_start(img) + 1;
+    let base = (leaf as usize) * (bs as usize);
+
+    let (a_at, a_len) = record_span(img, a).expect("record A");
+    let (b_at, b_len) = record_span(img, b).expect("record B");
+    assert!(
+        b_at == a_at + a_len,
+        "this helper only handles adjacent records, got {a_at}+{a_len} then {b_at}"
+    );
+
+    let a_bytes = img[a_at..a_at + a_len].to_vec();
+    let b_bytes = img[b_at..b_at + b_len].to_vec();
+
+    // Put B where A was and A where B was. Because the lengths differ, B's
+    // neighbours shift by the difference.
+    let delta = b_len as isize - a_len as isize;
+    let after = base + bs as usize;
+    for slot in img.iter_mut().take(after).skip(b_at + b_len) {
+        *slot = slot.wrapping_add(delta as u8);
+    }
+    img[a_at..a_at + b_len].copy_from_slice(&b_bytes);
+    img[a_at + b_len..a_at + b_len + a_len].copy_from_slice(&a_bytes);
+
+    // Rebuild the offset array from the keys, which the swap left in place but
+    // at the wrong offsets.
+    rebuild_offset_array(img);
+}
+
+/// Recompute the leaf node's offset array by walking its records in order.
+///
+/// The array is the only thing that says where each record starts, so after
+/// moving records it has to agree with the new layout. Records are variable
+/// length and self-delimiting -- a key declares its own size, and a thread or
+/// folder record is fixed -- so walking forward from the descriptor is enough.
+fn rebuild_offset_array(img: &mut [u8]) {
+    let bs = block_size(img);
+    let leaf = catalog_start(img) + 1;
+    let base = (leaf as usize) * (bs as usize);
+    let count = u16::from_be_bytes([img[base + 10], img[base + 11]]) as usize;
+
+    // Walk forward from the descriptor. A record is self-delimiting -- a key
+    // declares its own size, and a thread, folder or file record is fixed -- so
+    // the layout can be rebuilt without consulting the old offsets.
+    let mut starts = Vec::with_capacity(count);
+    let mut cursor = NODE_DESCRIPTOR_SIZE;
+    for _ in 0..count {
+        starts.push(cursor);
+        let key_len = u16::from_be_bytes([
+            img[base + cursor],
+            img[base + cursor + 1],
+        ]) as usize;
+        let body_at = cursor + 2 + key_len;
+        let rtype = i16::from_be_bytes([img[base + body_at], img[base + body_at + 1]]);
+        let body = match rtype {
+            1 => 88,
+            2 => 248,
+            _ => {
+                // Thread record: fixed part plus a u16 name count.
+                8 + 2 + 2 * u16::from_be_bytes([
+                    img[base + body_at + 8],
+                    img[base + body_at + 9],
+                ]) as usize
+            }
+        };
+        cursor = body_at + body;
+    }
+    for (i, at) in starts.iter().enumerate() {
+        let pos = base + bs as usize - 2 * (i + 1);
+        img[pos..pos + 2].copy_from_slice(&(*at as u16).to_be_bytes());
+    }
+    let free = base + bs as usize - 2 * (count + 1);
+    img[free..free + 2].copy_from_slice(&(cursor as u16).to_be_bytes());
+}
+
+/// Turn the thread record for `cnid` into one that decodes as nothing.
+///
+/// A thread record's key parentID is the object's CNID. Setting the record type
+/// to an unassigned value makes the record unparseable, which is the bluntest
+/// possible "no thread record here" -- a real volume would instead have the
+/// record absent, and that is what the checker must report either way.
+fn zero_thread_record(img: &mut [u8], cnid: u32) {
+    let bs = block_size(img);
+    let leaf = catalog_start(img) + 1;
+    let base = (leaf as usize) * (bs as usize);
+    let count = u16::from_be_bytes([img[base + 10], img[base + 11]]) as usize;
+    for i in 0..count {
+        let at = u16::from_be_bytes([
+            img[base + bs as usize - 2 * (i + 1)],
+            img[base + bs as usize - 2 * (i + 1) + 1],
+        ]) as usize;
+        let key_len = u16::from_be_bytes([img[base + at], img[base + at + 1]]) as usize;
+        // A thread record's key carries the *object's* CNID, so the match is on
+        // the key's parentID rather than anything in the body.
+        if u32::from_be_bytes([
+            img[base + at + 2],
+            img[base + at + 3],
+            img[base + at + 4],
+            img[base + at + 5],
+        ]) != cnid
+        {
+            continue;
+        }
+        let body_at = base + at + 2 + key_len;
+        // An unassigned record type, so nothing decodes it as a thread record.
+        img[body_at..body_at + 2].copy_from_slice(&0x7FFFu16.to_be_bytes());
+        return;
+    }
+    panic!("{cnid}: thread record not found");
+}
+
+/// Raise the root folder's declared `valence`.
+fn inflate_root_valence(img: &mut [u8], by: u32) {
+    let bs = block_size(img);
+    let leaf = catalog_start(img) + 1;
+    let base = (leaf as usize) * (bs as usize);
+    let count = u16::from_be_bytes([img[base + 10], img[base + 11]]) as usize;
+    for i in 0..count {
+        let at = u16::from_be_bytes([
+            img[base + bs as usize - 2 * (i + 1)],
+            img[base + bs as usize - 2 * (i + 1) + 1],
+        ]) as usize;
+        let key_len = u16::from_be_bytes([img[base + at], img[base + at + 1]]) as usize;
+        let body_at = base + at + 2 + key_len;
+        if i16::from_be_bytes([img[body_at], img[body_at + 1]]) != 1 {
+            continue;
+        }
+        let valence = u32::from_be_bytes([
+            img[body_at + 4],
+            img[body_at + 5],
+            img[body_at + 6],
+            img[body_at + 7],
+        ]);
+        img[body_at + 4..body_at + 8].copy_from_slice(&(valence + by).to_be_bytes());
+        return;
+    }
+    panic!("root folder record not found");
+}
+
+/// How many children the root folder's thread records actually name.
+fn expected_valence() -> u32 {
+    let img = std::fs::read(common::image("journal-with-files")).expect("read");
+    let bs = block_size(&img);
+    let leaf = catalog_start(&img) + 1;
+    let base = (leaf as usize) * (bs as usize);
+    let count = u16::from_be_bytes([img[base + 10], img[base + 11]]) as usize;
+    let mut children = 0;
+    for i in 0..count {
+        let at = u16::from_be_bytes([
+            img[base + bs as usize - 2 * (i + 1)],
+            img[base + bs as usize - 2 * (i + 1) + 1],
+        ]) as usize;
+        let key_len = u16::from_be_bytes([img[base + at], img[base + at + 1]]) as usize;
+        let body_at = base + at + 2 + key_len;
+        let rtype = i16::from_be_bytes([img[body_at], img[body_at + 1]]);
+        if rtype != 3 && rtype != 4 {
+            continue;
+        }
+        // A thread record's body names the object's parent.
+        let parent = u32::from_be_bytes([
+            img[body_at + 4],
+            img[body_at + 5],
+            img[body_at + 6],
+            img[body_at + 7],
+        ]);
+        if parent == ROOT_CNID {
+            children += 1;
+        }
+    }
+    children
 }
 
 /// Absolute offset of `cnid`'s file record body.
