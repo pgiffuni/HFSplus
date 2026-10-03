@@ -220,7 +220,30 @@ the generator wrote something coherent rather than merely self-consistent.
 
 A sparse file is deliberately **not** here: see the limitations list below.
 
-Eleven malformed images, none of which may mount.
+## A journal on another device (`tests/images/replayed/journal-external.img`)
+
+Produced by `tools/makejournal.py --external-journal`. A journal may live on its
+own partition, named by `ext_jnl_uuid` — which is what a Time Machine volume has
+— and `mkfs.hfsplus` cannot create that, so the state is written by hand.
+
+Two things make it worth having. The reader has a branch for it that no other
+image reached, and that branch was wrong: it validated the journal's `offset` as
+non-zero, but `offset` is read only when the journal is *inside* the filesystem,
+so a correct external-journal volume was refused with a complaint about a field
+that means nothing there. And `hfsls -j` printed `journal: none` for a volume
+whose own header says `journaled: true`, which is the opposite of the truth.
+
+`fsck.hfsplus` accepts it and leaves it byte-identical.
+
+Thirteen malformed images, none of which may mount.
+
+Two of them point `journalInfoBlock` outside the volume — at `totalBlocks`, and at
+a value large enough to overflow the block offset. `fsck.hfsplus` accepts both: it
+does not range-check that field either, so this is a place where the two
+implementations disagree and this one is stricter. The rationale is that the info
+block is part of the volume by definition, so a pointer outside it means the
+header is wrong — and without the bound the resulting refusal is a coincidence of
+whatever bytes happen to sit there.
 
 ## Not yet covered
 
