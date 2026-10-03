@@ -118,6 +118,21 @@ pub struct CheckReport {
     /// Mining reference: `BTCheckUnusedNodes` requires all `nodeSize` bytes of an
     /// unvisited node to be zero.
     pub unerased_node: Vec<(u8, u32)>,
+    /// A tree whose keys would need the 8-bit length form, which is not decoded.
+    ///
+    /// `tree`. `kBTBigKeysMask` selects a 16-bit key length; without it Apple
+    /// reads a 1-byte one, and this implementation always assumes the 16-bit form.
+    /// Every Apple-written tree sets the bit, so a volume needing the other form
+    /// is not something the formatters here produce -- but it is expressible, and
+    /// misreading it would decode a valid-looking key from the wrong bytes.
+    ///
+    /// So it is reported rather than misparsed. That is the difference between a
+    /// limitation that is visible and one that corrupts silently.
+    ///
+    /// Mining reference: `lib_fsck_hfs/dfalib/BTreeNodeOps.c` `CalcKeySize`
+    /// branches on `btreePtr->attributes & kBTBigKeysMask`, adding
+    /// `sizeof(UInt16)` or `sizeof(UInt8)` accordingly.
+    pub key_width: Vec<&'static str>,
     /// Blocks the bitmap marks used that nothing references.
     ///
     /// `fsck` reports this as the bitmap needing repair for orphaned blocks.
@@ -156,6 +171,7 @@ impl CheckReport {
             && self.child_node.is_empty()
             && self.sibling_link.is_empty()
             && self.unerased_node.is_empty()
+            && self.key_width.is_empty()
     }
 
     /// A one-line summary per disagreement, for a tool to print.
@@ -202,6 +218,13 @@ impl CheckReport {
         for (tree, node) in &self.sibling_link {
             out.push(format!(
                 "{tree} node {node}: its forward link disagrees with the node before it"
+            ));
+        }
+        for tree in &self.key_width {
+            out.push(format!(
+                "{tree}: its keys would use the 8-bit length form, which this \
+                 implementation does not decode; every Apple-written tree sets \
+                 kBTBigKeysMask, so this volume was not written by Apple or hfsprogs"
             ));
         }
         for (tree, node) in &self.unerased_node {
@@ -634,6 +657,17 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
     let tree_depth = header.tree_depth;
     let total_nodes = header.total_nodes;
 
+    // A tree that needs the 8-bit key-length form cannot be walked correctly by
+    // this implementation, so it is reported instead of walked. Note that
+    // `has_big_keys` ORs the bit with `maxKeyLength > 40`, so this only fires for
+    // a tree that is *consistently* short-key: a corrupt attribute word on a
+    // long-key tree already reads as big-key and is caught by the key-length
+    // check instead.
+    if !header.has_big_keys() {
+        report.key_width.push(tree);
+        return Ok(());
+    }
+
     // An empty tree still has a header node and nothing else, and `rootNode` is 0
     // -- which is the header. There is nothing to walk, but the unused-node check
     // still applies: every other node must be erased.
@@ -934,10 +968,11 @@ mod tests {
             child_node: vec![(1, 3, 900)],
             sibling_link: vec![(2, 5)],
             unerased_node: vec![(1, 9)],
+            key_width: vec!["attributes"],
         };
         assert!(!report.is_clean());
         let lines = report.describe();
-        assert_eq!(lines.len(), 12, "one line per disagreement:\n{}", lines.join("\n"));
+        assert_eq!(lines.len(), 13, "one line per disagreement:\n{}", lines.join("\n"));
         assert!(lines[0].contains('7') && lines[0].contains("no file references"));
         assert!(lines[1].contains('9') && lines[1].contains("not marked"));
         assert!(lines[2].contains("nextCatalogID"));
@@ -950,5 +985,6 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("points at node 900")));
         assert!(lines.iter().any(|l| l.contains("forward link disagrees")));
         assert!(lines.iter().any(|l| l.contains("not erased")));
+        assert!(lines.iter().any(|l| l.contains("8-bit length form")));
     }
 }
