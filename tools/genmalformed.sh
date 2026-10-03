@@ -176,6 +176,39 @@ echo
 #
 # The check below consequently runs against a throwaway copy, and the canonical
 # fixtures are never handed to fsck at all.
+# 14. A journal header whose start points at the journal header itself.
+#
+#     Offset zero of a journal *is* its header, so the walk would parse the
+#     header as a block list and report whatever counts it found in those bytes.
+#     CHECK_JOURNAL panics on exactly this, so a volume reaching it is corrupt by
+#     definition rather than unusual.
+if [[ -f ${REPO_ROOT}/tests/images/replayed/journal-replay-be.img ]]; then
+  python3 - "${REPO_ROOT}/tests/images/replayed/journal-replay-be.img" \
+    "${OUT_DIR}/journal-start-at-header.img" <<'PYEOF'
+import struct, sys
+src, dst = sys.argv[1], sys.argv[2]
+with open(src, "rb") as f:
+    data = bytearray(f.read())
+bs = struct.unpack_from(">I", data, 1024 + 40)[0]
+jib_off = struct.unpack_from(">I", data, 1024 + 12)[0] * bs
+jo = struct.unpack_from(">Q", data, jib_off + 36)[0]
+struct.pack_into(">Q", data, jo + 8, 0)          # journal_header.start
+struct.pack_into(">I", data, jo + 36, 0)         # zero the checksum field
+csum = 0
+for i in range(0, 44):
+    csum = ((csum << 1) | csum) >> 31 & 0xFFFFFFFF
+    pass
+# calc_checksum: a 32-bit rotate-left-and-add, over the first 44 bytes
+acc = 0
+for i in range(0, 44):
+    acc = ((acc << 1) & 0xFFFFFFFF) | ((acc >> 31) & 1)
+    acc = (acc + data[jo + i]) & 0xFFFFFFFF
+struct.pack_into(">I", data, jo + 36, acc)
+with open(dst, "wb") as f:
+    f.write(data)
+PYEOF
+fi
+
 echo "verifying that each fixture still bites (checker run on a COPY, never on"
 echo "the fixture, because fsck_hfs repairs the volume header in place):"
 if [[ -x /usr/sbin/fsck.hfsplus ]]; then

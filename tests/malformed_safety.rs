@@ -26,40 +26,67 @@ mod common;
 use hfsplus::blockdev::{BlockDevice, FileDevice};
 use hfsplus::error::Error;
 use hfsplus::format::volume_header::VolumeHeader;
+use hfsplus::volume::Volume;
 use std::path::{Path, PathBuf};
 
 fn malformed_dir() -> PathBuf {
     common::repo_root().join("tests/images/malformed")
 }
 
-/// Every malformed image, paired with a substring its error must contain.
+/// Where an image is expected to be rejected.
+///
+/// The two are not interchangeable. Most faults are in the volume header and are
+/// caught before anything else is read. A journal fault leaves the header
+/// perfectly valid -- the volume *is* journaled and well formed -- and is caught
+/// only when the journal is replayed, which is what mounting does.
+///
+/// Conflating them would either let a damaged journal through or demand that a
+/// sound header be rejected.
+///
+/// Mining reference: the journal cases come from `core/hfs_journal.c`
+/// `replay_journal` and `CHECK_JOURNAL`; the header cases from
+/// `core/hfs_vfsutils.c` `hfs_mount_hfsplus`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Level {
+    /// The volume header must not parse.
+    Header,
+    /// The header must parse, but mounting must fail.
+    Mount,
+}
+
+/// Every malformed image, the level at which it must be rejected, and a substring
+/// its error must contain.
 ///
 /// Kept as a table rather than as per-image manifests because these cases are
 /// about *error identity*, and a TOML round-trip would hide which assertion is
 /// actually being made.
-fn cases() -> Vec<(&'static str, &'static str)> {
+fn cases() -> Vec<(&'static str, Level, &'static str)> {
     vec![
         // Signature is not a member of the HFS family at all.
-        ("bad-signature", "unrecognised volume signature"),
+        ("bad-signature", Level::Header, "unrecognised volume signature"),
         // HFS+ signature carrying the HFSX version number. Apple validates the
         // signature/version pair, so this is a corrupt HFS+ volume, not HFSX.
-        ("hfsplus-sig-hfsx-version", "volume version"),
+        ("hfsplus-sig-hfsx-version", Level::Header, "volume version"),
         // blockSize must be a power of two and at least 512.
-        ("bad-block-size", "power of two"),
-        ("block-size-too-small", "power of two"),
+        ("bad-block-size", Level::Header, "power of two"),
+        ("block-size-too-small", Level::Header, "power of two"),
         // Images that end before the header can be read.
-        ("truncated-header", "truncated"),
-        ("truncated-half-header", "truncated"),
-        ("all-zero", "unrecognised volume signature"),
+        ("truncated-header", Level::Header, "truncated"),
+        ("truncated-half-header", Level::Header, "truncated"),
+        ("all-zero", Level::Header, "unrecognised volume signature"),
         // journalInfoBlock is a block number and nothing else constrains it, so a
         // volume naming one at or past its own end is damaged. The error must name
         // the field: the bytes found there would otherwise be parsed as a journal
         // info block and produce a complaint about *those* instead.
-        ("journal-info-block-out-of-volume", "journalInfoBlock"),
+        ("journal-info-block-out-of-volume", Level::Header, "journalInfoBlock"),
         // A value large enough that the block offset would overflow, told apart
         // from the range check by the same message -- both are refused, and both
         // for the same reason.
-        ("journal-info-block-huge", "journalInfoBlock"),
+        ("journal-info-block-huge", Level::Header, "journalInfoBlock"),
+        // Offset zero of a journal is its header, so a `start` there would have
+        // the walk parse the header as a block list. CHECK_JOURNAL panics on it,
+        // so this is a rejection rather than a truncation.
+        ("journal-start-at-header", Level::Mount, "journal_header.start"),
     ]
 }
 
@@ -69,18 +96,45 @@ fn image(name: &str) -> PathBuf {
 }
 
 /// Run the parser and return the error, asserting that no panic occurred.
-fn parse_error(path: &Path) -> Error {
+/// Reject `path` at the level the table says, and return the error.
+///
+/// `Level::Header` asks the header parser; `Level::Mount` requires the header to
+/// parse -- proving the volume is well formed -- and then requires the mount to
+/// fail. That second half matters: a journal fault that were caught by the header
+/// parser would be a different defect wearing the same fixture.
+fn parse_error(path: &Path, level: Level) -> Error {
     let dev = FileDevice::open(path)
         .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
-    match VolumeHeader::read_from(&dev) {
-        Ok(_) => panic!("{} was accepted but must be rejected", path.display()),
-        Err(e) => e,
+    match level {
+        Level::Header => match VolumeHeader::read_from(&dev) {
+            Ok(_) => panic!("{} was accepted but must be rejected", path.display()),
+            Err(e) => e,
+        },
+        Level::Mount => {
+            VolumeHeader::read_from(&dev).unwrap_or_else(|e| {
+                panic!(
+                    "{}: the volume header must be sound -- this image is meant to \
+                     exercise the journal, so a header fault would be a different \
+                     defect: {e}",
+                    path.display()
+                )
+            });
+            match Volume::open(&dev) {
+                Ok(_) => panic!(
+                    "{} mounted but must be rejected: {}",
+                    path.display(),
+                    "a journal that cannot be replayed leaves a stale filesystem, \
+                     and serving that is worse than refusing"
+                ),
+                Err(e) => e,
+            }
+        }
     }
 }
 
 #[test]
 fn malformed_images_are_present() {
-    for (name, _) in cases() {
+    for (name, _, _) in cases() {
         let p = image(name);
         assert!(
             p.exists(),
@@ -92,13 +146,13 @@ fn malformed_images_are_present() {
 
 #[test]
 fn each_malformed_image_produces_its_expected_structural_error() {
-    for (name, expected) in cases() {
+    for (name, level, expected) in cases() {
         let path = image(name);
         if !path.exists() {
             eprintln!("skipping {name}: not built");
             continue;
         }
-        let err = parse_error(&path);
+        let err = parse_error(&path, level);
         let text = err.to_string();
         assert!(
             text.contains(expected),
@@ -111,7 +165,7 @@ fn each_malformed_image_produces_its_expected_structural_error() {
 fn no_malformed_image_panics_under_repeated_parsing() {
     // Cheap insurance against a loop or a cached-state bug: parse each image
     // many times. A hang shows up as a test timeout, a panic as a failure.
-    for (name, _) in cases() {
+    for (name, level, _) in cases() {
         let path = image(name);
         if !path.exists() {
             continue;
@@ -119,8 +173,20 @@ fn no_malformed_image_panics_under_repeated_parsing() {
         let dev = FileDevice::open(&path).unwrap();
         for i in 0..64 {
             let out = format!("{name} iteration {i}");
-            if VolumeHeader::read_from(&dev).is_ok() {
-                panic!("{out}: accepted a malformed image");
+            match level {
+                Level::Header => {
+                    if VolumeHeader::read_from(&dev).is_ok() {
+                        panic!("{out}: accepted a malformed image");
+                    }
+                }
+                Level::Mount => {
+                    // Repeated parsing must not change the verdict, and must not
+                    // panic on a volume whose header is sound.
+                    assert!(
+                        Volume::open(&dev).is_err(),
+                        "{out}: mounted a malformed image"
+                    );
+                }
             }
         }
     }
@@ -290,7 +356,7 @@ fn the_checker_repairs_rather_than_refuses() {
 
     // The untouched fixture must be rejected by us.
     assert!(
-        parse_error(&path)
+        parse_error(&path, Level::Header)
             .to_string()
             .contains("unrecognised volume signature"),
         "our parser must reject a destroyed primary signature"
@@ -330,7 +396,7 @@ fn the_checker_repairs_rather_than_refuses() {
 
     // And the canonical fixture is still corrupt, because we never gave it to fsck.
     assert!(
-        parse_error(&path)
+        parse_error(&path, Level::Header)
             .to_string()
             .contains("unrecognised volume signature"),
         "running fsck must not have repaired the canonical fixture"
