@@ -71,6 +71,12 @@ VOLUME_HEADER_OFFSET = 1024
 # The CNIDs `main` hands out, in the order it creates the files. Hardcoded here so
 # the in-place patcher can find a record without constructing a Writer.
 FRAGMENTED_CNID = 18
+
+# `struct HFSPlusCatalogFile`'s data fork: logicalSize, clumpSize, totalBlocks, then
+# the eight extent descriptors.
+FORK_DATA_LOGICAL = 88
+FORK_DATA_TOTAL_BLOCKS = 88 + 12
+FORK_DATA_EXTENTS_OFFSET = 88 + 16
 NEXT_CATALOG_ID_OFFSET = 64
 # `struct HFSPlusVolumeHeader` has four date fields (create, modify, backup,
 # checked), so fileCount is at 32 and blockSize at 40.
@@ -498,6 +504,82 @@ class Writer:
         return len(self.records) - self._added
 
 
+def break_fork_extent(img, args):
+    """Make one extent descriptor point outside the volume.
+
+    A fork's extents are device block numbers, and nothing in the record bounds
+    them against the volume. A descriptor naming a block past the end would send
+    a reader off the image entirely -- and since the block number is multiplied
+    by the block size before any read, the offset overflows too.
+
+    Mining reference: core/FileExtentMapping.c MapFileBlockC, which computes
+    `block_num * jhdr_size` with no bound on `block_num` itself; the bound comes
+    from the caller, so it has to be checked somewhere.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    total = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 44)[0]
+    cat = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 272 + 16)[0]
+    base = (cat + 1) * bs
+    count = u16_from_be(img, base + 10)
+
+    for i in range(count):
+        at = u16_from_be(img, base + bs - 2 * (i + 1))
+        key_len = u16_from_be(img, base + at)
+        body = base + at + 2 + key_len
+        if u32_from_be(img, body + 8) != FRAGMENTED_CNID:
+            continue
+        slot = FORK_DATA_EXTENTS_OFFSET + args.fork_extent * 8
+        put = total + 4096
+        struct.pack_into(">II", img, body + slot, put, 8)
+        print(f"  fragmented.bin: extent {args.fork_extent} -> start {put}, count 8")
+        print(f"  the volume has {total} blocks, so the descriptor is past the end")
+        print(f"  and the offset it implies is {(put + 8) * bs}, beyond {len(img)} bytes")
+        break
+    else:
+        sys.exit(f"error: {FRAGMENTED_CNID}: file record not found")
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+
+def break_symlink(img, args):
+    """Give the symlink an empty data fork.
+
+    A symlink's target *is* its data fork, so an empty one names nothing. The
+    filesystem is otherwise sound -- the blocks stay allocated -- so nothing else
+    in the record set is wrong.
+
+    Mining reference: core/hfs_xattr.c reads a link target out of the file's data
+    fork for HFSPlus, so the target and the fork cannot disagree.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    cat = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 272 + 16)[0]
+    base = (cat + 1) * bs
+    count = u16_from_be(img, base + 10)
+
+    for i in range(count):
+        at = u16_from_be(img, base + bs - 2 * (i + 1))
+        key_len = u16_from_be(img, base + at)
+        body = base + at + 2 + key_len
+        name_len = u16_from_be(img, base + at + 6)
+        name = img[base + at + 8:base + at + 8 + name_len * 2].decode(
+            "utf-16-be", errors="replace")
+        if name != "link":
+            continue
+        struct.pack_into(">Q", img, body + FORK_DATA_LOGICAL, 0)
+        struct.pack_into(">I", img, body + FORK_DATA_TOTAL_BLOCKS, 0)
+        for e in range(8):
+            struct.pack_into(">II", img, body + FORK_DATA_EXTENTS_OFFSET + e * 8, 0, 0)
+        print("  link: data fork emptied -- a symlink with no target")
+        print(f"  its {args.unused} bytes stay allocated, so the bitmap still agrees")
+        break
+    else:
+        sys.exit("error: link: symlink record not found")
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+
 def break_fork_rule(img, args):
     """Break one of Apple's two fork-size inequalities, for the checker tests.
 
@@ -555,6 +637,12 @@ def main() -> None:
                     help="set a file record's data-fork logicalSize")
     ap.add_argument("--fork-total", type=int, default=0,
                     help="set a file record's data-fork totalBlocks")
+    ap.add_argument("--fork-extent", type=int, default=None, metavar="N",
+                    help="point data-fork extent N past the end of the volume")
+    ap.add_argument("--break-symlink", dest="break_symlink", action="store_true",
+                    help="empty the symlink's data fork, leaving it with no target")
+    ap.add_argument("--unused", type=int, default=19,
+                    help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     with open(args.source, "rb") as f:
@@ -566,6 +654,10 @@ def main() -> None:
     # A fork-rule patch changes a few bytes in place and needs no writer.
     if args.fork_logical or args.fork_total:
         return break_fork_rule(img, args)
+    if args.fork_extent is not None:
+        return break_fork_extent(img, args)
+    if args.break_symlink:
+        return break_symlink(img, args)
 
     w = Writer(img)
     bs = w.block_size

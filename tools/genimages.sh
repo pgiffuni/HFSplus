@@ -205,6 +205,16 @@ if [[ -f tests/images/generated/journal-with-files.img ]]; then
     tests/images/replayed/fork-total-too-large.img --fork-total 99
 fi
 
+# Two more faults a corpus image cannot express, because no formatter produces
+# them: an extent descriptor naming a block past the volume, and a symlink whose
+# data fork is empty. Both leave the filesystem otherwise sound.
+if [[ -f tests/images/generated/journal-with-files.img ]]; then
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/replayed/fork-extent-past-volume.img --fork-extent 2
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/replayed/symlink-empty-target.img --break-symlink
+fi
+
 echo "verifying every image with the independent checker"
 fail=0
 for img in "${OUT_DIR}"/*.img; do
