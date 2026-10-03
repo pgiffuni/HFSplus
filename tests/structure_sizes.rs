@@ -215,3 +215,64 @@ fn the_journal_info_block_is_180_bytes_with_the_reserved_field_shrunk() {
     assert_eq!(JIB_SIZE_OFFSET, 44);
     assert_eq!(JIB_SIZE_OFFSET + 8, 52, "which is where the UUID begins");
 }
+// --- Journal -----------------------------------------------------------
+
+/// `struct journal_header`: `int32 magic + int32 endian + off_t start + off_t end
+/// + off_t size + int32 blhdr_size + uint32 checksum + int32 jhdr_size +
+/// uint32 sequence_num`.
+#[test]
+fn the_journal_header_is_48_bytes_and_checksums_the_first_44() {
+    use hfsplus::journal::checksum::JOURNAL_HEADER_CKSUM_SIZE;
+    use hfsplus::journal::info::JournalHeader as Off;
+
+    let size = 4 + 4 + 8 + 8 + 8 + 4 + 4 + 4 + 4;
+    assert_eq!(size, 48);
+    assert_eq!(Off::SIZE, size);
+
+    // Apple deliberately checksums only the original header, for backwards
+    // compatibility: `JOURNAL_HEADER_CKSUM_SIZE` is `offsetof(sequence_num)`, so
+    // the field Apple added later is excluded. Getting this wrong makes every
+    // checksum fail on a journal Apple wrote, or -- worse, makes a corrupt one
+    // validate.
+    assert_eq!(Off::SEQUENCE_OFFSET, 44);
+    assert_eq!(JOURNAL_HEADER_CKSUM_SIZE, Off::SEQUENCE_OFFSET);
+    assert_eq!(Off::SIZE, JOURNAL_HEADER_CKSUM_SIZE + 4);
+
+    assert_eq!(Off::MAGIC_OFFSET, 0);
+    assert_eq!(Off::ENDIAN_OFFSET, 4);
+    assert_eq!(Off::START_OFFSET, 8);
+    assert_eq!(Off::SIZE_OFFSET, 24);
+    assert_eq!(Off::BLHDR_SIZE_OFFSET, 32);
+    assert_eq!(Off::CHECKSUM_OFFSET, 36);
+    assert_eq!(Off::JHDR_SIZE_OFFSET, 40);
+}
+
+/// `struct block_list_header` before its `binfo[]`, and `struct block_info`.
+///
+/// `block_info` is an `off_t` plus a union of a two-field struct and a pointer,
+/// so it is 16 bytes only where a pointer is 8. Every on-disk journal is
+/// therefore 64-bit-shaped, and the block list offset arithmetic depends on it.
+#[test]
+fn the_block_list_header_prefix_is_16_and_a_block_info_is_16() {
+    use hfsplus::journal::checksum::BLHDR_CHECKSUM_SIZE;
+    use hfsplus::journal::replay::{BLHDR_PREFIX_SIZE, BLOCK_INFO_SIZE};
+
+    let prefix = 2 + 2 + 4 + 4 + 4;
+    assert_eq!(prefix, 16);
+    assert_eq!(BLHDR_PREFIX_SIZE, prefix);
+
+    let info = 8 + 8;
+    assert_eq!(info, 16, "off_t plus the union, on a 64-bit machine");
+    assert_eq!(BLOCK_INFO_SIZE, info);
+
+    // The block list checksum covers the header and `binfo[0]`, which is where
+    // the transaction sequence number lives -- so this is why `binfo[0]` is not
+    // replayed as a block.
+    assert_eq!(BLHDR_CHECKSUM_SIZE, BLHDR_PREFIX_SIZE + BLOCK_INFO_SIZE);
+    assert_eq!(BLHDR_CHECKSUM_SIZE, 32);
+    assert_eq!(
+        hfsplus::journal::replay::FIRST_BLOCK_INDEX,
+        1,
+        "the sequence slot is binfo[0], so replay starts at index 1"
+    );
+}
