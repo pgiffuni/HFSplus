@@ -45,14 +45,29 @@ reachable read-only:
   `nextCatalogID` against the CNIDs in use.
 - Catalog structure: key order within a leaf, key length against `maxKeyLength`,
   a thread record for every object, and folder valence.
+- B-tree structure, for every tree the volume has: node heights against the tree
+  depth, index child pointers, the leaf sibling chain, and the rule that a node
+  nothing reaches must be entirely zero.
 - `hfsck` — the tool, with a fourth exit status for "read and found
   inconsistent".
 
 Acceptance: 15 clean images must produce an empty report, 11 malformed ones must
-be refused or flagged, and four deliberate breakages must be flagged by *both*
-this checker and `fsck.hfsplus`. What remains before this could be called a
-checker is the B-tree structural pass (node heights, node sizes, the B-tree map)
-and the multi-linked-files pass, which needs hard-link resolution first.
+be refused or flagged, and **six** deliberate breakages must be flagged by *both*
+this checker and `fsck.hfsplus`, each matched on Apple's own wording rather than
+ours — valence is the field name in `struct HFSPlusCatalogFolder`, but the
+checker says "Invalid directory item count".
+
+What remains before this could be called a checker:
+
+- The B-tree map — one bit per node, MSB first, living in the header node's
+  third record and the map nodes after it. `fsck.hfsplus` compares the stored map
+  against one it computes, and building this crate's extents tree by hand showed
+  how easy it is to get wrong: a map not updated for a new node is
+  "Invalid map node".
+- Node size consistency, and the `kBTBigKeysMask` / short-key form.
+- The multi-linked-files pass, which needs hard-link resolution first — the
+  crate surfaces `is_hard_link` and `link_count` but does not follow a chain
+  through the attributes tree.
 
 ## Order
 
