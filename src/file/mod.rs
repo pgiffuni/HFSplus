@@ -181,15 +181,20 @@ impl<'a, D: BlockDevice + ?Sized> TreeOverflow<'a, D> {
 
     /// Find the group of up to eight extents that begins at `start_block`.
     ///
-    /// The key is `(fileID = fork CNID, startBlock = cumulative allocated blocks
-    /// already described)`.
+    /// The key is `(forkType, fileID = fork CNID, startBlock = cumulative
+    /// allocated blocks already described)`.
     ///
     /// # Errors
     ///
     /// A `None` means "no further groups", which ends the walk. Any structural
     /// problem inside the Extents B-tree is propagated, because silently
     /// stopping would turn a corrupt volume into files that read as short.
-    pub fn find_group(&self, file_id: u32, start_block: u32) -> Result<Option<crate::format::extents::ExtentRecord>> {
+    pub fn find_group(
+        &self,
+        fork_type: u8,
+        file_id: u32,
+        start_block: u32,
+    ) -> Result<Option<crate::format::extents::ExtentRecord>> {
         use crate::btree::key::split_extent_record;
 
         let header = self.extents_tree.header();
@@ -211,6 +216,12 @@ impl<'a, D: BlockDevice + ?Sized> TreeOverflow<'a, D> {
                     if key.file_id > file_id {
                         return Ok(None);
                     }
+                    continue;
+                }
+                // Both forks of a file share a CNID and sort adjacently, so
+                // matching on the CNID alone would let a data fork adopt its
+                // resource fork's extents.
+                if key.fork_type != fork_type {
                     continue;
                 }
                 if key.start_block == start_block {
@@ -239,19 +250,23 @@ impl<'a, D: BlockDevice + ?Sized> TreeOverflow<'a, D> {
 /// A `TreeOverflow` paired with the CNID of the fork being read.
 pub struct ForkOverflow<'a, 'r, D: ?Sized> {
     tree: &'r TreeOverflow<'a, D>,
+    fork_type: u8,
     file_id: u32,
 }
 
 impl<'a, 'r, D: BlockDevice + ?Sized> std::fmt::Debug for ForkOverflow<'a, 'r, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ForkOverflow").field("file_id", &self.file_id).finish()
+        f.debug_struct("ForkOverflow")
+            .field("fork_type", &self.fork_type)
+            .field("file_id", &self.file_id)
+            .finish()
     }
 }
 
 impl<'a, 'r, D: BlockDevice + ?Sized> ForkOverflow<'a, 'r, D> {
     /// Bind a resolver to one fork.
-    pub fn for_fork(tree: &'r TreeOverflow<'a, D>, file_id: u32) -> Self {
-        ForkOverflow { tree, file_id }
+    pub fn for_fork(tree: &'r TreeOverflow<'a, D>, fork_type: u8, file_id: u32) -> Self {
+        ForkOverflow { tree, fork_type, file_id }
     }
 }
 
@@ -260,7 +275,7 @@ impl<'a, 'r, D: BlockDevice + ?Sized> OverflowResolver for ForkOverflow<'a, 'r, 
         &self,
         start_block: u32,
     ) -> Result<Option<crate::format::extents::ExtentRecord>> {
-        self.tree.find_group(self.file_id, start_block)
+        self.tree.find_group(self.fork_type, self.file_id, start_block)
     }
 }
 

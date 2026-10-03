@@ -28,7 +28,9 @@ use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID};
 use crate::catalog::lookup::Catalog;
 use crate::catalog::record::{BsdInfo, CatalogRecord, FileRecord, FolderRecord};
 use crate::error::{Error, Result};
-use crate::file::ForkReader;
+use crate::extent::OverflowResolver;
+use crate::btree::ExtentKey;
+use crate::file::{ForkOverflow, ForkReader, TreeOverflow};
 use crate::format::fork::ForkData;
 use crate::format::volume_header::{FileSystemKind, VolumeHeader};
 
@@ -43,6 +45,13 @@ pub struct Volume<'a, D: ?Sized> {
     header: VolumeHeader,
     catalog: Catalog<'a, D>,
     kind: FileSystemKind,
+    /// The extents overflow B-tree, opened on first use.
+    ///
+    /// Opened lazily because a volume whose forks all fit inline never touches
+    /// it, and on such a volume it may not even exist. Held here rather than
+    /// built per read because a `ForkOverflow` borrows the tree it resolves
+    /// against.
+    extents: std::cell::OnceCell<TreeOverflow<'a, D>>,
 }
 
 impl<'a, D: BlockDevice + ?Sized> std::fmt::Debug for Volume<'a, D> {
@@ -83,7 +92,13 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             header.is_hfsx(),
         )?;
 
-        Ok(Volume { device, header, catalog, kind })
+        Ok(Volume {
+            device,
+            header,
+            catalog,
+            kind,
+            extents: std::cell::OnceCell::new(),
+        })
     }
 
     /// The volume header.
@@ -218,13 +233,13 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Read `len` bytes from a file's data fork at `offset`.
     pub fn read(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>> {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork).read(offset, len)
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f)).read(offset, len)
     }
 
     /// Read the whole data fork, bounded by `limit` bytes.
     pub fn read_file(&self, file: &Object, limit: usize) -> Result<Vec<u8>> {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork).read_all(limit)
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f)).read_all(limit)
     }
 
     /// Read `len` bytes from a file's resource fork.
@@ -236,7 +251,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         if f.record.resource_fork.logical_size == 0 {
             return Ok(Vec::new());
         }
-        self.fork_reader(&f.record.resource_fork).read(offset, len)
+        self.fork_reader(&f.record.resource_fork, ExtentKey::RESOURCE_FORK, file_id(f)).read(offset, len)
     }
 
     /// The target of a symbolic link.
@@ -252,7 +267,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         // A target is bounded by PATH_MAX; a longer one means a corrupt fork, and
         // allocating for it would be the wrong response to a bad on-disk length.
         const MAX_TARGET: usize = 4096;
-        let bytes = self.fork_reader(&f.record.data_fork).read_all(MAX_TARGET)?;
+        let bytes = self
+            .fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+            .read_all(MAX_TARGET)?;
         let s = String::from_utf8_lossy(&bytes);
         Ok(s.trim_end_matches('\0').to_string())
     }
@@ -312,9 +329,82 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         )
     }
 
-    fn fork_reader(&self, fork: &ForkData) -> ForkReader<'a, D> {
-        ForkReader::new(self.device, fork, self.header.block_size)
+    /// A reader for `fork`, with overflow extents resolved when it needs them.
+    ///
+    /// A fork holds at most `kHFSPlusExtentDensity` (8) extents inline. Anything
+    /// past that keeps the rest in the **extents overflow B-tree**, keyed on the
+    /// fork's CNID and the index of the first extent it holds. Without a
+    /// resolver a fork that overflows would silently read only its first eight
+    /// extents: every offset past that boundary would look like a hole, so the
+    /// read would return zeros instead of the file.
+    ///
+    /// Mining reference: Apple `core/hfs_extents.c` `extoffset` walks
+    /// `fabs->extents` and, once past the inline density, looks the remaining
+    /// extents up in the extents B-tree by CNID. `core/hfs_vfsops.c` reads
+    /// through that mapping, so a file that overflows is a normal file, not a
+    /// special case.
+    fn fork_reader(
+        &self,
+        fork: &ForkData,
+        fork_type: u8,
+        file_id: u32,
+    ) -> ForkReader<'_, D> {
+        if !fork.needs_overflow() {
+            return ForkReader::new(self.device, fork, self.header.block_size);
+        }
+        // A fork whose overflow tree is absent or unreadable must still read its
+        // inline extents rather than failing outright, because the first eight
+        // are on hand.
+        match self.overflow_resolver(fork_type, file_id) {
+            Some(resolver) => {
+                ForkReader::with_overflow(self.device, fork, self.header.block_size, resolver)
+            }
+            None => ForkReader::new(self.device, fork, self.header.block_size),
+        }
     }
+
+    /// A resolver over the extents overflow B-tree for one fork.
+    ///
+    /// Returns `None` when the volume has no extents file, or it cannot be read.
+    /// That is not an error at this level: the fork's own inline extents are
+    /// still readable, and a volume with no overflow file cannot have a fork
+    /// that overflows.
+    fn overflow_resolver(
+        &self,
+        fork_type: u8,
+        file_id: u32,
+    ) -> Option<Box<dyn OverflowResolver + '_>> {
+        let fork = &self.header.extents_file;
+        if fork.logical_size == 0 {
+            return None;
+        }
+        // `OnceCell::get_or_try_init` is unstable, so try the existing value
+        // first and only build on a miss. The double `get` is not a race in the
+        // intended sense: two threads may each open the tree, and both results
+        // are equivalent, so the second `set` is simply ignored.
+        if self.extents.get().is_none() {
+            if let Ok(tree) = crate::btree::io::BTreeFile::open(
+                self.device,
+                fork,
+                self.header.block_size,
+                true,
+            ) {
+                let _ = self.extents.set(TreeOverflow::new(tree));
+            }
+        }
+        let tree = self.extents.get()?;
+        Some(Box::new(ForkOverflow::for_fork(tree, fork_type, file_id)))
+    }
+}
+
+    /// The CNID a fork's overflow extents are keyed on.
+///
+/// Both forks of a file share the CNID, and the extents B-tree key includes the
+/// fork type so they cannot collide. Mining reference: `core/hfs_extents.c` keys
+/// on `fileID` and `forkType`, with `kDataForkType = 0` and
+/// `kResourceForkType = 0xFF`.
+fn file_id(f: &FileAttrs) -> u32 {
+    f.record.file_id.0
 }
 
 fn kind_label(kind: FileSystemKind) -> &'static str {
