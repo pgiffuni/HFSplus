@@ -447,3 +447,161 @@ fn the_independent_checker_accepts_the_external_journal_image() {
         "the checker modified the image:\n{text}"
     );
 }
+
+// --- A journal header written by an older system -------------------------
+
+#[test]
+fn a_legacy_journal_header_is_replayed_without_a_checksum_check() {
+    // Apple accepts `OLD_JOURNAL_HEADER_MAGIC` ('JHDR') as well as 'JNLx', then
+    // *converts* the old one to the new -- "XXXdbg - convert old style magic
+    // numbers to the new one". The conversion happens only after it has decided
+    // not to check the checksum, guarded by `if (magic == JOURNAL_HEADER_MAGIC)`
+    // and the comment "only check if we're the current journal header magic
+    // value".
+    //
+    // So a legacy header is a journal that must replay, and whose stored checksum
+    // is not consulted. Rewriting the magic leaves that checksum stale, which is
+    // what such a journal looks like on disk, so a stale checksum must not stop
+    // anything.
+    let path = common::repo_root().join("tests/images/replayed/journal-legacy-header.img");
+    if !path.exists() {
+        eprintln!(
+            "skipping: {} not built; run makejournal.py --legacy-header",
+            path.display()
+        );
+        return;
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("a legacy header is still a journal");
+
+    // Located, and its transaction still replays.
+    assert!(
+        !journal.is_uninitialized(),
+        "a legacy header must not be mistaken for an unwritten journal"
+    );
+    assert_eq!(
+        journal.transactions().len(),
+        1,
+        "the transaction must replay through a legacy header"
+    );
+    assert_eq!(journal.replayed_blocks().len(), 1);
+    assert!(
+        journal.truncation().is_none(),
+        "a stale checksum must not truncate the replay: {:?}",
+        journal.truncation()
+    );
+
+    // And the checksum is reported as not-checked rather than as failed, which is
+    // the distinction Apple draws by guarding on the magic.
+    assert_eq!(
+        journal.header_checksum_ok(),
+        None,
+        "Apple checks the checksum only for the current magic, so a legacy header \
+         is not checked -- which is different from being checked and failing"
+    );
+
+    // The header is the old one, and is otherwise intact.
+    let header = journal.header().expect("a header was read");
+    assert_eq!(header.magic, hfsplus::journal::info::OLD_JOURNAL_HEADER_MAGIC);
+    assert_eq!(header.start, 4096, "the transaction geometry is unchanged");
+    assert_eq!(header.end, 12288);
+    assert_eq!(header.sequence_num, 1);
+}
+
+#[test]
+fn the_current_magic_still_has_its_checksum_checked() {
+    // The converse, and it is what makes the case above mean anything: for a
+    // current header the checksum is consulted, and a wrong one is reported
+    // without being fatal.
+    let path = common::image("journaled-hfsplus");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("an unwritten journal is still a journal");
+    // An all-zero header is unwritten rather than current, so nothing to check.
+    assert!(journal.header().is_none());
+    assert_eq!(journal.header_checksum_ok(), None);
+
+    let path = common::repo_root().join("tests/images/replayed/journal-replay-be.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("a written journal");
+    assert_eq!(journal.header_checksum_ok(), Some(true), "the fixture is sound");
+}
+
+#[test]
+fn opening_a_legacy_journal_leaves_the_image_byte_identical() {
+    // The guarantee every journal test rests on, stated for the legacy path too:
+    // reading a journal never writes it.
+    let path = common::repo_root().join("tests/images/replayed/journal-legacy-header.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let before = digest(&std::fs::read(&path).expect("read before"));
+    {
+        let dev = FileDevice::open(&path).expect("open");
+        let vh = VolumeHeader::read_from(&dev).expect("header");
+        let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+            .expect("journal open")
+            .expect("a legacy header is still a journal");
+        let _ = journal.transactions();
+        let _ = journal.replayed_blocks();
+    }
+    assert_eq!(
+        before,
+        digest(&std::fs::read(&path).expect("read after")),
+        "reading a legacy journal modified the image"
+    );
+}
+
+#[test]
+fn a_block_list_header_size_too_small_to_hold_one_is_refused() {
+    // `blhdr_size` sets how many bytes the walk reads per block list. Below the
+    // five fixed fields the list cannot be read at all, and without this check the
+    // failure arrives as a truncated field -- a statement about the bytes rather
+    // than about the header that gave the size.
+    //
+    // Mining reference: `struct block_list_header` in `core/hfs_journal.h` is
+    // `max_blocks`, `num_blocks`, `bytes_used`, `checksum` and `flags` before its
+    // `binfo[]`.
+    let mut header = hfsplus::journal::info::JournalHeader {
+        magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
+        endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        start: 4096,
+        end: 12288,
+        size: 524288,
+        blhdr_size: 4,
+        checksum: 0,
+        jhdr_size: 4096,
+        sequence_num: 1,
+    };
+    let err = header.validate(524288).expect_err("four bytes cannot hold a header");
+    let text = err.to_string();
+    assert!(
+        text.contains("blhdr_size"),
+        "the error must name the field, got {text:?}"
+    );
+
+    // A size that can hold the fixed part is accepted; the walk then decides.
+    header.blhdr_size = hfsplus::journal::replay::BLHDR_PREFIX_SIZE as u32;
+    assert!(
+        header.validate(524288).is_ok(),
+        "a block list header needs only its fixed part to be read"
+    );
+}

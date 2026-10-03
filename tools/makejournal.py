@@ -36,6 +36,7 @@ import argparse
 import struct
 import sys
 
+OLD_JOURNAL_HEADER_MAGIC = 0x4A484452
 JOURNAL_HEADER_MAGIC = 0x4A4E4C78  # 'JNLx'
 ENDIAN_MAGIC = 0x12345678
 JOURNAL_HEADER_CKSUM_SIZE = 44
@@ -228,6 +229,42 @@ def write_external_journal(img: bytearray, journal_info_block: int, args) -> Non
     print("  offset zeroed: it described a position in this volume, and the journal is not here")
 
 
+def write_legacy_header(img: bytearray, args) -> None:
+    """Rewrite the journal header's magic to the pre-'JNLx' value.
+
+    Apple accepts both `JOURNAL_HEADER_MAGIC` ('JNLx') and
+    `OLD_JOURNAL_HEADER_MAGIC` ('JHDR'), then *converts* the old one to the new --
+    "XXXdbg - convert old style magic numbers to the new one". It converts only
+    after deciding not to check the checksum: Apple guards that with
+    `if (magic == JOURNAL_HEADER_MAGIC)` and the comment "only check if we're the
+    current journal header magic value".
+
+    So a legacy header is a journal that must replay, and whose checksum is not
+    consulted. Both halves matter, and a corpus image from a current macOS cannot
+    show either. Rewriting the magic leaves the stored checksum stale, which is
+    exactly what a journal converted from the old format looks like on disk.
+
+    Mining reference: `core/hfs_journal.c` `journal_open`, the magic test and the
+    conversion that follows it.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    vh = VOLUME_HEADER_OFFSET
+    journal_info_block = struct.unpack_from(">I", img, vh + 12)[0]
+    jib_off = journal_info_block * bs
+    journal_offset = struct.unpack_from(">Q", img, jib_off + JIB_OFFSET_OFFSET)[0]
+
+    struct.pack_into(">I", img, journal_offset, OLD_JOURNAL_HEADER_MAGIC)
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+    stored = struct.unpack_from(">I", img, journal_offset + 36)[0]
+    print(f"{args.dest}: journal header magic rewritten to 'JHDR'")
+    print(f"  at byte {journal_offset}, block {journal_offset // bs}")
+    print(f"  stored checksum left at 0x{stored:08x}, which now does not match:")
+    print("  Apple does not check the checksum for a legacy header, and neither")
+    print("  does this crate -- so the stale value must not stop the replay")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source")
@@ -238,6 +275,9 @@ def main() -> None:
                     help="replacement payload; defaults to a recognisable pattern")
     ap.add_argument("--little-endian", action="store_true",
                     help="write the journal header little-endian, as x86 hosts do")
+    ap.add_argument("--legacy-header", dest="legacy_header",
+                    action="store_true",
+                    help="rewrite the journal header magic to the old 'JHDR' value")
     ap.add_argument("--external-journal", dest="external_journal",
                     action="store_true",
                     help="rewrite the info block to name a journal on another device")
@@ -267,6 +307,8 @@ def main() -> None:
 
     if args.external_journal:
         return write_external_journal(img, journal_info_block, args)
+    if args.legacy_header:
+        return write_legacy_header(img, args)
 
     # --- Journal info block ------------------------------------------------
     jib_off = journal_info_block * block_size

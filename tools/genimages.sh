@@ -142,6 +142,17 @@ if [[ -f tools/mktorn.py ]] && [[ -f tests/images/generated/journaled-hfsplus.im
     tests/images/replayed/journal-torn-catalog.img --name torn.txt --cnid 18
 fi
 
+echo "JOURNAL HEADER, LEGACY MAGIC"
+# Apple accepts 'JHDR' as well as 'JNLx' and converts the old magic on open --
+# but only after deciding not to check the checksum, which it guards with
+# `if (magic == JOURNAL_HEADER_MAGIC)`. A journal converted from the old format
+# therefore has a checksum that no longer matches, and must still replay. No
+# current-macOS image can show that.
+if [[ -f tests/images/replayed/journal-replay-be.img ]]; then
+  python3 tools/makejournal.py tests/images/replayed/journal-replay-be.img \
+    tests/images/replayed/journal-legacy-header.img --legacy-header
+fi
+
 echo "EXTERNAL JOURNAL"
 # A journal can live on another partition, named by ext_jnl_uuid -- which is what
 # a Time Machine volume has. mkfs_hfsplus cannot create one, so it is written by
