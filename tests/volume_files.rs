@@ -40,6 +40,8 @@ const WITH_FILES: &str = "journal-with-files";
 const FRAGMENTED: &str = "fragmented.bin";
 /// A symbolic link.
 const LINK: &str = "link";
+/// A file whose extents spill past the inline eight into the extents B-tree.
+const OVERFLOW: &str = "overflow.bin";
 /// The link's target, as stored.
 const LINK_TARGET: &str = "../elsewhere/target";
 
@@ -96,7 +98,13 @@ fn the_root_folder_lists_the_files_alongside_the_journal_ones() {
         names.sort();
         assert_eq!(
             names,
-            vec![".journal", ".journal_info_block", "fragmented.bin", "link"],
+            vec![
+                ".journal",
+                ".journal_info_block",
+                "fragmented.bin",
+                "link",
+                "overflow.bin",
+            ],
             "the added files must appear alongside the two newfs_hfs created"
         );
     });
@@ -393,7 +401,7 @@ fn the_manifests_file_entries_describe_what_the_volume_actually_has() {
         .unwrap_or_else(|e| panic!("read manifest: {e}"));
     let manifest = common::manifest::Manifest::parse(&text);
     let count = manifest.array_len("files");
-    assert_eq!(count, 2, "the manifest must specify both added files");
+    assert_eq!(count, 3, "the manifest must specify all three added files");
 
     with_volume(WITH_FILES, |vol| {
         for index in 1..=count {
@@ -446,6 +454,102 @@ fn the_manifests_file_entries_describe_what_the_volume_actually_has() {
                 other => panic!("{name}: unexpected kind {other:?}"),
             }
         }
+    });
+}
+
+// --- Extents that overflow into the B-tree ----------------------------
+
+#[test]
+fn a_file_whose_extents_overflow_is_read_through_the_extents_tree() {
+    // The end-to-end version of what `tests/extents_overflow.rs` covers at the
+    // reader level. `overflow.bin` keeps eight extents inline and two in the
+    // volume's extents overflow B-tree, keyed on `(forkType, fileID,
+    // startBlock)`. Before the resolver was wired into `Volume::fork_reader`, a
+    // read past the eighth extent returned zeros, so this file would have been
+    // silently half empty.
+    //
+    // Every block carries its own physical block number, so the whole file must
+    // read as ten ascending numbers -- and the last two can only come from the
+    // tree.
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        let file = entry(vol, OVERFLOW);
+        assert_eq!(file.data_size(), 10 * 4096, "ten blocks, eight of them inline");
+
+        let data = vol.read_file(&file, 1 << 20).expect("read");
+        assert_eq!(data.len(), 10 * 4096);
+
+        let numbers: Vec<u32> = data
+            .chunks(4096)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert!(
+            numbers.windows(2).all(|w| w[1] > w[0]),
+            "all ten block numbers must ascend, got {numbers:?}"
+        );
+        assert!(
+            numbers[0] > 0,
+            "the last two blocks are only findable through the tree, so their \
+             numbers cannot be zero; got {numbers:?}"
+        );
+
+        // The inline eight and the overflow two must both be real content, not
+        // a zero-fill fallback: a distinct pattern per block is what the
+        // generator writes, and zero would mean the resolver was never consulted.
+        assert!(
+            numbers.iter().all(|n| *n != 0),
+            "every block must be real data, got {numbers:?}"
+        );
+    });
+}
+
+#[test]
+fn a_read_past_the_inline_extents_agrees_with_the_whole_file() {
+    // The boundary that matters is between extent eight and extent nine, since
+    // that is where the data stops being inline and starts coming from the tree.
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        let file = entry(vol, OVERFLOW);
+        let whole = vol.read_file(&file, 1 << 20).expect("read");
+
+        for block in [7u64, 8, 9] {
+            let at = block * 4096;
+            for offset in [at.saturating_sub(2), at, at + 2] {
+                if offset as usize + 8 > whole.len() {
+                    continue;
+                }
+                assert_eq!(
+                    vol.read(&file, offset, 8).expect("window"),
+                    &whole[offset as usize..offset as usize + 8],
+                    "a read at {offset} disagrees with the whole-file read"
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn the_overflowing_file_declares_every_block_it_uses() {
+    // `totalBlocks` counts inline *and* overflow blocks, so a fork that spills
+    // must declare all ten while showing only eight extents. fsck checks this
+    // ("Incorrect block count"), and the crate has to read it consistently too.
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        let file = entry(vol, OVERFLOW);
+        let fork = file.as_file().expect("a file record").record.data_fork;
+        let inline: u64 = (0..8)
+            .map(|i| u64::from(fork.extents.raw[i].block_count))
+            .sum();
+        assert_eq!(inline, 8, "eight blocks are described inline");
+        assert_eq!(fork.total_blocks, 10, "but the fork declares all ten");
+        assert!(fork.needs_overflow(), "so the fork must consult the tree");
+        assert_eq!(fork.overflow_block_count(), 2);
     });
 }
 

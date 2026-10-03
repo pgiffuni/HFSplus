@@ -415,6 +415,42 @@ fn extent_keys_decode_in_the_empty_extents_tree_too() {
 }
 
 #[test]
+fn the_corpus_confirms_the_declared_extents_key_length() {
+    // `kHFSPlusExtentKeyMaximumLength` is 10, not 8: `struct HFSPlusExtentKey` is
+    // `keyLength + forkType + pad + fileID + startBlock`, so the body is 10 bytes
+    // and `kHFSPlusExtentKeyMaximumLength = sizeof(HFSPlusExtentKey) - 2`.
+    //
+    // This is worth asserting against real data rather than only against the
+    // header, because an earlier revision modelled the key as 8 bytes and every
+    // test in the suite still passed -- the corpus contains no overflowing file,
+    // so nothing ever decoded a real extents key.
+    //
+    // `mkfs.hfsplus` allocates the extents fork on every volume, so the tree is
+    // there and empty: real geometry, no records to depend on.
+    use hfsplus::btree::key::EXTENT_KEY_MAX_LENGTH;
+
+    assert_eq!(EXTENT_KEY_MAX_LENGTH, 10);
+    assert_eq!(ExtentKey::ON_DISK_SIZE, 12);
+
+    let mut checked = 0;
+    for (name, hfs_plus) in trees() {
+        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        if vh.extents_file.logical_size == 0 {
+            continue;
+        }
+        let bt = BTreeFile::open(&dev, &vh.extents_file, vh.block_size, hfs_plus)
+            .unwrap_or_else(|e| panic!("{name}: extents tree: {e}"));
+        assert_eq!(
+            bt.header().max_key_length,
+            EXTENT_KEY_MAX_LENGTH as u16,
+            "{name}: the formatter wrote this, so it is ground truth, not a preference"
+        );
+        checked += 1;
+    }
+    assert!(checked > 0, "no volume had an extents file to check");
+}
+
+#[test]
 fn a_header_record_is_still_recoverable_from_a_btree_node() {
     // BTreeHeader::from_node reads at offset 14, exactly as Apple's
     // hfs_btreeio.c GetBTreeBlock does. Confirm against a real header node.
