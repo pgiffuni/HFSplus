@@ -262,7 +262,21 @@ fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
     ));
 
     let Some(j) = vol.journal()? else {
-        s.push_str("journal:         none\n");
+        // The volume is journaled but there is no journal in the image to replay.
+        // That is not the same as there being no journal at all, and a diagnostic
+        // that cannot tell them apart is not much use.
+        if let Some(info) = vol.external_journal()? {
+            s.push_str("journal:         on another device\n");
+            s.push_str(&format!(
+                "journal size:    {}\n",
+                info.size
+            ));
+            s.push_str(&format!("journal flags:   0x{:08x}\n", info.flags));
+            s.push_str("  this image has no journal to replay; the journal is named\n");
+            s.push_str("  by ext_jnl_uuid on a partition this reader cannot locate\n");
+        } else {
+            s.push_str("journal:         none\n");
+        }
         return Ok(s);
     };
 

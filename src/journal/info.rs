@@ -178,11 +178,46 @@ impl JournalInfoBlock {
     /// offset and size against the device before using them. An unvalidated
     /// offset would let a corrupt info block point a reader anywhere, including
     /// outside the image.
+    /// Check this block against the size of the device it describes.
+    ///
+    /// The two journal locations need different things, and conflating them is a
+    /// mistake that refuses a valid volume:
+    ///
+    /// - **Inside the filesystem**: `offset` is the journal's byte offset *in this
+    ///   volume* and `size` its length, so both must be non-zero and the extent
+    ///   must lie within the device.
+    /// - **On another device**: `offset` is not read at all. The journal is named
+    ///   by `ext_jnl_uuid`, and `size` is the length used to match it to the
+    ///   partition. A volume in this state legitimately has `offset == 0`, so
+    ///   requiring it to be non-zero refuses a correct volume with a confusing
+    ///   error about a field that means nothing here.
+    ///
+    /// Mining reference: `core/hfs_vfsutils.c` reads `jibp->offset` only inside
+    /// `if (jib_flags & kJIJournalInFSMask)`, and passes `jib_size` to
+    /// `open_journal_dev` on the other path. When that device cannot be opened
+    /// Apple fails the mount with `EROFS` -- the volume becomes read-only rather
+    /// than becoming unopenable.
     pub fn validate(&self, device_bytes: u64) -> Result<()> {
-        if self.offset == 0 || self.size == 0 {
+        if self.size == 0 {
             return Err(Error::invalid(
                 "JournalInfoBlock",
-                format!("offset {} and size {} must both be non-zero", self.offset, self.size),
+                format!("size {} must be non-zero", self.size),
+            ));
+        }
+
+        let flags = self.flag_set();
+        if !flags.in_filesystem() {
+            // The journal is elsewhere; `offset` says nothing about this device.
+            return Ok(());
+        }
+
+        if self.offset == 0 {
+            return Err(Error::invalid(
+                "JournalInfoBlock",
+                format!(
+                    "offset 0 is not valid for a journal in the filesystem at {}",
+                    self.offset
+                ),
             ));
         }
         let end = self

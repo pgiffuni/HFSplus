@@ -341,6 +341,31 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         )
     }
 
+    /// The volume's journal info block, when the journal lives on another device.
+    ///
+    /// [`Volume::journal`] returns `None` for such a volume, because there is no
+    /// journal in the image to replay. That is the right answer for a reader and
+    /// the wrong answer for a diagnostic: "no journal" and "the journal is
+    /// somewhere else" are different states, and a caller asked to report on the
+    /// volume needs to tell them apart.
+    ///
+    /// Mining reference: `core/hfs_vfsutils.c` `hfs_mount_hfsplus` branches on
+    /// `kJIJournalInFSMask` and, on the other path, calls `open_journal_dev` with
+    /// `ext_jnl_uuid` and `machine_serial_num`. Locating that device is a
+    /// mount-time policy decision, so this only reports what the block says.
+    pub fn external_journal(&self) -> Result<Option<crate::journal::info::JournalInfoBlock>> {
+        if !self.header.is_journaled() || self.header.journal_info_block == 0 {
+            return Ok(None);
+        }
+        let bs = u64::from(self.header.block_size);
+        let len = usize::try_from(bs).map_err(|_| Error::overflow("journal info block size"))?;
+        let mut buf = vec![0u8; len];
+        let at = u64::from(self.header.journal_info_block) * bs;
+        self.device.read_at(at, &mut buf)?;
+        let info = crate::journal::info::JournalInfoBlock::parse(&buf)?;
+        Ok(if info.flag_set().in_filesystem() { None } else { Some(info) })
+    }
+
     /// The volume's allocation bitmap.
     pub fn allocation_bitmap(&self) -> Result<AllocationBitmap<'a, D>> {
         AllocationBitmap::open(
