@@ -1001,3 +1001,58 @@ fn a_killed_block_is_skipped_without_stopping_the_replay() {
         "one block per transaction in this fixture"
     );
 }
+
+#[test]
+fn transactions_past_a_stale_journal_header_end_are_still_recovered() {
+    // The crash case. A transaction is journalled and the machine stops before
+    // the header's `end` is updated, so the journal holds more than its header
+    // claims. Apple walks on: its loop is
+    // `while (check_past_jnl_end || jnl->jhdr->start != jnl->jhdr->end)`, and
+    // `check_past_jnl_end` is cleared only for a pre-sequence-number journal.
+    //
+    // Stopping at `end` under-recovers this silently -- the file returned is
+    // shorter, and nothing says so. Confirmed against the previous bound, which
+    // recovered 1 transaction from this image where the fix recovers 3.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal`, the loop condition
+    // and its "examining extra transactions" branch.
+    let ran = with_fixture("journal-short-end", |journal| {
+        assert_eq!(
+            journal.transactions().len(),
+            3,
+            "every journalled transaction must be recovered"
+        );
+        assert_eq!(journal.replayed_blocks().len(), 2, "over two distinct blocks");
+        assert!(
+            journal.truncation().is_none(),
+            "the journal is sound; walking past a stale end is not damage, got {:?}",
+            journal.truncation()
+        );
+    });
+    assert!(ran, "journal-short-end: the image must be built");
+
+    // And the same image with its header intact must give the identical answer,
+    // which is what makes the walk past `end` a recovery rather than a guess.
+    let path = common::repo_root()
+        .join("tests/images/replayed/journal-replay-multi.img");
+    if !path.exists() {
+        eprintln!("skipping the comparison: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let intact = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("a journal");
+    assert_eq!(
+        journal_txn_count(&intact),
+        3,
+        "the intact journal yields the same transactions"
+    );
+}
+
+fn journal_txn_count<D: hfsplus::blockdev::BlockDevice + ?Sized>(
+    journal: &Journal<'_, D>,
+) -> usize {
+    journal.transactions().len()
+}
