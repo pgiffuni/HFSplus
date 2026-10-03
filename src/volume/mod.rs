@@ -144,7 +144,13 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 
     /// Look up `name` inside `parent`.
     pub fn lookup(&self, parent: Cnid, name: &[u16]) -> Result<Option<Object>> {
-        let Some(record) = self.catalog.lookup(parent, name)? else {
+        // The name is taken from the catalog key the search landed on, not from
+        // the request. On a case-folding volume several spellings reach the same
+        // record, and reporting the caller's spelling would name a file that does
+        // not exist: `Volume::name` is derived from this, and so is anything a
+        // FUSE mount returns to a process that listed the directory by another
+        // spelling.
+        let Some((stored, record)) = self.catalog.lookup_named(parent, name)? else {
             return Ok(None);
         };
         // Thread records describe a directory entry from the outside; a
@@ -152,7 +158,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         if record.is_thread() {
             return Ok(None);
         }
-        Ok(Object::from_record(name.to_vec(), record, self.header.has_expanded_times()))
+        Ok(Object::from_record(stored, record, self.header.has_expanded_times()))
     }
 
     /// List a directory's entries.

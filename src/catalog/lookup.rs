@@ -152,6 +152,25 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
     /// key with `buildkey` and calls `BTGetRecordFromIndex`/`BTSearchRecord`.
     pub fn lookup(&self, parent_id: Cnid, name: &[u16]) -> Result<Option<CatalogRecord>> {
         let key = CatalogKey::for_child(parent_id, name);
+        Ok(self.search(&key)?.map(|(_, record)| record))
+    }
+
+    /// Look up a child and report the name the catalog *stores* for it.
+    ///
+    /// On a case-folding volume several spellings resolve to one record, so the
+    /// name that was asked for and the name on disk differ. A caller that echoes
+    /// the request back is then reporting a file that does not exist, so this
+    /// returns the key the search actually landed on.
+    ///
+    /// Mining reference: Apple `core/hfs_catalog.c` `cat_lookup` returns the
+    /// position it found, and the caller reads the key from the record rather
+    /// than reusing the one it built.
+    pub fn lookup_named(
+        &self,
+        parent_id: Cnid,
+        name: &[u16],
+    ) -> Result<Option<(Vec<u16>, CatalogRecord)>> {
+        let key = CatalogKey::for_child(parent_id, name);
         self.search(&key)
     }
 
@@ -217,7 +236,7 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
     }
 
     /// Find the record whose key is exactly `key`.
-    fn search(&self, key: &CatalogKey) -> Result<Option<CatalogRecord>> {
+    fn search(&self, key: &CatalogKey) -> Result<Option<(Vec<u16>, CatalogRecord)>> {
         let max_key = usize::from(self.tree.header().max_key_length);
         let root = self.tree.header().root_node;
 
@@ -253,7 +272,7 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
         node: &crate::btree::node::Node<'_>,
         key: &CatalogKey,
         max_key: usize,
-    ) -> Option<CatalogRecord> {
+    ) -> Option<(Vec<u16>, CatalogRecord)> {
         let mut lo = 0u16;
         let mut hi = node.num_records();
         let mut found: Option<u16> = None;
@@ -274,8 +293,8 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
 
         let idx = found?;
         let record = node.record(idx).ok()?;
-        let (_, body) = split_record(record)?;
-        parse_record(body).ok()
+        let (stored, body) = split_record(record)?;
+        parse_record(body).ok().map(|r| (stored.name, r))
     }
 
     /// Choose the child node to descend into from an index node.
