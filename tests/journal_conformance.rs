@@ -658,3 +658,116 @@ fn a_journal_header_pointing_at_its_own_header_is_refused() {
     };
     assert!(sound.validate(524288).is_ok(), "a sound header must validate");
 }
+
+/// The milestone's own acceptance criteria, run over every journaled image.
+///
+/// Two things, for each: `fsck.hfsplus` accepts a **copy** and leaves it
+/// untouched, and reading the image through the library leaves the **source**
+/// byte-identical.
+///
+/// The distinction between the two files matters and is the whole reason for the
+/// copy. `fsck_hfs` repairs as well as reports, and it repairs the volume header
+/// in place -- which is how `tools/genmalformed.sh` came to undo the very
+/// corruptions it was generating. Pointed at a fixture it would change it, so it
+/// is only ever given a throwaway.
+///
+/// The faults in `journal-bad-*` are in the journal, which `fsck.hfsplus` does
+/// not replay, so it accepts those images too. That is not a contradiction: they
+/// are sound filesystems with unsound journals, and refusing them is the
+/// reader's job rather than the checker's.
+#[test]
+fn the_milestone_criteria_hold_for_every_journaled_image() {
+    let fsck = common::fsck_available();
+    if fsck.is_none() {
+        eprintln!("skipping the fsck column: fsck.hfsplus not installed");
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    for dir in ["generated", "replayed"] {
+        let path = common::repo_root().join("tests/images").join(dir);
+        let Ok(entries) = std::fs::read_dir(&path) else { continue };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("img") {
+                continue;
+            }
+            let Some(name) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            if name.starts_with("journal") {
+                names.push(format!("{dir}/{name}"));
+            }
+        }
+    }
+    names.sort();
+    assert!(!names.is_empty(), "no journaled images were found");
+
+    let mut checked = 0;
+    for entry in &names {
+        // `entry` is "dir/stem"; the image is the stem plus its extension.
+        let path = common::repo_root()
+            .join("tests/images")
+            .join(format!("{entry}.img"));
+        if !path.exists() {
+            eprintln!("skipping {entry}: not built");
+            continue;
+        }
+        let before = digest(&std::fs::read(&path).expect("read the source"));
+
+        // Read it every way the library offers, then compare.
+        {
+            let dev = FileDevice::open(&path).expect("open");
+            let vol = Volume::open(&dev);
+            if let Ok(vol) = vol {
+                let _ = vol.is_journaled();
+                let _ = vol.header().journal_info_block;
+                if let Ok(Some(j)) = vol.journal() {
+                    let _ = j.transactions();
+                    let _ = j.replayed_blocks();
+                    let _ = j.truncation();
+                    let _ = j.header_checksum_ok();
+                }
+                let _ = vol.external_journal();
+            }
+            // And through the overlaid device, which is the view a mount sees.
+            if let Ok(vh) = VolumeHeader::read_from(&dev) {
+                if let Ok(Some(journal)) =
+                    Journal::open(&dev, vh.journal_info_block, vh.block_size)
+                {
+                    let _ = journal.read_bytes(0, 4096);
+                }
+            }
+        }
+
+        let after = digest(&std::fs::read(&path).expect("read the source back"));
+        assert_eq!(
+            before,
+            after,
+            "{entry}: reading the image modified the source"
+        );
+
+        if let Some(fsck) = &fsck {
+            let mut probe = std::env::temp_dir();
+            probe.push(format!("ms5-{}.img", entry.replace('/', "-")));
+            std::fs::copy(&path, &probe).expect("copy for fsck");
+            let out = common::run_fsck(fsck, &probe);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let probe_after = digest(&std::fs::read(&probe).expect("read the probe back"));
+            let _ = std::fs::remove_file(&probe);
+
+            assert!(
+                text.contains("appears to be OK"),
+                "{entry}: the checker rejected a sound image:\n{text}"
+            );
+            assert_eq!(
+                before,
+                probe_after,
+                "{entry}: the checker modified its copy, so it repaired something:\n{text}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "no journaled images were checked");
+}
