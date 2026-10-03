@@ -38,7 +38,7 @@ mod common;
 
 use hfsplus::blockdev::FileDevice;
 use hfsplus::catalog::record::{S_IFLNK, S_IFMT, S_IFREG};
-use hfsplus::volume::Object;
+use hfsplus::volume::{Object, Volume};
 
 /// The image `tools/mkfiles.py` produces from `journaled-hfsplus`.
 const WITH_FILES: &str = "journal-with-files";
@@ -570,3 +570,121 @@ fn digest(bytes: &[u8]) -> u64 {
     }
     h
 }
+
+#[test]
+fn a_fork_extent_past_the_volume_is_refused_when_a_read_reaches_it() {
+    // A descriptor's `startBlock` is a device block number and nothing in the
+    // record bounds it -- the block number is multiplied by the block size before
+    // any read, so a descriptor past the end gives an offset past the end.
+    //
+    // Mining reference: `core/FileExtentMapping.c` `MapFileBlockC` computes
+    // `block_num * jhdr_size` with no bound on `block_num`; the bound comes from
+    // the caller.
+    //
+    // Worth pinning because of *when* it is caught. A read confined to the earlier,
+    // valid extents succeeds -- the same tolerance that lets a fork short of its
+    // logical size read as zeros -- so the damage is silent until a read reaches
+    // it. The checker refuses the whole volume instead, which is where the
+    // complaint belongs.
+    let path = common::repo_root()
+        .join("tests/images/replayed/fork-extent-past-volume.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+
+    let units: Vec<u16> = FRAGMENTED_NAME.encode_utf16().collect();
+    let object = vol
+        .lookup(vol.root_cnid(), &units)
+        .expect("lookup")
+        .expect("fragmented.bin must be listed");
+
+    // Extent 2 is the broken one, so offset 2 blocks in reaches it. The reader
+    // refuses, but as a *device* truncation rather than by naming the bound --
+    // it multiplies the block number and asks for bytes that are not there. That
+    // is safe and it is the reader's only line of defence here; the message
+    // naming the extent bound is the checker's.
+    let err = vol
+        .read(&object, 2 * 4096, 64)
+        .expect_err("a read reaching the bad extent must be refused");
+    assert!(
+        err.to_string().contains("truncated"),
+        "the read must fail as a short read, got {err}"
+    );
+
+    // And the earlier extents still read, which is the tolerance being described
+    // rather than a second bug.
+    assert_eq!(
+        vol.read(&object, 0, 64).expect("a read inside the valid extents").len(),
+        64
+    );
+
+    // The checker refuses the volume outright, and is the place the bound is
+    // named.
+    match hfsplus::check::check(&vol, None) {
+        Err(e) => assert!(
+            e.to_string().contains("outside volume"),
+            "the checker must name the extent bound, got {e}"
+        ),
+        Ok(report) => assert!(
+            !report.is_clean(),
+            "the checker must not call this volume consistent: {:?}",
+            report.describe()
+        ),
+    }
+}
+
+#[test]
+fn a_symlink_whose_target_is_empty_is_refused() {
+    // A symlink's target *is* its data fork, so an empty one names nothing.
+    // Returning "" would hand back a path, and a caller would try to resolve it
+    // -- against the process's working directory in the worst case.
+    //
+    // Mining reference: `core/hfs_xattr.c` reads a link target out of the file's
+    // data fork for HFSPlus, so the fork and the target cannot disagree.
+    let path = common::repo_root()
+        .join("tests/images/replayed/symlink-empty-target.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+
+    let units: Vec<u16> = "link".encode_utf16().collect();
+    let object = vol
+        .lookup(vol.root_cnid(), &units)
+        .expect("lookup")
+        .expect("the symlink must still be listed");
+    assert!(object.is_symlink(), "it is still a symlink");
+    assert_eq!(object.data_size(), 0, "its data fork is empty");
+
+    let err = vol
+        .read_link(&object)
+        .expect_err("an empty target must be refused, not returned");
+    assert!(
+        err.to_string().contains("no target"),
+        "the error must say why, got {err}"
+    );
+
+    // And the sound symlink still reads, so the check is not simply refusing all
+    // of them.
+    let good = common::image("journal-with-files");
+    if good.exists() {
+        let dev = FileDevice::open(&good).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        let object = vol
+            .lookup(vol.root_cnid(), &units)
+            .expect("lookup")
+            .expect("link");
+        assert_eq!(
+            vol.read_link(&object).expect("a sound symlink"),
+            "../elsewhere/target"
+        );
+    }
+}
+
+/// Name of the fragmented file in the generated fixtures.
+const FRAGMENTED_NAME: &str = "fragmented.bin";
