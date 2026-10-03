@@ -149,6 +149,15 @@ pub struct CheckReport {
     /// file. Mining reference: `core/hfs_catalog.c` allocates `nextCatalogID`
     /// monotonically and `hfs_vfsutils.c` checks it against the catalog.
     pub next_cnid_reuse: Option<(u32, u32)>,
+    /// A fork that breaks one of Apple's two size inequalities.
+    ///
+    /// `(CNID, or 0 for a special fork, the reason)`. Both come from
+    /// `ForkData::validate`, which checks `logical <= physical` and
+    /// `physical <= described_blocks * block_size`.
+    ///
+    /// Mining reference: `lib_fsck_hfs/dfalib/CatalogCheck.c` `CheckFileData`,
+    /// reporting `E_LEOF` and `E_PEOF` respectively.
+    pub fork_rule: Vec<(u32, String)>,
     /// A fork's `totalBlocks` disagrees with the blocks its extents describe.
     ///
     /// The other direction of the same arithmetic: the extents must account for
@@ -163,6 +172,7 @@ impl CheckReport {
             && self.missing.is_empty()
             && self.next_cnid_reuse.is_none()
             && self.fork_block_count.is_empty()
+            && self.fork_rule.is_empty()
             && self.key_order.is_empty()
             && self.key_length.is_empty()
             && self.missing_thread.is_empty()
@@ -236,6 +246,14 @@ impl CheckReport {
             out.push(format!(
                 "folder {cnid} declares valence {declared} but has {counted} children"
             ));
+        }
+        for (cnid, reason) in &self.fork_rule {
+            let which = if *cnid == SPECIAL_FORK_SENTINEL {
+                "a special fork".to_string()
+            } else {
+                format!("file {cnid}")
+            };
+            out.push(format!("{which}: {reason}"));
         }
         for (cnid, declared, described) in &self.fork_block_count {
             let which = if *cnid == SPECIAL_FORK_SENTINEL {
@@ -409,13 +427,20 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
         }
         let (blocks, described) = fork_blocks(vol, special, 0)?;
         referenced.extend(blocks);
-        if described != special.total_blocks {
-            report.fork_block_count.push((
-                SPECIAL_FORK_SENTINEL,
-                special.total_blocks,
-                described,
-            ));
-            let _ = name;
+        let _ = name;
+        match special.validate(u64::from(described), header.block_size) {
+            Ok(()) => {
+                if described != special.total_blocks {
+                    report.fork_block_count.push((
+                        SPECIAL_FORK_SENTINEL,
+                        special.total_blocks,
+                        described,
+                    ));
+                }
+            }
+            Err(e) => report
+                .fork_rule
+                .push((SPECIAL_FORK_SENTINEL, e.to_string())),
         }
     }
 
@@ -437,10 +462,19 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
                     }
                     let (blocks, described) = fork_blocks(vol, fork, cnid)?;
                     referenced.extend(blocks);
-                    if described != fork.total_blocks {
-                        report
-                            .fork_block_count
-                            .push((cnid, fork.total_blocks, described));
+                    // Apple's two inequalities, checked against the blocks the
+                    // extents really describe rather than against `total_blocks`
+                    // alone. `reported` accumulates so a fork is not reported once
+                    // per check: the first failure is the informative one.
+                    match fork.validate(u64::from(described), header.block_size) {
+                        Ok(()) => {
+                            if described != fork.total_blocks {
+                                report
+                                    .fork_block_count
+                                    .push((cnid, fork.total_blocks, described));
+                            }
+                        }
+                        Err(e) => report.fork_rule.push((cnid, e.to_string())),
                     }
                 }
             }
@@ -960,6 +994,7 @@ mod tests {
             missing: vec![9],
             next_cnid_reuse: Some((18, 20)),
             fork_block_count: vec![(19, 10, 8)],
+            fork_rule: vec![(20, "logicalSize claims a hole".to_string())],
             key_order: vec![(1, 4)],
             key_length: vec![(1, 2)],
             missing_thread: vec![22],
@@ -972,7 +1007,7 @@ mod tests {
         };
         assert!(!report.is_clean());
         let lines = report.describe();
-        assert_eq!(lines.len(), 13, "one line per disagreement:\n{}", lines.join("\n"));
+        assert_eq!(lines.len(), 14, "one line per disagreement:\n{}", lines.join("\n"));
         assert!(lines[0].contains('7') && lines[0].contains("no file references"));
         assert!(lines[1].contains('9') && lines[1].contains("not marked"));
         assert!(lines[2].contains("nextCatalogID"));
@@ -981,6 +1016,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("maxKeyLength")));
         assert!(lines.iter().any(|l| l.contains("no thread record")));
         assert!(lines.iter().any(|l| l.contains("valence")));
+        assert!(lines.iter().any(|l| l.contains("claims a hole")));
         assert!(lines.iter().any(|l| l.contains("height contradicts")));
         assert!(lines.iter().any(|l| l.contains("points at node 900")));
         assert!(lines.iter().any(|l| l.contains("forward link disagrees")));
