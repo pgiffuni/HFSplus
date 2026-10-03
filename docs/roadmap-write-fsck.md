@@ -32,6 +32,28 @@ The write side is thinner than the read side, but the shapes are known:
 What does not exist: an allocator, a B-tree *writer* (insert, split, and the node
 map), and any notion of a volume being created or checked.
 
+## Where this actually stands
+
+More of step 2 and 3 than expected is done, because both turned out to be
+reachable read-only:
+
+- `src/alloc/mod.rs` — the allocator: reserve, release, first-fit search from a
+  hint with wrap, and the `orphaned`/`missing` comparison.
+- `src/check/mod.rs` — four checks, all read-only: allocation bitmap against the
+  catalog's extents in both directions, each fork's declared `totalBlocks`
+  against what its extents describe (including the volume's own five forks), and
+  `nextCatalogID` against the CNIDs in use.
+- Catalog structure: key order within a leaf, key length against `maxKeyLength`,
+  a thread record for every object, and folder valence.
+- `hfsck` — the tool, with a fourth exit status for "read and found
+  inconsistent".
+
+Acceptance: 15 clean images must produce an empty report, 11 malformed ones must
+be refused or flagged, and four deliberate breakages must be flagged by *both*
+this checker and `fsck.hfsplus`. What remains before this could be called a
+checker is the B-tree structural pass (node heights, node sizes, the B-tree map)
+and the multi-linked-files pass, which needs hard-link resolution first.
+
 ## Order
 
 1. **Write support** (`write:`) — in-place file and directory modification,
