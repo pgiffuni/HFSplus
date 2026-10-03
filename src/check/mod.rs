@@ -36,6 +36,12 @@ use crate::catalog::record::CatalogRecord;
 use crate::error::{Error, Result};
 use crate::volume::Volume;
 
+/// Sentinel in [`CheckReport::fork_block_count`] for the volume's own forks.
+///
+/// No file can hold CNID 0: `kHFSRootFolderID` is 2, and 0 and 1 are reserved,
+/// so the value cannot collide with a file's.
+pub const SPECIAL_FORK_SENTINEL: u32 = 0;
+
 /// What a set of checks found.
 ///
 /// Every field is a disagreement between two structures, not a verdict on which
@@ -93,8 +99,13 @@ impl CheckReport {
             ));
         }
         for (cnid, declared, described) in &self.fork_block_count {
+            let which = if *cnid == SPECIAL_FORK_SENTINEL {
+                "a special fork".to_string()
+            } else {
+                format!("file {cnid}")
+            };
             out.push(format!(
-                "file {cnid} declares {declared} blocks but its extents describe {described}"
+                "{which} declares {declared} blocks but its extents describe {described}"
             ));
         }
         out
@@ -242,11 +253,31 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
     let allocation_start = header.allocation_file.extents.raw[0].start_block;
     let mut referenced: Vec<u32> =
         metadata_blocks(header.block_size, header.total_blocks, allocation_start)?;
-    referenced.extend(fork_blocks(vol, fork, 0)?.0);
-    referenced.extend(fork_blocks(vol, &header.catalog_file, 0)?.0);
-    referenced.extend(fork_blocks(vol, &header.extents_file, 0)?.0);
-    if header.attributes_file.logical_size > 0 {
-        referenced.extend(fork_blocks(vol, &header.attributes_file, 0)?.0);
+    // The volume's own five forks, each checked as carefully as a file's. A
+    // special fork is validated at mount time -- `core/hfs_vfsutils.c` derives
+    // each one's expected size from the header and refuses the volume otherwise
+    // -- so a catalog fork claiming two billion blocks is a mount failure, not a
+    // curiosity.
+    for (name, special) in [
+        ("allocationFile", &header.allocation_file),
+        ("extentsFile", &header.extents_file),
+        ("catalogFile", &header.catalog_file),
+        ("attributesFile", &header.attributes_file),
+        ("startupFile", &header.startup_file),
+    ] {
+        if special.logical_size == 0 && special.total_blocks == 0 {
+            continue;
+        }
+        let (blocks, described) = fork_blocks(vol, special, 0)?;
+        referenced.extend(blocks);
+        if described != special.total_blocks {
+            report.fork_block_count.push((
+                SPECIAL_FORK_SENTINEL,
+                special.total_blocks,
+                described,
+            ));
+            let _ = name;
+        }
     }
 
     // --- Every block the catalog says the files occupy ------------------

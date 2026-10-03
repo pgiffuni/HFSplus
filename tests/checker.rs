@@ -196,6 +196,46 @@ fn a_file_with_no_thread_record_is_still_visited() {
     );
 }
 
+// --- The malformed corpus -----------------------------------------------
+
+#[test]
+fn every_malformed_image_is_either_refused_or_flagged() {
+    // The complement of the negative test above. An image the corpus deliberately
+    // broke must not pass silently, whether the parser refuses it or a check
+    // finds the damage -- and if some future check makes one of them pass, this
+    // says so by name.
+    let dir = common::repo_root().join("tests/images/malformed");
+    let entries = std::fs::read_dir(&dir).expect("the malformed corpus must exist");
+    let mut names: Vec<String> = entries
+        .filter_map(|e| {
+            let path = e.ok()?.path();
+            if path.extension()? == "img" {
+                Some(path.file_stem()?.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no malformed images found");
+
+    let mut clean: Vec<&str> = Vec::new();
+    for name in &names {
+        let path = dir.join(format!("{name}.img"));
+        let dev = FileDevice::open(&path).expect("open");
+        let verdict = Volume::open(&dev).and_then(|vol| check::check(&vol, None));
+        if let Ok(report) = verdict {
+            if report.is_clean() {
+                clean.push(name.as_str());
+            }
+        }
+    }
+    assert!(
+        clean.is_empty(),
+        "these images were deliberately corrupted but the checker passed them: {clean:?}"
+    );
+}
+
 // --- Helpers for building broken copies ---------------------------------
 //
 // Each break is applied to a *copy* in the temporary directory, so the corpus
