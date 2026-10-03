@@ -1056,3 +1056,29 @@ fn journal_txn_count<D: hfsplus::blockdev::BlockDevice + ?Sized>(
 ) -> usize {
     journal.transactions().len()
 }
+
+#[test]
+fn the_stale_end_fixture_is_otherwise_sound() {
+    // The point of the previous test is that the extra transactions are real
+    // ones the header had not caught up with. That only holds if the header is
+    // otherwise consistent -- and `end` sits inside the header's checksummed
+    // range, so cutting it invalidates the checksum unless the fixture refreshes
+    // it.
+    //
+    // A stale header checksum is not fatal -- Apple mounts anyway, and so does
+    // this crate -- so a fixture that skipped the refresh would still replay all
+    // three transactions and still pass, while testing something narrower than it
+    // claims.
+    //
+    // Mining reference: `JOURNAL_HEADER_CKSUM_SIZE` is `offsetof(sequence_num)`,
+    // so the checksum covers `end`.
+    let ran = with_fixture("journal-short-end", |journal| {
+        assert_eq!(
+            journal.header_checksum_ok(),
+            Some(true),
+            "the fixture must be a sound journal, not one that merely replays"
+        );
+        assert_eq!(journal.transactions().len(), 3);
+    });
+    assert!(ran, "journal-short-end: the image must be built");
+}
