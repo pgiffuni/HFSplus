@@ -2,6 +2,7 @@
 /target
 tests/images/generated/
 tests/images/malformed/
+tests/images/replayed/
 tests/images/public/*
 tests/images/macos/*
 !tests/images/public/.gitkeep

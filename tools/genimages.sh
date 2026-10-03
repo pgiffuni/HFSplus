@@ -95,6 +95,32 @@ echo "LEGACY"
 make_image classic-hfs          32 -h -v "ClassicVolume"
 
 echo
+echo "JOURNAL REPLAY"
+# Every image created with -J has an uninitialised journal, because no
+# transaction has ever been written, so the corpus cannot exercise replay at all.
+# makejournal.py writes a real journal header, transaction and block list into a
+# journaled image so that the replay path has something to replay.
+if [[ -x tools/makejournal.py || -f tools/makejournal.py ]]; then
+  mkdir -p tests/images/replayed
+  # The three names tests/journal_replay.rs expects, so there is one recipe.
+  [[ -f tests/images/generated/journaled-hfsplus.img ]] && python3 tools/makejournal.py \
+    tests/images/generated/journaled-hfsplus.img \
+    tests/images/replayed/journal-replay-be.img --block 200 --data "journal replayed block 200"
+
+  # The little-endian header form, which is what a 64-bit x86 or ARM host writes
+  # and the reader has to detect rather than assume.
+  [[ -f tests/images/generated/journaled-hfsplus.img ]] && python3 tools/makejournal.py \
+    tests/images/generated/journaled-hfsplus.img \
+    tests/images/replayed/journal-replay-le.img --block 201 --little-endian \
+    --data "journal replayed block 201"
+
+  # A different volume block size, so the geometry is not only exercised at 4K.
+  [[ -f tests/images/generated/journaled-hfsplus-1k.img ]] && python3 tools/makejournal.py \
+    tests/images/generated/journaled-hfsplus-1k.img \
+    tests/images/replayed/journal-replay-1k.img --block 300 \
+    --data "journal replayed block 300 on a 1k volume"
+fi
+
 echo "verifying every image with the independent checker"
 fail=0
 for img in "${OUT_DIR}"/*.img; do
