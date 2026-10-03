@@ -29,7 +29,7 @@
 //! papered over.
 
 use super::checksum::{calc_checksum, BLHDR_CHECKSUM_SIZE};
-use super::info::{JournalHeader, JournalInfoBlock, END_BLK_NUM};
+use super::info::{JournalHeader, JournalInfoBlock, END_BLK_NUM, JOURNAL_HEADER_MAGIC};
 use crate::blockdev::BlockDevice;
 use crate::error::{Error, Result};
 
@@ -312,6 +312,9 @@ pub struct Journal<'a, D: ?Sized> {
     header: Option<JournalHeader>,
     transactions: Vec<Transaction>,
     overlay: Vec<ReplayedBlock>,
+    /// Whether the journal header's checksum matched, or `None` when it was not
+    /// checked.
+    checksum_ok: Option<bool>,
     /// The volume's allocation block size, which `bnum` is measured in.
     block_size: u32,
     /// Where replay stopped short, if it did.
@@ -330,6 +333,7 @@ impl<'a, D: BlockDevice + ?Sized> std::fmt::Debug for Journal<'a, D> {
             .field("truncated_at", &self.truncated_at)
             .field("replayed_blocks", &self.overlay.len())
             .field("has_header", &self.header.is_some())
+            .field("header_checksum_ok", &self.checksum_ok)
             .finish()
     }
 }
@@ -362,13 +366,33 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
             return Ok(None);
         }
 
-        let mut header_bytes = vec![0u8; 4096.min(info.size as usize).max(512)];
+        // Read no more than the journal itself holds. The artificial floor that
+        // used to sit here could ask the device for bytes a small journal near the
+        // end of an image does not contain, turning "there is no header here" into
+        // a confusing truncation error. The parser decides what is enough.
+        let want = usize::try_from(info.size)
+            .map_err(|_| Error::overflow("journal header read length"))?
+            .min(MAX_HEADER_PROBE);
+        let mut header_bytes = vec![0u8; want];
         device.read_at(info.offset, &mut header_bytes)?;
         let header = JournalHeader::parse(&header_bytes)?;
+
+        // Apple's checksum diagnostic. It computes the header checksum, compares
+        // it with the stored value, and *deliberately does not fail* on a
+        // mismatch: the `goto bad_journal` is commented out. So this is reported
+        // rather than enforced, and only for the current magic, which is exactly
+        // the condition Apple guards with.
+        //
+        // Mining reference: core/hfs_journal.c `journal_open`.
+        let checksum_ok = match &header {
+            Some(h) if h.magic == JOURNAL_HEADER_MAGIC => Some(h.checksum_matches(&header_bytes)),
+            _ => None,
+        };
 
         let mut journal = Journal {
             info,
             header,
+            checksum_ok,
             transactions: Vec::new(),
             overlay: Vec::new(),
             block_size,
@@ -673,6 +697,22 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         self.transactions.iter().map(|t| t.block_lists.len()).sum()
     }
 
+    /// Whether the journal header's checksum matched.
+    ///
+    /// `None` when it was not checked, which is the case for a journal with no
+    /// header, and for one using the legacy `JHDR` magic: Apple guards the check
+    /// with `if (magic == JOURNAL_HEADER_MAGIC)`.
+    ///
+    /// A `Some(false)` is a diagnostic, not a failure. Apple prints a message and
+    /// mounts anyway, because refusing would leave the filesystem missing every
+    /// recent change.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `journal_open`, where the
+    /// `goto bad_journal` after the checksum mismatch is commented out.
+    pub fn header_checksum_ok(&self) -> Option<bool> {
+        self.checksum_ok
+    }
+
     /// Where replay stopped short, and why.
     ///
     /// `Some((offset, reason))` means the journal was damaged partway and
@@ -698,6 +738,12 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         OverlaidDevice { inner: self.device, overlay: &self.overlay }
     }
 }
+
+/// Most bytes read when probing for a journal header.
+///
+/// A journal header is 48 bytes and occupies one filesystem block, so 4 KiB
+/// covers any real volume. Reading more would be reading block-list data.
+const MAX_HEADER_PROBE: usize = 4096;
 
 /// Cap on block lists within one transaction.
 const MAX_BLOCK_LISTS: u32 = 1 << 12;
