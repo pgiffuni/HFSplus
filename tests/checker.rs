@@ -321,6 +321,49 @@ fn every_malformed_image_is_either_refused_or_flagged() {
     );
 }
 
+#[test]
+fn a_reachable_node_with_the_wrong_height_is_reported() {
+    // A reader descends by height, so a wrong one sends it into nodes that are
+    // not leaves -- and the result is a lookup that finds nothing rather than one
+    // that fails.
+    //
+    // Only node 1, the catalog's leaf. Nodes 2 and 3 exist in the file and are
+    // not reachable from the root, and a checker that walks from the root has no
+    // business reporting them: unreachable nodes are what Apple's
+    // `BTCheckUnusedNodes` pass is for, and that check is not here yet. Writing a
+    // height into one of those is the case this test deliberately does not make,
+    // because asserting on it would be asserting the wrong behaviour.
+    let image = break_image("journal-with-files", "height", |img| {
+        let mut set = false;
+        set_leaf_height(img, 1, 7, &mut set);
+        assert!(set, "the catalog leaf node was not found");
+    });
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
+
+    assert!(
+        report.node_height.iter().any(|(tree, node)| *tree == 1 && *node == 1),
+        "the catalog leaf's height must be reported, got {:?}",
+        report.node_height
+    );
+}
+
+#[test]
+fn an_index_record_pointing_nowhere_is_reported() {
+    // Only reachable on a tree with index nodes. The corpus volumes have depth-1
+    // catalogs, so this builds the shape: a root index node whose single child
+    // points past the end of the file.
+    let image = break_image("journal-with-files", "child", |img| {
+        make_dangling_child(img);
+    });
+    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let _ = std::fs::remove_file(&image);
+    assert!(
+        !report.child_node.is_empty(),
+        "a child pointing past the end must be reported, got a clean report"
+    );
+}
+
 // --- Agreement with an independent implementation ------------------------
 
 /// The strongest evidence available that these checks mean what they claim: the
@@ -375,6 +418,11 @@ fn the_checker_and_the_independent_checker_agree_about_damage() {
             what: "a thread record's type destroyed",
             break_it: destroy_thread_record,
             apple_says: "Invalid catalog record type",
+        },
+        Case {
+            what: "a leaf node's height wrong",
+            break_it: wrong_leaf_height,
+            apple_says: "Invalid node height",
         },
     ];
 
@@ -454,6 +502,68 @@ fn destroy_thread_record(img: &mut [u8]) {
     zero_thread_record(img, FRAGMENTED_CNID);
 }
 
+/// Set the catalog's leaf node height to something the tree depth contradicts.
+fn wrong_leaf_height(img: &mut [u8]) {
+    let mut set = false;
+    set_leaf_height(img, 1, 7, &mut set);
+    assert!(set, "the catalog leaf node was not found");
+}
+
+/// Write `height` into a catalog node's descriptor.
+///
+/// Node numbers are offsets within the catalog file, so node 0 is the header and
+/// node 1 the leaf. `set` reports whether the node was written, so a caller can
+/// assert it broke the node it meant to rather than silently missing it.
+fn set_leaf_height(img: &mut [u8], node_num: u32, height: u8, set: &mut bool) {
+    let bs = block_size(img);
+    let base = (catalog_start(img) + node_num) as usize * bs as usize;
+    img[base + 9] = height;
+    *set = true;
+}
+
+/// Turn the catalog's root into an index node whose child points past the end.
+///
+/// The corpus catalog is depth 1, so its root is a leaf. Promoting it to an index
+/// node with one record makes the tree claim a depth it does not have and gives
+/// the walk a child to follow into nothing -- which is the corruption an index
+/// node's child pointer can carry.
+fn make_dangling_child(img: &mut [u8]) {
+    let node = catalog_start(img);
+    let bs = block_size(img);
+    // The header record starts at offset 14, and `treeDepth` is its first field.
+    let base = node as usize * bs as usize + BT_HEADER_RECORD_OFFSET;
+    // Node 0 is the header, node 1 is the leaf. Give the leaf a child instead of
+    // a record: an index node's record is a key plus a u32, and we reuse the
+    // first record's key so the length stays plausible.
+    let leaf_base = (node + 1) as usize * bs as usize;
+    // Node 0 is the header, node 1 the leaf.
+    let count = u16::from_be_bytes([img[leaf_base + 10], img[leaf_base + 11]]);
+    if count == 0 {
+        panic!("the catalog leaf holds no records to turn into an index record");
+    }
+    // Leaf -> index is kind 0xff -> 0x00.
+    img[leaf_base + 8] = 0x00;
+    // A depth-1 tree's root is its leaf, so claiming depth 2 is consistent with
+    // having children.
+    put_u16(img, base, 2);
+    // One record, whose child is past the end of the file.
+    put_u16(img, leaf_base + 10, 1);
+    // The first record's key stays where it was; its child goes after the key.
+    let key_len = u16::from_be_bytes([img[leaf_base + 14], img[leaf_base + 15]]) as usize + 2;
+    let child_at = leaf_base + 14 + key_len;
+    let total_nodes = u32::from_be_bytes([
+        img[VOLUME_HEADER_OFFSET + 44],
+        img[VOLUME_HEADER_OFFSET + 45],
+        img[VOLUME_HEADER_OFFSET + 46],
+        img[VOLUME_HEADER_OFFSET + 47],
+    ]);
+    img[child_at..child_at + 4].copy_from_slice(&(total_nodes + 100).to_be_bytes());
+}
+
+fn put_u16(img: &mut [u8], at: usize, v: u16) {
+    img[at..at + 2].copy_from_slice(&v.to_be_bytes());
+}
+
 // --- Helpers for building broken copies ---------------------------------
 //
 // Each break is applied to a *copy* in the temporary directory, so the corpus
@@ -463,6 +573,8 @@ fn destroy_thread_record(img: &mut [u8]) {
 const FRAGMENTED_CNID: u32 = 18;
 /// CNID of the root folder, `kHFSRootFolderID`.
 const ROOT_CNID: u32 = 2;
+/// Offset of a node's header record: past the 14-byte `BTNodeDescriptor`.
+const BT_HEADER_RECORD_OFFSET: usize = 14;
 /// CNID of `.journal`, whose thread record will be swapped with the one below.
 const RECORD_A: u32 = 16;
 /// CNID of `.journal_info_block`.
