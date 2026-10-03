@@ -220,10 +220,14 @@ fn a_recovered_volume_lists_every_object_exactly_once() {
 #[test]
 fn the_on_disk_filesystem_is_accepted_by_the_independent_checker() {
     // This is what separates a crash-consistent volume from a corrupt one.
-    // `fsck.hfsplus` reads the image directly and never replays the journal, so
-    // it is checking the stale filesystem -- and it must pass. A file that lives
-    // only in the journal is not a disk defect, and a checker that complained
-    // would be wrong about what it found.
+    // The checker accepts the image and leaves it byte-identical, so it validated
+    // the stale filesystem without writing the replay. That is the claim the byte
+    // comparison supports; whether it replayed in memory is not observable from
+    // outside, so it is not asserted.
+    //
+    // A file that lives only in the journal is not a disk defect, and a checker
+    // that complained would be wrong about what it found. See docs/dev-tools.md
+    // for what the hfsprogs port does and does not examine.
     //
     // Run on a COPY. `fsck_hfs` repairs as well as reports, and pointing it at a
     // fixture would rewrite it.
@@ -246,11 +250,20 @@ fn the_on_disk_filesystem_is_accepted_by_the_independent_checker() {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let after = std::fs::read(&probe).expect("read the probe back");
     let _ = std::fs::remove_file(&probe);
 
     assert!(
         text.contains("appears to be OK"),
         "the stale on-disk filesystem must still be sound:\n{text}"
+    );
+    // The claim above is "validated without writing the replay", so the image
+    // must come back byte-identical. A checker that replayed the journal into the
+    // volume would make `torn.txt` appear on disk, and this is what would show it.
+    assert_eq!(
+        digest(&std::fs::read(&path).expect("read the original")),
+        digest(&after),
+        "the checker modified the image:\n{text}"
     );
 }
 

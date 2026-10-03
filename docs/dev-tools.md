@@ -89,6 +89,43 @@ state byte-identical to the pristine original. Consequences:
 3. `tools/genmalformed.sh` originally ran the checker over its own fixtures and
    silently undid every corruption. It now runs against a throwaway copy.
 
+#### What the port does not check
+
+`hfsprogs` is an unofficial port of Apple's `fsck_hfs`, and it is a faithful one:
+111 of the 119 message strings in Apple's `lib_fsck_hfs/fsck_hfs_strings.c` are
+present verbatim in the installed binary, and some of the rest are present
+reworded (`"Volume bitmap needs repair for under-allocation"` became
+`"...needs minor repair..."`, `"Journal needs to be replayed"` became
+`"Journal need to be replayed"`). That is why it is usable as an arbiter at all.
+
+Seven checks are absent, and one of them matters here:
+
+| Absent check | Consequence |
+| --- | --- |
+| `Bad information for symbolic link`, `Symbolic link ... has bad length`, `Bad symbolic link is` | **Symlinks are not validated at all.** |
+| `Invalid Finder info for {file,directory} hard link` | Finder info on hard-link members is unchecked. |
+| `B-tree node is split across extents` | A B-tree whose nodes straddle non-contiguous extents is accepted. |
+| `Journal need[s] to be replayed but volume is read-only` | Present but reworded; see below. |
+
+Verified empirically rather than inferred from the strings: taking
+`journal-with-files.img` and zeroing the data fork of the `link` symlink — which
+Apple rejects as bad information for a symbolic link — passes the port's catalog
+check without comment. The only complaints are about the bitmap and the free
+block count, and those follow from the zeroed fork rather than from the link.
+
+So the symlink fixture's validity rests on the format rather than on the checker,
+and `tests/volume_files.rs` says so where it relies on it.
+
+Two consequences for how results are reported:
+
+- "fsck says OK" is evidence that the structures it *does* examine are
+  consistent. It is not evidence that the volume is wholly sound, and for the
+  fields the port skips it is not evidence at all.
+- `fsck` leaves `journal-torn-catalog.img` byte-identical and reports it sound,
+  which shows it validated the stale filesystem without writing the replay. That
+  is a weaker claim than "fsck never replays the journal", which is what the
+  test used to say and what the byte comparison can actually support.
+
 ### `mkfs.hfs` / `fsck.hfs` — classic HFS
 
 Classic HFS only, in practice: `mkfs.hfs` defaults to HFS+ just like

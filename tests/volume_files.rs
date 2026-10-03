@@ -21,7 +21,14 @@
 //!   rather than return the file's contents.
 //!
 //! The image passes `fsck.hfsplus` unchanged, which is the check that the
-//! generator wrote something coherent rather than merely self-consistent.
+//! generator wrote something coherent rather than merely self-consistent -- with
+//! one caveat worth stating, because it is the one place this suite leans on
+//! something the checker does not do. `hfsprogs` is an unofficial port of Apple's
+//! `fsck_hfs` and it **does not validate symlinks at all**: zeroing the data fork
+//! of `link`, which Apple rejects as bad information for a symbolic link, passes
+//! without comment. So the symlink fixture's validity rests on the format --
+//! Apple's `S_IFLNK` mode and its target in the data fork -- and on the crate
+//! reading it back, not on the checker agreeing. See `docs/dev-tools.md`.
 //!
 //! Mining reference: Apple `core/hfs_format.h` for `struct HFSPlusCatalogFile`
 //! and `struct HFSPlusBSDInfo`; `core/hfs_xattr.c` for a link target living in
@@ -239,6 +246,8 @@ fn read_link_returns_the_stored_target() {
     // Apple keeps a symlink's target in the file's data fork, so this reads the
     // same bytes a data read would -- but it must interpret them as a path, not
     // return them as file contents.
+    //
+    // The checker will not confirm any of this; see the module note.
     if !require(WITH_FILES) {
         return;
     }
