@@ -534,6 +534,32 @@ impl VolumeHeader {
                 ),
             ));
         }
+        // A journaled volume must say where its journal info block is, and the
+        // block it names must be one of its own. The field is otherwise a bare
+        // `u32` that nothing constrains, so a volume naming a block at or past
+        // its own end would send a reader off to parse whatever happens to live
+        // there -- catalog data, or the journal's own blocks -- and the resulting
+        // complaint would be about *those* bytes rather than about the volume.
+        //
+        // Apple does not range-check this, and tolerates such a volume by
+        // accident. Refusing it here is deliberate: the info block is part of the
+        // volume by definition, so a pointer outside it means the header is wrong.
+        //
+        // Mining reference: `struct HFSPlusVolumeHeader` documents
+        // `journalInfoBlock` as the "allocation block number of the journal info
+        // block", and `core/hfs_vfsutils.c` `hfs_mount_hfsplus` uses it as a
+        // block number within this volume before consulting the image.
+        if self.is_journaled() {
+            let info_block = u64::from(self.journal_info_block);
+            let limit = u64::from(self.total_blocks);
+            if self.journal_info_block == 0 || info_block >= limit {
+                return Err(Error::out_of_range(
+                    "volume_header.journalInfoBlock",
+                    info_block,
+                    limit,
+                ));
+            }
+        }
         Ok(())
     }
 

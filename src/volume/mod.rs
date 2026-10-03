@@ -334,6 +334,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         if !self.header.is_journaled() {
             return Ok(None);
         }
+
+        // `journalInfoBlock` is bounded by `VolumeHeader::validate`, so it names a
+        // block of this volume by the time we get here.
         crate::journal::Journal::open(
             self.device,
             self.header.journal_info_block,
