@@ -11,3 +11,7 @@ tests/images/macos/*
 
 # Manifests are committed: they are the test specification.
 !tests/images/manifests/
+
+# mktorn.py imports makejournal.py to reuse its journal layout and checksum.
+__pycache__/
+*.pyc
