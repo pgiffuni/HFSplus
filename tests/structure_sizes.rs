@@ -217,9 +217,9 @@ fn the_journal_info_block_is_180_bytes_with_the_reserved_field_shrunk() {
 }
 // --- Journal -----------------------------------------------------------
 
-/// `struct journal_header`: `int32 magic + int32 endian + off_t start + off_t end
-/// + off_t size + int32 blhdr_size + uint32 checksum + int32 jhdr_size +
-/// uint32 sequence_num`.
+/// `struct journal_header`, whose fields are `int32 magic`, `int32 endian`,
+/// `off_t start`, `off_t end`, `off_t size`, `int32 blhdr_size`, `uint32
+/// checksum`, `int32 jhdr_size` and `uint32 sequence_num`.
 #[test]
 fn the_journal_header_is_48_bytes_and_checksums_the_first_44() {
     use hfsplus::journal::checksum::JOURNAL_HEADER_CKSUM_SIZE;
@@ -247,7 +247,7 @@ fn the_journal_header_is_48_bytes_and_checksums_the_first_44() {
     assert_eq!(Off::JHDR_SIZE_OFFSET, 40);
 }
 
-/// `struct block_list_header` before its `binfo[]`, and `struct block_info`.
+// `struct block_list_header` before its `binfo[]`, and `struct block_info`.
 ///
 /// `block_info` is an `off_t` plus a union of a two-field struct and a pointer,
 /// so it is 16 bytes only where a pointer is 8. Every on-disk journal is
