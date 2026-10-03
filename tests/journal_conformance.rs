@@ -771,3 +771,78 @@ fn the_milestone_criteria_hold_for_every_journaled_image() {
     }
     assert!(checked > 0, "no journaled images were checked");
 }
+
+#[test]
+fn a_journal_is_clean_exactly_when_start_equals_end() {
+    // Apple's own predicate, in its own words: "if the start and end are equal
+    // then the journal is clean. otherwise it's not clean and therefore an
+    // error."
+    //
+    // Mining reference: `core/hfs_journal.c` `journal_is_clean`, returning 0 for
+    // equal and EBUSY otherwise "so the caller can differentiate an invalid
+    // journal from a busy one".
+    //
+    // It is *not* the same as being uninitialised. `kJIJournalNeedInitMask` says
+    // nobody has written to the journal yet; `start == end` says there is nothing
+    // outstanding *right now*. A journal can be initialised and still be dirty,
+    // which is the ordinary state after a crash.
+    /// What a journal reports: clean, uninitialised, and its start/end when it
+    /// has a header at all -- an unwritten journal has none, which is precisely
+    /// a case the predicate has to answer.
+    struct Report {
+        clean: bool,
+        uninitialised: bool,
+        bounds: Option<(u64, u64)>,
+    }
+
+    let check = |name: &str, rel: &str| -> Option<Report> {
+        let path = common::repo_root().join("tests/images").join(rel);
+        if !path.exists() {
+            eprintln!("skipping {name}: not built");
+            return None;
+        }
+        let dev = FileDevice::open(&path).expect("open");
+        let vh = VolumeHeader::read_from(&dev).expect("header");
+        let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+            .expect("journal open")?;
+        Some(Report {
+            clean: journal.is_clean(),
+            uninitialised: journal.is_uninitialized(),
+            bounds: journal.header().map(|h| (h.start, h.end)),
+        })
+    };
+
+    // A journal nobody has written to has no header, and is clean.
+    if let Some(r) = check("journaled-hfsplus", "generated/journaled-hfsplus.img") {
+        assert_eq!(r.bounds, None, "an unwritten journal has no header");
+        assert!(r.clean, "and nothing outstanding, so it is clean");
+        assert!(r.uninitialised, "while also carrying the need-init flag");
+    }
+
+    // A journal with a transaction: dirty, and not uninitialised.
+    if let Some(r) = check("journal-replay-be", "replayed/journal-replay-be.img") {
+        let (start, end) = r.bounds.expect("a written journal has a header");
+        assert_ne!(start, end, "this journal has a transaction");
+        assert!(!r.clean, "so it must not be clean");
+        assert!(!r.uninitialised, "and it is not merely uninitialised either");
+    }
+
+    // And the predicate is exactly the equality, not a heuristic: a header whose
+    // start and end agree is clean whatever else is true of it.
+    let header = hfsplus::journal::info::JournalHeader {
+        magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
+        endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        start: 4096,
+        end: 4096,
+        size: 524288,
+        blhdr_size: 4096,
+        checksum: 0,
+        jhdr_size: 4096,
+        sequence_num: 7,
+    };
+    assert!(
+        header.start == header.end,
+        "the predicate is the equality, so this must be clean whatever the \\
+         sequence number"
+    );
+}

@@ -292,6 +292,10 @@ fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
         if flags.needs_init() { " needs-init" } else { "" },
     ));
     s.push_str(&format!("uninitialised:   {}\n", j.is_uninitialized()));
+    // Apple's own predicate for a read-only mount, which refuses rather than
+    // recovers. Reported so the difference between the two policies is visible:
+    // `hfsls` replays either way.
+    s.push_str(&format!("clean:           {}\n", j.is_clean()));
     match j.header() {
         None => s.push_str("journal header:  none (never written)\n"),
         Some(h) => {

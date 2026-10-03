@@ -588,6 +588,31 @@ fn a_volume_without_a_journal_still_says_none() {
 }
 
 #[test]
+fn the_journal_report_distinguishes_clean_from_uninitialised() {
+    // Two different states that read alike in the directory listing. "Nobody has
+    // written to this yet" and "there is nothing outstanding right now" are not
+    // the same claim -- a journal is initialised and dirty after an ordinary
+    // crash -- and Apple's read-only mount policy turns on the second one.
+    let unwritten = generated("journaled-hfsplus");
+    let dirty = replayed("journal-replay-be");
+    if !require(&unwritten) || !require(&dirty) {
+        return;
+    }
+
+    let fresh = stdout(&hfsls(&["-j", &unwritten]));
+    assert!(
+        fresh.contains("uninitialised:   true") && fresh.contains("clean:           true"),
+        "an unwritten journal is both:\n{fresh}"
+    );
+
+    let busy = stdout(&hfsls(&["-j", &dirty]));
+    assert!(
+        busy.contains("uninitialised:   false") && busy.contains("clean:           false"),
+        "a journal with a transaction is neither:\n{busy}"
+    );
+}
+
+#[test]
 fn inspecting_a_torn_volume_does_not_recover_it() {
     // The recovered file is visible only through replay. `hfsls` lists the
     // filesystem, and it does not replay, so it must report the stale view. If
