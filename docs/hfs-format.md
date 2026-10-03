@@ -398,9 +398,11 @@ catalog `maxKeyLength` is 516 and attributes 264, so both are big-key trees;
 the extents tree's 10-byte keys are not. `has_big_keys` in
 `src/btree/key.rs` follows Apple's rule rather than the stored bit alone.
 
-No corpus volume carries an extents or attributes tree -- `mkfs.hfsplus` creates
-neither, because no file is ever large enough to overflow -- so those two values
-come from `core/hfs_format.h` rather than from measurement.
+The extents and attributes *trees* are present on every volume and empty:
+`mkfs.hfsplus` allocates both forks, but no file it creates is ever large enough
+to overflow. So their key lengths are measurable, and `tests/journal_replay.rs`'s
+sibling `tests/btree_conformance.rs` checks them against what the formatter wrote.
+`tools/mkfiles.py` later fills the extents tree in deliberately.
 
 ## Key maximum lengths
 
@@ -408,9 +410,17 @@ come from `core/hfs_format.h` rather than from measurement.
 | --- | --- | --- |
 | catalog | `kHFSPlusCatalogKeyMaximumLength` | 516 (`u32 parentID` + `HFSUniStr255` 512) |
 | extents | `kHFSPlusExtentKeyMaximumLength` | 10 (`u8 forkType` + `u8 pad` + `u32 fileID` + `u32 startBlock`) |
-| attributes | `kHFSPlusAttrKeyMaximumLength` | 264 |
+| attributes | `kHFSPlusAttrKeyMaximumLength` | 266 (`u16 pad` + `u32 fileID` + `u32 startBlock` + `u16 attrNameLen` + `UniChar attrName[127]`)
 
 All three are defined in `core/hfs_format.h` as `sizeof(Key) - sizeof(u_int16_t)`.
+
+All three are also written into each tree's header by the formatter, so the
+corpus is ground truth for them rather than a reading of the same header the
+parser produces. Measured on `journaled-hfsplus`: catalog 516, extents 10,
+attributes 266. Two of these were wrong here and no test noticed -- the extents
+key dropped `forkType` and `pad`, the attributes key dropped `pad` -- because
+nothing in the corpus ever decoded a key of either kind. `tests/
+btree_conformance.rs` now checks all three against the corpus.
 
 The extents value is the one worth stating in full, because the key is short
 enough that the two middle fields look like padding and are not:

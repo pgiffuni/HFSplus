@@ -76,10 +76,26 @@ pub const EXTENT_KEY_MAX_LENGTH: usize = 1 + 1 + 4 + 4;
 
 /// `kHFSPlusAttrKeyMaximumLength`: the attributes key body.
 ///
-/// Mining reference: `HFSPlusAttrKey` is
-/// `u16 keyLength + u32 fileID + u32 startBlock + u16 attrNameLen +
-/// UniChar attrName[127]`.
-pub const ATTR_KEY_MAX_LENGTH: usize = 4 + 4 + 2 + 127 * 2;
+/// Mining reference: `kHFSPlusAttrKeyMaximumLength` is
+/// `sizeof(HFSPlusAttrKey) - sizeof(u_int16_t)` in `core/hfs_format.h`, and
+/// `HFSPlusAttrKey` is
+///
+/// ```c
+/// struct HFSPlusAttrKey {
+///     u_int16_t     keyLength;       /* key length, in bytes */
+///     u_int16_t     pad;             /* set to zero */
+///     u_int32_t     fileID;
+///     u_int32_t     startBlock;
+///     u_int16_t     attrNameLen;     /* number of unicode characters */
+///     u_int16_t     attrName[kHFSMaxAttrNameLen];  /* kHFSMaxAttrNameLen = 127 */
+/// } __attribute__((aligned(2), packed));
+/// ```
+///
+/// so the body is `pad + fileID + startBlock + attrNameLen + attrName` = 266
+/// bytes, and the record with its length prefix is 268. The `pad` is a real
+/// field, not filler: an earlier revision omitted it and got 264, which the
+/// corpus's own attributes tree contradicts -- `mkfs.hfsplus` writes 266 there.
+pub const ATTR_KEY_MAX_LENGTH: usize = 2 + 4 + 4 + 2 + 127 * 2;
 
 /// Whether a tree's keys carry a 16-bit length prefix.
 ///
@@ -432,7 +448,11 @@ mod tests {
         // threshold, and therefore still on the 16-bit length form.
         assert_eq!(EXTENT_KEY_MAX_LENGTH, 10);
         assert_eq!(ExtentKey::ON_DISK_SIZE, 12);
-        assert_eq!(ATTR_KEY_MAX_LENGTH, 264);
+        // 266, confirmed by the corpus's attributes tree header: `mkfs.hfsplus`
+        // writes that value, so it is ground truth rather than a reading of the
+        // header. The two bytes of `pad` in `HFSPlusAttrKey` are the difference
+        // from the 264 an earlier revision used.
+        assert_eq!(ATTR_KEY_MAX_LENGTH, 266);
         // Catalog and attributes keys are above the 40-byte big-key threshold;
         // the extents key is below it, so a strict `> 40` test would leave that
         // tree on the 8-bit form unless the stored bit says otherwise.
