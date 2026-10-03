@@ -878,21 +878,24 @@ fn a_block_list_claiming_more_blocks_than_the_journal_holds_is_refused() {
     // `max_blocks > (jhdr->size / jhdr->jhdr_size)` -- so rounding up would be one
     // block looser than Apple's, and a list claiming that many blocks would be
     // accepted here and refused there.
-    let ran = with_fixture("journal-bad-max-blocks", |journal| {
+    // The bound is found in the walk, before any transaction start is recorded,
+    // so it is a refusal rather than a truncation -- see the next test for the
+    // distinction and why it lands where it does.
+    let path = common::repo_root()
+        .join("tests/images/replayed/journal-bad-max-blocks.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let err = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect_err("a list claiming more blocks than exist must not replay");
+    let text = err.to_string();
     assert!(
-        journal.transactions().is_empty(),
-        "nothing may be replayed from a list claiming more blocks than exist"
+        text.contains("more blocks than the journal holds"),
+        "the reason must state the bound, got {text:?}"
     );
-    let (offset, reason) = journal
-        .truncation()
-        .expect("an impossible max_blocks must truncate");
-    assert_eq!(offset, 4096, "at the first block list");
-    assert!(
-        reason.contains("more blocks than the journal holds"),
-        "the reason must state the bound, got {reason:?}"
-    );
-    });
-    assert!(ran, "journal-bad-max-blocks: the image must be built");
 }
 
 #[test]
@@ -1081,4 +1084,68 @@ fn the_stale_end_fixture_is_otherwise_sound() {
         assert_eq!(journal.transactions().len(), 3);
     });
     assert!(ran, "journal-short-end: the image must be built");
+}
+
+#[test]
+fn damage_before_any_good_transaction_refuses_the_volume() {
+    // Apple aborts the replay outright when no transaction start was ever found,
+    // and `journal_open` then returns NULL, which `hfs_mount_existing` treats as
+    // EINVAL -- the volume does not mount.
+    //
+    // The alternative is worse than an error. A journal yielding no transactions
+    // leaves the on-disk filesystem exactly as it was, and that filesystem is
+    // *stale*: every write the journal held is missing. Serving it as a successful
+    // mount hands back a catalog that is out of date with nothing saying so.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal` prints "no known
+    // good txn start offset! aborting journal replay"; `core/hfs_vfsops.c` turns
+    // a NULL journal into EINVAL.
+    let path = common::repo_root()
+        .join("tests/images/replayed/journal-bad-max-blocks.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let err = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect_err("a journal with no good transaction must not open");
+    let text = err.to_string();
+    assert!(
+        text.contains("no good transaction"),
+        "the error must say why, got {text:?}"
+    );
+
+    // And through the volume, since that is where a user meets it.
+    let vol = Volume::open(&dev);
+    assert!(
+        vol.is_err(),
+        "a volume whose journal cannot be replayed must not mount"
+    );
+}
+
+#[test]
+fn damage_after_a_good_transaction_truncates_rather_than_aborting() {
+    // The other side of the same rule, and it is a real distinction rather than
+    // an inconsistency. Apple sets `txn_start_offset` when it sees
+    // `BLHDR_FIRST_HEADER`, which happens *after* the header checks and *before*
+    // the block loop. So a zero `bsize` in the first list's blocks is found with
+    // a transaction start already recorded, and truncates rather than aborting.
+    //
+    // The outcome is a mount with nothing replayed -- which is what Apple
+    // produces, since the retry replays exactly the empty prefix.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal`, the order of the
+    // `BLHDR_FIRST_HEADER` test relative to the header checks and the block loop.
+    let ran = with_fixture("journal-bad-bsize", |journal| {
+        assert!(
+            journal.transactions().is_empty(),
+            "nothing was replayed, but the transaction was recorded"
+        );
+        let (_offset, reason) = journal
+            .truncation()
+            .expect("the damage is reported, not swallowed");
+        assert!(reason.contains("zero size"), "got {reason:?}");
+    });
+    assert!(ran, "journal-bad-bsize: the image must be built");
 }
