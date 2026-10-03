@@ -936,3 +936,68 @@ fn every_replay_fixture_opens_without_panicking_and_without_writing() {
     }
     assert!(checked > 0, "no replay fixtures were checked");
 }
+
+#[test]
+fn a_block_list_entry_with_a_zero_size_truncates_the_transaction() {
+    // Not an empty block to skip: a zero size means the list is inconsistent. The
+    // data cursor advances by each entry's size, so a zero desynchronises every
+    // *later* entry in the same list -- they would be read from the wrong offset
+    // and replay plausible nonsense. Refusing is the only safe answer, and it is
+    // what Apple does.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal` prints "invalid
+    // bsize" inside the block loop and goes to `bad_txn_handling`.
+    let ran = with_fixture("journal-bad-bsize", |journal| {
+        assert!(
+            journal.transactions().is_empty(),
+            "nothing may be replayed from a list whose cursor is desynchronised"
+        );
+        assert_eq!(journal.replayed_blocks().len(), 0);
+        let (offset, reason) = journal
+            .truncation()
+            .expect("a zero-size entry must truncate");
+        assert_eq!(offset, 4096, "at the first block list");
+        assert!(
+            reason.contains("zero size"),
+            "the reason must say what is wrong, got {reason:?}"
+        );
+    });
+    assert!(ran, "journal-bad-bsize: the image must be built");
+}
+
+#[test]
+fn a_killed_block_is_skipped_without_stopping_the_replay() {
+    // The counterpart, and the distinction that makes the zero-size rule safe.
+    // A killed block is *meant* to be absent -- Apple writes `(off_t)-1` when a
+    // block could not be journalled -- and it is skipped while the data cursor
+    // still steps over its recorded size. So a killed block and a zero-sized one
+    // are opposite instructions, and treating them alike would either drop data
+    // or refuse a sound journal.
+    //
+    // Mining reference: `core/hfs_journal.c` `replay_journal`, "don't add \"killed\"
+    // blocks", with the cursor still advanced past them.
+    let path = common::repo_root().join("tests/images/replayed/journal-replay-be.img");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vh = VolumeHeader::read_from(&dev).expect("header");
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .expect("journal open")
+        .expect("a journal");
+    assert!(
+        journal.truncation().is_none(),
+        "a sound journal must replay in full"
+    );
+
+    // The point is that the rule is about the size, not about the block being
+    // absent: the same loop skips -1 and refuses 0. A killed block never reaches
+    // the overlay at all, so its absence is not observable here -- which is
+    // exactly why a zero size has to be refused instead of skipped.
+    assert_eq!(
+        journal.replayed_blocks().len(),
+        journal.transactions().len(),
+        "one block per transaction in this fixture"
+    );
+}
