@@ -142,6 +142,18 @@ if [[ -f tools/mktorn.py ]] && [[ -f tests/images/generated/journaled-hfsplus.im
     tests/images/replayed/journal-torn-catalog.img --name torn.txt --cnid 18
 fi
 
+echo "FILES WITH DATA"
+# mkfs.hfsplus creates an empty volume and cannot put a file in it, so the whole
+# corpus has no file with data except the two newfs_hfs makes for its journal.
+# mkfiles.py adds the two shapes a read-only filesystem has to get right and a
+# formatter cannot produce: fragmented extents, and a symlink. The allocation
+# bitmap, file count, free block count and root valence are updated, and the
+# image below is verified like every other one.
+if [[ -f tools/mkfiles.py ]] && [[ -f tests/images/generated/journaled-hfsplus.img ]]; then
+  python3 tools/mkfiles.py tests/images/generated/journaled-hfsplus.img \
+    tests/images/generated/journal-with-files.img
+fi
+
 echo "verifying every image with the independent checker"
 fail=0
 for img in "${OUT_DIR}"/*.img; do
