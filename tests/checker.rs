@@ -171,15 +171,23 @@ fn a_fork_declaring_more_blocks_than_its_extents_describe_is_reported() {
     let Some((report, _)) = check_path(&image) else { panic!("in scope") };
     let _ = std::fs::remove_file(&image);
 
-    let entry = report
-        .fork_block_count
+    // Reported through Apple's rule rather than as a bare count mismatch: the fork
+    // claims more blocks than its extents account for, which is `E_PEOF` and
+    // names the direction. Asserting the numbers as well, since a report saying
+    // only "these differ" would pass a looser check.
+    let reason = report
+        .fork_rule
         .iter()
-        .find(|(cnid, _, _)| *cnid == FRAGMENTED_CNID)
+        .find(|(cnid, _)| *cnid == FRAGMENTED_CNID)
+        .map(|(_, r)| r.as_str())
         .unwrap_or_else(|| panic!("the inflated fork must be reported, got {:?}", report));
-    assert_eq!(
-        *entry,
-        (FRAGMENTED_CNID, 8 + 7, 8),
-        "the report must name the declared and described counts, not just that they differ"
+    assert!(
+        reason.contains("15 blocks of 4096") && reason.contains("8 blocks"),
+        "the reason must state the declared and described counts, got {reason:?}"
+    );
+    assert!(
+        reason.contains("totalBlocks"),
+        "and name the field, got {reason:?}"
     );
 }
 
@@ -1067,3 +1075,92 @@ fn file_record_offset(img: &[u8], cnid: u32) -> usize {
     panic!("{cnid}: file record not found");
 }
 
+
+// --- Apple's two fork-size inequalities ----------------------------------
+
+#[test]
+fn a_data_fork_longer_than_its_blocks_is_reported() {
+    // The non-sparse rule, in the fork validator rather than in the reader. An
+    // HFS+ data fork has no representation for a hole: a zero-start extent
+    // descriptor is the *attributes* file's gap marker, and `hfs_vfsops.c` has no
+    // zero-fill path for a data fork. So a logical size beyond the blocks behind
+    // it is a corrupt record, not a sparse file -- and a reader that zero-fills
+    // it is inventing bytes rather than recovering them.
+    //
+    // Mining reference: `lib_fsck_hfs/dfalib/CatalogCheck.c` `CheckFileData`,
+    // which reports `E_LEOF`, "Incorrect size for file".
+    let Some((report, _)) = check_image("fork-logical-too-large") else {
+        return;
+    };
+    let finding = report
+        .fork_rule
+        .iter()
+        .find(|(cnid, reason)| *cnid == FRAGMENTED_CNID && reason.contains("logicalSize"))
+        .unwrap_or_else(|| panic!("the oversized fork must be reported, got {:?}", report));
+    let _ = finding;
+    assert!(
+        report.describe().iter().any(|l| l.contains("cannot be sparse")),
+        "the reason must state the rule, not just the numbers: {:?}",
+        report.describe()
+    );
+}
+
+#[test]
+fn a_data_fork_claiming_more_blocks_than_its_extents_is_reported() {
+    // The other direction: the record claims more blocks than its extents
+    // account for, which is what would make a reader read past the end of the
+    // file's own data.
+    //
+    // Mining reference: the same function, reporting `E_PEOF`, "Incorrect block
+    // count for file".
+    let Some((report, _)) = check_image("fork-total-too-large") else {
+        return;
+    };
+    assert!(
+        report.fork_rule.iter().any(|(cnid, reason)| {
+            *cnid == FRAGMENTED_CNID && reason.contains("exceed the")
+        }),
+        "the overstated fork must be reported, got {:?}",
+        report
+    );
+}
+
+#[test]
+fn a_fork_may_be_shorter_than_its_blocks() {
+    // The tolerance Apple allows, and the reason this is two inequalities
+    // rather than an equality. A file of 5000 bytes occupies two 4096-byte
+    // blocks, so `logical < physical` is ordinary and must not be reported.
+    //
+    // Everything in the corpus is a whole number of blocks, so nothing
+    // distinguishes a reader that checks `==` from one that checks `<=`.
+    let path = common::image("journal-with-files");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let fragmented = vol
+        .lookup(
+            vol.root_cnid(),
+            &"fragmented.bin".encode_utf16().collect::<Vec<_>>(),
+        )
+        .expect("lookup")
+        .expect("present");
+    let fork = fragmented.as_file().expect("a file record").record.data_fork;
+
+    let mut short = fork;
+    short.logical_size = fork.logical_size - 1;
+    assert!(
+        short.validate(u64::from(short.total_blocks), vol.header().block_size).is_ok(),
+        "a fork one byte shorter than its blocks is ordinary"
+    );
+
+    // And one byte *longer* is not.
+    let mut long = fork;
+    long.logical_size = fork.logical_size + 1;
+    assert!(
+        long.validate(u64::from(long.total_blocks), vol.header().block_size).is_err(),
+        "one byte beyond the blocks is a corrupt record"
+    );
+}
