@@ -820,6 +820,41 @@ filesystem missing *every* recent change, which is a worse state than one
 missing changes from the damage point onwards. This crate therefore reports
 truncation through `Journal::truncation()` rather than raising an error.
 
+### Replay validates block numbers before using them
+
+Apple sanity-checks the whole list before applying any of it, and rejects a
+negative block number that is not the killed sentinel:
+
+```c
+if (blhdr->binfo[i].bnum < 0 && blhdr->binfo[i].bnum != (off_t)-1) {
+    printf("... bogus block number 0x%llx\n", ...);
+    bad_blocks = 1;
+    goto bad_txn_handling;
+}
+```
+
+Skipping this would let a `bnum` with the high bit set compute a device offset far
+outside the image. The downstream bounds check would eventually catch it, but
+only after the offset had been multiplied out, so the check belongs where Apple
+put it: before the contents are used, and it drops the transaction rather than
+the journal.
+
+### The overlay short-reads at end of file
+
+`OverlaidDevice` is a `BlockDevice`, whose contract is that a read running past
+the end is an error. But the overlaid read is answering a *POSIX* read, where end
+of file is reported by returning fewer bytes. So a request that starts inside a
+replayed block and runs past the end of the device must return the overlay bytes
+it already has and then stop, not fail:
+
+```text
+nothing wrong: propagate Truncated, the file read errors out
+wrong:         return the overlay bytes, then short-read the tail
+```
+
+Getting this backwards makes a mount report EIO for the tail of a file whose head
+it had just read successfully.
+
 ### Journal replay is read-only by construction
 
 Replayed blocks go into an in-memory overlay, and reads consult it in preference
