@@ -404,13 +404,14 @@ fn extent_keys_decode_in_the_empty_extents_tree_too() {
     // Exercises the extents key decoder against a real, if empty, tree by
     // confirming its length prefix against a synthetic record shaped exactly as
     // core/hfs_format.h declares.
-    let mut rec = Vec::new();
-    rec.extend_from_slice(&8u16.to_be_bytes());
-    rec.extend_from_slice(&0u32.to_be_bytes());
-    rec.extend_from_slice(&0u32.to_be_bytes());
+    // `struct HFSPlusExtentKey`: keyLength (10), forkType, pad, fileID,
+    // startBlock -- 12 bytes with the prefix.
+    let rec = ExtentKey::for_resource_fork(0x1122_3344, 0x5566_7788).to_record();
+    assert_eq!(rec.len(), 12);
     let k = ExtentKey::from_record(&rec).unwrap();
-    assert_eq!(k.file_id, 0);
-    assert_eq!(k.start_block, 0);
+    assert_eq!(k.fork_type, 0xFF, "kResourceForkType");
+    assert_eq!(k.file_id, 0x1122_3344);
+    assert_eq!(k.start_block, 0x5566_7788);
 }
 
 #[test]

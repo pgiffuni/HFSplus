@@ -56,9 +56,23 @@ pub const CATALOG_KEY_MAX_LENGTH: usize = 4 + 512;
 
 /// `kHFSPlusExtentKeyMaximumLength`: the extents overflow key body.
 ///
-/// Mining reference: `HFSPlusExtentKey` is
-/// `u16 keyLength + u32 fileID + u32 startBlock`.
-pub const EXTENT_KEY_MAX_LENGTH: usize = 8;
+/// Mining reference: `core/hfs_format.h` computes this as
+/// `sizeof(HFSPlusExtentKey) - sizeof(u_int16_t)`, and `HFSPlusExtentKey` is
+///
+/// ```c
+/// struct HFSPlusExtentKey {
+///     u_int16_t  keyLength;   /* length of key, excluding this field */
+///     u_int8_t   forkType;    /* 0 = data fork, FF = resource fork */
+///     u_int8_t   pad;         /* make the other fields align on 32-bit */
+///     u_int32_t  fileID;
+///     u_int32_t  startBlock;
+/// } __attribute__((aligned(2), packed));
+/// ```
+///
+/// so the body is `forkType + pad + fileID + startBlock` = 10 bytes, and the
+/// record with its length prefix is 12. `forkType` is not padding: it is what
+/// keeps the two forks of one file apart in a shared tree.
+pub const EXTENT_KEY_MAX_LENGTH: usize = 1 + 1 + 4 + 4;
 
 /// `kHFSPlusAttrKeyMaximumLength`: the attributes key body.
 ///
@@ -219,12 +233,17 @@ impl<'a> CatalogKey<'a> {
     }
 }
 
-/// An extents overflow key: CNID plus a cumulative block offset.
+/// An extents overflow key: fork type, CNID, and a cumulative block offset.
 ///
 /// Mining reference: `core/hfs_format.h` `struct HFSPlusExtentKey`:
-/// `u16 keyLength + u32 fileID + u32 startBlock`.
+/// `u16 keyLength + u8 forkType + u8 pad + u32 fileID + u32 startBlock`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExtentKey {
+    /// Which fork of the file these extents describe: 0 data, 0xFF resource.
+    ///
+    /// Both forks share one B-tree, so this is what stops a data fork's extents
+    /// being read as its resource fork's.
+    pub fork_type: u8,
     /// CNID of the file whose extents these are.
     pub file_id: u32,
     /// Allocation blocks already described by earlier groups for this file.
@@ -235,23 +254,41 @@ pub struct ExtentKey {
 }
 
 impl ExtentKey {
+    /// Byte offset of `forkType` within the key record.
+    const FORK_TYPE_OFFSET: usize = BIG_KEY_PREFIX;
+
     /// Byte offset of `fileID` within the key record.
-    const FILE_ID_OFFSET: usize = BIG_KEY_PREFIX;
+    const FILE_ID_OFFSET: usize = BIG_KEY_PREFIX + 2;
 
     /// Byte offset of `startBlock` within the key record.
-    const START_BLOCK_OFFSET: usize = BIG_KEY_PREFIX + 4;
+    const START_BLOCK_OFFSET: usize = BIG_KEY_PREFIX + 6;
 
-    /// Byte offset of the trailing pad byte, when the key size is odd.
+    /// Byte size of the key record, prefix included.
     ///
-    /// The key body is 8 bytes and the prefix 2, so the total is already even and
-    /// there is never a pad byte. Stated explicitly because every other HFS+ key
-    /// needs one and assuming that here would be wrong.
+    /// There is no trailing pad: the body is 10 bytes and the prefix 2, so the
+    /// total is already even.
     pub const ON_DISK_SIZE: usize = BIG_KEY_PREFIX + EXTENT_KEY_MAX_LENGTH;
+
+    /// `kDataForkType`, from `core/FileExtentMapping.c`.
+    pub const DATA_FORK: u8 = 0;
+    /// `kResourceForkType`, from `core/FileExtentMapping.c`.
+    pub const RESOURCE_FORK: u8 = 0xFF;
+
+    /// A key for a fork's data extents.
+    pub fn for_data_fork(file_id: u32, start_block: u32) -> Self {
+        ExtentKey { fork_type: Self::DATA_FORK, file_id, start_block }
+    }
+
+    /// A key for a fork's resource extents.
+    pub fn for_resource_fork(file_id: u32, start_block: u32) -> Self {
+        ExtentKey { fork_type: Self::RESOURCE_FORK, file_id, start_block }
+    }
 
     /// Encode this key into a node record.
     pub fn to_record(&self) -> [u8; Self::ON_DISK_SIZE] {
         let mut out = [0u8; Self::ON_DISK_SIZE];
         out[0..2].copy_from_slice(&(EXTENT_KEY_MAX_LENGTH as u16).to_be_bytes());
+        out[Self::FORK_TYPE_OFFSET] = self.fork_type;
         out[Self::FILE_ID_OFFSET..Self::FILE_ID_OFFSET + 4]
             .copy_from_slice(&self.file_id.to_be_bytes());
         out[Self::START_BLOCK_OFFSET..Self::START_BLOCK_OFFSET + 4]
@@ -262,10 +299,10 @@ impl ExtentKey {
     /// Decode an extents key from a record.
     pub fn from_record(record: &[u8]) -> Result<Self> {
         let be = Be::new(record);
-        if record.len() < BIG_KEY_PREFIX + 8 {
+        if record.len() < Self::ON_DISK_SIZE {
             return Err(Error::Truncated {
                 what: "extent key",
-                needed: BIG_KEY_PREFIX + 8,
+                needed: Self::ON_DISK_SIZE,
                 available: record.len(),
             });
         }
@@ -280,6 +317,7 @@ impl ExtentKey {
             });
         }
         Ok(ExtentKey {
+            fork_type: record[Self::FORK_TYPE_OFFSET],
             file_id: be.u32(Self::FILE_ID_OFFSET)?,
             start_block: be.u32(Self::START_BLOCK_OFFSET)?,
         })
@@ -290,6 +328,8 @@ impl ExtentKey {
     /// Mining reference: `core/hfs_extents.c` and Apple's attributes key
     /// comparator order by `fileID` first, then by `startBlock`, both as plain
     /// 32-bit numbers. Extents keys are never case folded: they contain no names.
+    /// `forkType` is not part of the ordering, because one file's data and
+    /// resource forks share a `fileID` and must sort adjacently.
     pub fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
         self.file_id
             .cmp(&other.file_id)
@@ -387,11 +427,15 @@ mod tests {
     fn catalog_key_constants_match_apple() {
         // HFSUniStr255 is 2 + 255*2 = 512 bytes; the body is 4 + 512 = 516.
         assert_eq!(CATALOG_KEY_MAX_LENGTH, 516);
-        assert_eq!(EXTENT_KEY_MAX_LENGTH, 8);
+        // The extents key body is forkType + pad + fileID + startBlock = 10, so
+        // it is 12 bytes with the prefix -- still below the 40-byte big-key
+        // threshold, and therefore still on the 16-bit length form.
+        assert_eq!(EXTENT_KEY_MAX_LENGTH, 10);
+        assert_eq!(ExtentKey::ON_DISK_SIZE, 12);
         assert_eq!(ATTR_KEY_MAX_LENGTH, 264);
         // Catalog and attributes keys are above the 40-byte big-key threshold;
-        // the 8-byte extents key is below it, so a strict `> 40` test would
-        // leave that tree on the 8-bit form unless the stored bit says otherwise.
+        // the extents key is below it, so a strict `> 40` test would leave that
+        // tree on the 8-bit form unless the stored bit says otherwise.
         assert!(has_big_keys(CATALOG_KEY_MAX_LENGTH as u16, 0));
         assert!(has_big_keys(ATTR_KEY_MAX_LENGTH as u16, 0));
         assert!(!has_big_keys(EXTENT_KEY_MAX_LENGTH as u16, 0));
@@ -399,9 +443,11 @@ mod tests {
 
     #[test]
     fn extent_key_round_trips() {
-        let k = ExtentKey { file_id: 42, start_block: 770 };
+        let k = ExtentKey::for_data_fork(42, 770);
         let rec = k.to_record();
-        assert_eq!(ExtentKey::ON_DISK_SIZE, 10);
+        // `sizeof(struct HFSPlusExtentKey)`: the prefix plus forkType, pad,
+        // fileID and startBlock.
+        assert_eq!(ExtentKey::ON_DISK_SIZE, 12);
         assert_eq!(ExtentKey::from_record(&rec).unwrap(), k);
 
         // And through the record splitter, which extents records go through.
@@ -415,9 +461,9 @@ mod tests {
 
     #[test]
     fn extent_keys_order_by_cnid_then_offset() {
-        let a = ExtentKey { file_id: 2, start_block: 100 };
-        let b = ExtentKey { file_id: 2, start_block: 200 };
-        let c = ExtentKey { file_id: 3, start_block: 0 };
+        let a = ExtentKey::for_data_fork(2, 100);
+        let b = ExtentKey::for_data_fork(2, 200);
+        let c = ExtentKey::for_data_fork(3, 0);
         assert_eq!(a.cmp_key(&b), std::cmp::Ordering::Less);
         assert_eq!(b.cmp_key(&a), std::cmp::Ordering::Greater);
         // CNID dominates: a higher CNID sorts after even with a smaller offset.
@@ -430,6 +476,35 @@ mod tests {
         assert!(split_extent_record(&[]).is_none());
         assert!(split_extent_record(&[0u8; 5]).is_none());
         assert!(split_extent_record(&[0u8; 9]).is_none());
+        assert!(split_extent_record(&[0u8; 11]).is_none());
+    }
+
+    #[test]
+    fn the_fork_type_survives_a_round_trip_and_is_not_the_file_id() {
+        // The field is what keeps a data fork from adopting its resource fork's
+        // extents, and it sits between the length prefix and fileID on disk.
+        let data = ExtentKey::for_data_fork(0x1122_3344, 0x5566_7788);
+        let record = data.to_record();
+        assert_eq!(record[2], ExtentKey::DATA_FORK, "forkType is at offset 2");
+        assert_eq!(record[3], 0, "pad is at offset 3");
+        assert_eq!(
+            &record[4..8],
+            &0x1122_3344u32.to_be_bytes(),
+            "fileID is at offset 4, not 2"
+        );
+        assert_eq!(&record[8..12], &0x5566_7788u32.to_be_bytes());
+
+        let back = ExtentKey::from_record(&record).unwrap();
+        assert_eq!(back.file_id, 0x1122_3344);
+        assert_eq!(back.fork_type, ExtentKey::DATA_FORK);
+
+        let resource = ExtentKey::for_resource_fork(0x1122_3344, 0).to_record();
+        assert_eq!(resource[2], 0xFF, "kResourceForkType is 0xFF");
+        assert_ne!(
+            ExtentKey::from_record(&data.to_record()).unwrap(),
+            ExtentKey::from_record(&resource).unwrap(),
+            "the two forks of one file must be distinguishable"
+        );
     }
 
     #[test]
