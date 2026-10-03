@@ -43,7 +43,22 @@ BLHDR_CHECKSUM_SIZE = 32
 BLHDR_FIRST_HEADER = 0x00000002
 BLHDR_CHECK_CHECKSUMS = 0x00000001
 K_JI_JOURNAL_IN_FS_MASK = 0x00000001
+K_JI_JOURNAL_ON_OTHER_DEVICE_MASK = 0x00000002
 K_JI_JOURNAL_NEED_INIT_MASK = 0x00000004
+
+# A recognisable but well-formed 16-byte `uuid_string_t` for the
+# external-journal fixture. An all-zero UUID is not a valid one, and the point of
+# the fixture is a journal reference that is *correct* about being elsewhere.
+#
+# Sixteen bytes, which is asserted below: assigning a slice of the wrong length
+# to a `bytearray` silently *resizes* it rather than failing, so a short constant
+# here truncates the whole image by the difference. That happened, and the
+# symptom was a B-tree header reading a byte-for-node-size value from three
+# blocks away.
+EXTERNAL_JOURNAL_UUID = bytes.fromhex("4846532b65787465726e616c00010000")
+assert len(EXTERNAL_JOURNAL_UUID) == 16, "ext_jnl_uuid is 16 bytes"
+
+VOLUME_HEADER_OFFSET = 1024
 
 JIB_OFFSET_OFFSET = 4 + 32
 JIB_SIZE_OFFSET = JIB_OFFSET_OFFSET + 8
@@ -157,6 +172,62 @@ def build_block_list(blocks, blhdr_size: int, first: bool,
     return bytes(header), bytes(data)
 
 
+def write_external_journal(img: bytearray, journal_info_block: int, args) -> None:
+    """Rewrite the info block to name a journal on a *different* device.
+
+    A journal can live on its own volume, named by a GPT UUID in
+    `struct JournalInfoBlock.ext_jnl_uuid`. `mkfs_hfsplus` cannot create that, so
+    the state is written by hand -- and it is worth having, because a reader must
+    decline it rather than look for a journal inside the image and find nothing.
+
+    Two things change, and they are what the format says:
+
+      - `kJIJournalOnOtherDeviceMask` is set and `kJIJournalInFSMask` cleared, so
+        the journal is not where the flags say it is.
+      - `offset` is zeroed. It is the journal's byte offset *in this volume*, and
+        the journal is not in this volume, so leaving it pointing into this
+        image would invite a reader to replay a journal that is not here.
+        `size` is deliberately left alone: Apple passes `jib_size` to
+        `open_journal_dev` on the external path as well, using it to match the
+        partition.
+
+    The journal's own blocks stay allocated and the bitmap is left alone: they are
+    still in use by whatever the real external journal replaced, and clearing the
+    bits would introduce a different fault from the one this fixture is about.
+
+    Mining reference: `struct JournalInfoBlock` in `core/hfs_format.h`, and
+    `core/hfs_journal.c` `hfs_journal_open`, which returns before touching the
+    volume when the journal is on another device.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    jib_off = journal_info_block * bs
+
+    flags = struct.unpack_from(">I", img, jib_off)[0]
+    flags &= ~K_JI_JOURNAL_IN_FS_MASK
+    flags |= K_JI_JOURNAL_ON_OTHER_DEVICE_MASK
+    struct.pack_into(">I", img, jib_off, flags)
+
+    # `offset` is the journal's byte offset *in this volume*, and the journal is
+    # not in this volume, so it is zeroed. `size` is left alone: Apple passes
+    # `jib_size` to `open_journal_dev` on the external path too, using it to
+    # match the partition, so zeroing it would describe a journal of no length.
+    struct.pack_into(">Q", img, jib_off + JIB_OFFSET_OFFSET, 0)
+
+    # `ext_jnl_uuid` is a 16-byte `uuid_string_t` at offset 52.
+    uuid_at = jib_off + 52
+    if len(img[uuid_at:uuid_at + 16]) != len(EXTERNAL_JOURNAL_UUID):
+        sys.exit("internal error: the uuid slice does not fit; refusing to resize the image")
+    img[uuid_at:uuid_at + 16] = EXTERNAL_JOURNAL_UUID
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+    print(f"{args.dest}: journal moved off this device")
+    print(f"  journalInfoBlock {journal_info_block}, flags now 0x{flags:08x}")
+    print("  kJIJournalOnOtherDeviceMask set, kJIJournalInFSMask clear")
+    print(f"  ext_jnl_uuid = {EXTERNAL_JOURNAL_UUID.hex()}")
+    print("  offset zeroed: it described a position in this volume, and the journal is not here")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source")
@@ -167,6 +238,9 @@ def main() -> None:
                     help="replacement payload; defaults to a recognisable pattern")
     ap.add_argument("--little-endian", action="store_true",
                     help="write the journal header little-endian, as x86 hosts do")
+    ap.add_argument("--external-journal", dest="external_journal",
+                    action="store_true",
+                    help="rewrite the info block to name a journal on another device")
     ap.add_argument("--extra", action="append", default=[], metavar="BLOCK:TEXT",
                     help="add a further transaction rewriting BLOCK with TEXT; "
                          "repeat for more. Later transactions supersede earlier "
@@ -190,6 +264,9 @@ def main() -> None:
     journal_info_block = struct.unpack_from(">I", img, vh + 12)[0]
     if journal_info_block == 0:
         sys.exit("error: journalInfoBlock is zero on a journaled volume")
+
+    if args.external_journal:
+        return write_external_journal(img, journal_info_block, args)
 
     # --- Journal info block ------------------------------------------------
     jib_off = journal_info_block * block_size

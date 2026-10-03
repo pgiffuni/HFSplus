@@ -142,6 +142,17 @@ if [[ -f tools/mktorn.py ]] && [[ -f tests/images/generated/journaled-hfsplus.im
     tests/images/replayed/journal-torn-catalog.img --name torn.txt --cnid 18
 fi
 
+echo "EXTERNAL JOURNAL"
+# A journal can live on another partition, named by ext_jnl_uuid -- which is what
+# a Time Machine volume has. mkfs_hfsplus cannot create one, so it is written by
+# hand. The reader must decline it rather than search the image and report the
+# volume as unjournaled, and the independent checker must still call the volume
+# sound.
+if [[ -f tests/images/generated/journaled-hfsplus.img ]]; then
+  python3 tools/makejournal.py tests/images/generated/journaled-hfsplus.img \
+    tests/images/replayed/journal-external.img --external-journal
+fi
+
 echo "FILES WITH DATA"
 # mkfs.hfsplus creates an empty volume and cannot put a file in it, so the whole
 # corpus has no file with data except the two newfs_hfs makes for its journal.
