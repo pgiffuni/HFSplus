@@ -376,14 +376,21 @@ impl<'a> Node<'a> {
 
 /// Byte size of the key at the head of a node record, prefix included.
 ///
-/// A HFS+ key's `keyLength` excludes the length field itself, so the record's key
-/// occupies `keyLength + 2` bytes. Whether the length field is one byte or two
-/// depends on the tree's `kBTBigKeysMask`, which the caller knows and this does
-/// not -- so the *declared* size is used, and a caller walking a short-key tree
-/// must not use this for a key whose length would fit in one byte.
+/// **Assumes a 16-bit key length.** A HFS+ key's `keyLength` excludes the
+/// length field itself, so with a 16-bit prefix the key occupies
+/// `keyLength + 2` bytes.
 ///
-/// Mining reference: `lib_fsck_hfs/dfalib/BTreeNodeOps.c` `CalcKeySize` adds
-/// `sizeof(UInt16)` when `kBTBigKeysMask` is set.
+/// The format also allows an 8-bit prefix, and Apple branches on it: `CalcKeySize`
+/// adds `sizeof(UInt16)` when `kBTBigKeysMask` is set and `sizeof(UInt8)`
+/// otherwise. This does not, because every Apple-written tree sets the bit --
+/// `newfs_hfs/makehfs.c` ORs it in for the catalog, the extents tree and the
+/// attributes tree alike, as do `core/hfs_btreeio.c` and `core/hfs_hotfiles.c` --
+/// and a volume without it would be parsed wrongly rather than refused.
+///
+/// That is a deliberate limitation, not an oversight, and it is reported rather
+/// than misparsed: `hfsck` flags a tree that would need the 8-bit form, so a
+/// volume in that state is refused with an explanation instead of decoded into
+/// nonsense. See [`crate::check`].
 fn key_size_on_disk(record: &[u8]) -> Result<usize> {
     if record.len() < 2 {
         return Err(Error::Truncated {

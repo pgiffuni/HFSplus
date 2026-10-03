@@ -283,6 +283,10 @@ impl ExtentKey {
     ///
     /// There is no trailing pad: the body is 10 bytes and the prefix 2, so the
     /// total is already even.
+    ///
+    /// Assumes the 16-bit key-length form. See [`crate::btree::node`]'s note on
+    /// `key_size_on_disk` for why that holds and what happens if it does not --
+    /// short answer: `hfsck` refuses such a tree rather than misreading it.
     pub const ON_DISK_SIZE: usize = BIG_KEY_PREFIX + EXTENT_KEY_MAX_LENGTH;
 
     /// `kDataForkType`, from `core/FileExtentMapping.c`.
