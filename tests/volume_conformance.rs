@@ -285,8 +285,15 @@ fn a_case_sensitive_volume_resolves_only_the_exact_spelling() {
             folded.as_ref().map(|o| o.cnid()),
             "both spellings must resolve to the same object on a folding volume"
         );
-        // The name reported is the stored one, not the one that was asked for.
-        assert_eq!(exact.unwrap().name_string(), "BasicVolume");
+        // The name reported is the one stored on disk, not the one that was asked
+        // for. On a folding volume both spellings reach the same record, and
+        // echoing the request would report a file that does not exist.
+        assert_eq!(exact.as_ref().map(|o| o.name_string()), Some("BasicVolume".into()));
+        assert_eq!(
+            folded.as_ref().map(|o| o.name_string()),
+            Some("BasicVolume".into()),
+            "a folded lookup must still report the catalog's spelling"
+        );
     });
 
     with_volume("hfsx-case-sensitive", |vol| {

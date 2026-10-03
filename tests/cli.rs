@@ -567,6 +567,59 @@ fn inspecting_a_torn_volume_does_not_recover_it() {
     assert!(text.contains(".journal"), "the stale view must still list what is there");
 }
 
+// --- Name comparison ----------------------------------------------------
+
+#[test]
+fn name_resolution_follows_the_volumes_own_comparison_rule() {
+    // The strongest statement the tools can make: a path resolves through
+    // whatever comparison the volume declares, not one this crate imposes.
+    // The two corpus volumes differ, so the same input has to give different
+    // answers, and a hardcoded comparator would fail one of them.
+    let folding = generated("journaled-hfsplus");
+    let sensitive = generated("hfsx-case-sensitive");
+    if !require(&folding) || !require(&sensitive) {
+        return;
+    }
+
+    // On a case-folding volume, a differently-cased name finds the same entry.
+    let out = hfsls(&[&folding, ".JOURNAL"]);
+    assert_eq!(code(&out), 0, "a folding volume must accept any case: {}", stderr(&out));
+    assert!(
+        stdout(&out).contains(".journal"),
+        "the entry must be found and reported under its real name, got {:?}",
+        stdout(&out)
+    );
+
+    // On a case-sensitive volume the same input must not resolve. These volumes
+    // have no entries under either spelling, so the point is the refusal.
+    let out = hfsls(&[&sensitive, "BASICVOLUME"]);
+    assert_eq!(
+        code(&out),
+        2,
+        "a case-sensitive volume must not fold names, got {}",
+        code(&out)
+    );
+}
+
+#[test]
+fn the_case_sensitivity_reported_matches_the_one_used() {
+    // `-s` states the rule; the lookup above exercises it. If the two disagreed
+    // the report would be decoration.
+    let folding = generated("journaled-hfsplus");
+    let sensitive = generated("hfsx-case-sensitive");
+    if !require(&folding) || !require(&sensitive) {
+        return;
+    }
+    assert!(
+        stdout(&hfsls(&["-s", &folding])).contains("case sensitive:  false"),
+        "a plain HFS+ volume folds names"
+    );
+    assert!(
+        stdout(&hfsls(&["-s", &sensitive])).contains("case sensitive:  true"),
+        "an HFSX volume with kHFSBinaryCompare must report case sensitivity"
+    );
+}
+
 fn digest(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
