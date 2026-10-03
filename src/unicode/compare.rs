@@ -113,7 +113,23 @@ impl Comparator {
     /// byte from the catalog B-tree header. Both must agree before names compare
     /// case-sensitively.
     ///
-    /// `kHFSBinaryCompare` from `core/hfs_format.h`.
+    /// Mining reference: Apple `core/hfs_vfsutils.c` `hfs_mounthfsplus` tests
+    /// `(hfsmp->hfs_flags & HFS_X)` *and* `btinfo.keyCompareType ==
+    /// kHFSBinaryCompare` before setting `HFS_CASE_SENSITIVE`, so the two
+    /// conditions are conjunctive there as they are here.
+    ///
+    /// The signature test is not redundant with the byte. A volume is HFSX
+    /// exactly when the signature word is `kHFSXSigWord`, and a plain HFS+ volume
+    /// is permitted to carry `kHFSBinaryCompare` in its catalog header — the
+    /// byte describes how *that* tree was built, not what the filesystem means by
+    /// a name. Trusting it alone would make an HFS+ volume report
+    /// case-sensitivity that does not exist, and every lookup by a folded name
+    /// would miss.
+    ///
+    /// `kHFSBinaryCompare` from `core/hfs_format.h`. Note that
+    /// `core/hfs_btreeio.c` writes exactly this byte into the trees it
+    /// initialises, but that is `hfs_create_attr_btree` and concerns the
+    /// attributes B-tree, whose keys are attribute names rather than file names.
     pub const fn for_volume(is_hfsx: bool, key_compare_type: u8) -> Self {
         if is_hfsx && key_compare_type == crate::catalog::key::K_HFS_BINARY_COMPARE {
             Comparator::Binary

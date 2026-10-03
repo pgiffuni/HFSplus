@@ -37,6 +37,7 @@ mod common;
 use hfsplus::blockdev::FileDevice;
 use hfsplus::catalog::cnid::{ROOT_FOLDER_ID, ROOT_PARENT_ID};
 use hfsplus::catalog::record::{CatalogRecord, FILE_RECORD_SIZE, FOLDER_RECORD_SIZE};
+use hfsplus::catalog::key::{K_HFS_BINARY_COMPARE, K_HFS_CASE_FOLDING};
 use hfsplus::catalog::{Catalog, CatalogKey, Cnid};
 use hfsplus::format::volume_header::VolumeHeader;
 use hfsplus::unicode::{Comparator, Ordering};
@@ -98,6 +99,64 @@ fn every_corpus_catalog_opens_with_the_right_comparator() {
             assert_eq!(vh.root_folder_id(), ROOT_FOLDER_ID.0, "{name}");
         });
     }
+}
+
+#[test]
+fn case_sensitivity_needs_the_signature_and_the_byte_to_agree() {
+    // Apple decides this in `hfs_mounthfsplus` by testing both
+    // `(hfs_flags & HFS_X)` and `btinfo.keyCompareType == kHFSBinaryCompare`.
+    // The corpus happens to have the two in agreement on every volume, so the
+    // conjunction is never exercised -- which is exactly why it is worth stating
+    // here, where it is.
+
+    // Each corpus volume, with the byte its catalog actually carries.
+    // `with_catalog` hands the volume to a closure rather than returning it, so
+    // the byte is collected into a `Cell` the closure can write through.
+    let observed: Vec<(bool, u8)> = corpus()
+        .into_iter()
+        .map(|(name, _, is_hfsx)| {
+            let byte = std::cell::Cell::new(0u8);
+            with_catalog(name, |_, catalog| {
+                byte.set(catalog.header().key_compare_type.code());
+            });
+            (is_hfsx, byte.get())
+        })
+        .collect();
+
+    // Sanity: the corpus really does span both bytes, so the cases below are not
+    // vacuous duplicates of each other.
+    assert!(
+        observed.iter().any(|(_, b)| *b == K_HFS_BINARY_COMPARE),
+        "expected at least one case-sensitive catalog, got {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|(_, b)| *b == K_HFS_CASE_FOLDING),
+        "expected at least one case-folding catalog, got {observed:?}"
+    );
+
+
+    // The four combinations. Only HFSX *with* the binary byte is sensitive.
+    for is_hfsx in [false, true] {
+        for byte in [K_HFS_CASE_FOLDING, K_HFS_BINARY_COMPARE] {
+            let got = Comparator::for_volume(is_hfsx, byte);
+            let want_sensitive = is_hfsx && byte == K_HFS_BINARY_COMPARE;
+            assert_eq!(
+                got.is_case_sensitive(),
+                want_sensitive,
+                "is_hfsx={is_hfsx} keyCompareType=0x{byte:02x} chose {got:?}"
+            );
+        }
+    }
+
+    // The one combination a real volume can reach and a naive reader gets wrong:
+    // a folding volume that carries the binary byte anyway. Treating the byte as
+    // authoritative would make it case-sensitive, and every lookup of a
+    // differently-cased name would miss.
+    assert_eq!(
+        Comparator::for_volume(false, K_HFS_BINARY_COMPARE),
+        Comparator::CaseFolding,
+        "an HFS+ volume folds names regardless of the byte it carries"
+    );
 }
 
 #[test]
