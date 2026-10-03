@@ -498,3 +498,143 @@ fn a_damaged_journal_truncates_rather_than_being_abandoned() {
         &text[..26.min(text.len())]
     );
 }
+
+
+#[test]
+fn a_read_running_past_the_end_of_the_device_short_reads() {
+    // A request that starts inside a replayed block and runs past the end of the
+    // device has already been partly answered. POSIX read reports end of file by
+    // returning fewer bytes, not by failing, and a mount that got an error here
+    // would report EIO for a file whose tail it had just read successfully.
+    let path = image_path("journal-replay-be");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .unwrap()
+        .unwrap();
+    let overlaid = journal.into_device();
+
+    let device_len = dev.len().unwrap();
+    let replayed = journal.replayed_blocks()[0].device_offset;
+    let bs = u64::from(vh.block_size);
+
+    // Start at the beginning of the replayed block, and ask for 4 KiB more than
+    // the device has left, so the request straddles the overlay and the end.
+    let start = replayed;
+    let over = 4096usize;
+    let want = ((device_len - start) as usize) + over;
+    let mut buf = vec![0u8; want];
+
+    let read = overlaid.read_at(start, &mut buf);
+    assert!(
+        read.is_ok(),
+        "a read straddling the replay and the end of the device must not fail: {:?}",
+        read.err()
+    );
+
+    // The head must be journal data: the payload marker, which the device's own
+    // contents could not produce.
+    assert!(
+        String::from_utf8_lossy(&buf[..26]).contains("journal replayed"),
+        "the replayed head must come from the journal, got {:?}",
+        String::from_utf8_lossy(&buf[..26])
+    );
+
+    // Everything up to the end of the device must be filled: one block from the
+    // journal, the remainder from the device.
+    let block = bs as usize;
+    assert!(block < want, "the request must reach past the overlay block");
+    assert_eq!(buf[block..].iter().take(64).len(), 64);
+}
+
+#[test]
+fn a_read_entirely_past_the_end_is_empty_rather_than_an_error() {
+    let path = image_path("journal-replay-be");
+    if !path.exists() {
+        return;
+    }
+    let dev = FileDevice::open(&path).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
+        .unwrap()
+        .unwrap();
+    let overlaid = journal.into_device();
+
+    let device_len = dev.len().unwrap();
+    let mut buf = vec![0u8; 4096];
+    // Must terminate rather than spin, and must not error.
+    overlaid
+        .read_at(device_len, &mut buf)
+        .expect("a read starting at end of file is empty, not an error");
+    overlaid
+        .read_at(device_len + (1 << 20), &mut buf)
+        .expect("a read starting past the end is empty, not an error");
+}
+
+#[test]
+fn a_negative_block_number_is_refused() {
+    // A bnum with the high bit set that is not the -1 killed sentinel is bogus.
+    // Letting it through computes a device offset far outside the image.
+    //
+    // Mining reference: core/hfs_journal.c rejects it before any of the list's
+    // contents are used, and drops the transaction rather than the journal.
+    let source = image_path("journal-replay-be");
+    if !source.exists() {
+        eprintln!("skipping: {} not built", source.display());
+        return;
+    }
+    let mut broken = std::fs::read(&source).expect("read image");
+
+    let vh_off = VOLUME_HEADER_OFFSET as usize;
+    let be32 = |buf: &[u8], at: usize| {
+        u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+    };
+    let bs = be32(&broken, vh_off + 40) as usize;
+    let jib_block = be32(&broken, vh_off + 12);
+    let jib_off = jib_block as usize * bs;
+    let journal_offset =
+        u64::from_be_bytes(broken[jib_off + 36..jib_off + 44].try_into().unwrap()) as usize;
+
+    // binfo[1].bnum is at block-list prefix + 16 bytes. The block list sits one
+    // block past the journal header.
+    let blhdr = journal_offset + bs;
+    let bnum_at = blhdr + 16 + 16;
+    // A large-but-not-all-ones negative value, which is the case Apple rejects.
+    broken[bnum_at..bnum_at + 8].copy_from_slice(&0x8000_0000_0000_0000u64.to_be_bytes());
+
+    // binfo[1] begins at offset 32, which is outside the 32 bytes the header
+    // checksum covers, so the checksum itself is untouched by this edit. That is
+    // deliberate: it isolates the block-number check from the header check.
+    assert_eq!(bnum_at - blhdr, 32, "binfo[1] must start just past the checksummed range");
+
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("hfsplus-negbnum-{}.img", std::process::id()));
+    std::fs::write(&probe, &broken).unwrap();
+
+    let dev = FileDevice::open(&probe).unwrap();
+    let vh = VolumeHeader::read_from(&dev).unwrap();
+    let result = Journal::open(&dev, vh.journal_info_block, vh.block_size);
+    let _ = std::fs::remove_file(&probe);
+
+    match result {
+        Err(e) => panic!("a bogus block number must truncate, not fail outright: {e}"),
+        Ok(None) => {}
+        Ok(Some(j)) => {
+            assert_eq!(
+                j.replayed_blocks().len(),
+                0,
+                "a transaction with a bogus block number must not be applied"
+            );
+            let (_, why) = j.truncation().expect("truncation must be reported");
+            assert!(
+                why.contains("bogus block number"),
+                "the reason should say so, got {why:?}"
+            );
+        }
+    }
+}
+
