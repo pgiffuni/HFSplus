@@ -549,8 +549,12 @@ impl Object {
         self.resource_size() > 0
     }
 
-    /// Borrow the file attributes, if this is a file.
-    fn as_file(&self) -> Result<&FileAttrs> {
+    /// The file record behind this object, if it is a file.
+    ///
+    /// A caller that needs the fork geometry -- to check an extent layout, or to
+    /// tell a single-extent fork from a multi-extent one -- has no other way to
+    /// see it, because [`Object::data_size`] reports only the logical size.
+    pub fn as_file(&self) -> Result<&FileAttrs> {
         match self {
             Object::File(f) => Ok(f),
             Object::Directory(_) => Err(Error::invalid("object", "not a file")),
