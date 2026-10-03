@@ -235,6 +235,30 @@ pub struct ExtentKey {
 }
 
 impl ExtentKey {
+    /// Byte offset of `fileID` within the key record.
+    const FILE_ID_OFFSET: usize = BIG_KEY_PREFIX;
+
+    /// Byte offset of `startBlock` within the key record.
+    const START_BLOCK_OFFSET: usize = BIG_KEY_PREFIX + 4;
+
+    /// Byte offset of the trailing pad byte, when the key size is odd.
+    ///
+    /// The key body is 8 bytes and the prefix 2, so the total is already even and
+    /// there is never a pad byte. Stated explicitly because every other HFS+ key
+    /// needs one and assuming that here would be wrong.
+    pub const ON_DISK_SIZE: usize = BIG_KEY_PREFIX + EXTENT_KEY_MAX_LENGTH;
+
+    /// Encode this key into a node record.
+    pub fn to_record(&self) -> [u8; Self::ON_DISK_SIZE] {
+        let mut out = [0u8; Self::ON_DISK_SIZE];
+        out[0..2].copy_from_slice(&(EXTENT_KEY_MAX_LENGTH as u16).to_be_bytes());
+        out[Self::FILE_ID_OFFSET..Self::FILE_ID_OFFSET + 4]
+            .copy_from_slice(&self.file_id.to_be_bytes());
+        out[Self::START_BLOCK_OFFSET..Self::START_BLOCK_OFFSET + 4]
+            .copy_from_slice(&self.start_block.to_be_bytes());
+        out
+    }
+
     /// Decode an extents key from a record.
     pub fn from_record(record: &[u8]) -> Result<Self> {
         let be = Be::new(record);
@@ -255,8 +279,36 @@ impl ExtentKey {
                 available: record.len(),
             });
         }
-        Ok(ExtentKey { file_id: be.u32(2)?, start_block: be.u32(6)? })
+        Ok(ExtentKey {
+            file_id: be.u32(Self::FILE_ID_OFFSET)?,
+            start_block: be.u32(Self::START_BLOCK_OFFSET)?,
+        })
     }
+
+    /// Compare two extents keys the way the B-tree orders them.
+    ///
+    /// Mining reference: `core/hfs_extents.c` and Apple's attributes key
+    /// comparator order by `fileID` first, then by `startBlock`, both as plain
+    /// 32-bit numbers. Extents keys are never case folded: they contain no names.
+    pub fn cmp_key(&self, other: &Self) -> std::cmp::Ordering {
+        self.file_id
+            .cmp(&other.file_id)
+            .then_with(|| self.start_block.cmp(&other.start_block))
+    }
+}
+
+/// Split an Extents B-tree node record into its key and the 64-byte extent array.
+///
+/// The Extents B-tree does **not** use catalog keys, so it cannot go through the
+/// catalog `split_record`. Mining reference: `core/hfs_format.h`
+/// `struct HFSPlusExtentKey`, `u_int16_t keyLength + u32 fileID + u32 startBlock`.
+pub fn split_extent_record(record: &[u8]) -> Option<(ExtentKey, &[u8])> {
+    let key = ExtentKey::from_record(record).ok()?;
+    let off = ExtentKey::ON_DISK_SIZE.min(record.len());
+    if off > record.len() {
+        return None;
+    }
+    Some((key, &record[off..]))
 }
 
 #[cfg(test)]
@@ -347,13 +399,37 @@ mod tests {
 
     #[test]
     fn extent_key_round_trips() {
-        let mut rec = Vec::new();
-        rec.extend_from_slice(&8u16.to_be_bytes());
-        rec.extend_from_slice(&42u32.to_be_bytes());
-        rec.extend_from_slice(&770u32.to_be_bytes());
-        let k = ExtentKey::from_record(&rec).unwrap();
-        assert_eq!(k.file_id, 42);
-        assert_eq!(k.start_block, 770);
+        let k = ExtentKey { file_id: 42, start_block: 770 };
+        let rec = k.to_record();
+        assert_eq!(ExtentKey::ON_DISK_SIZE, 10);
+        assert_eq!(ExtentKey::from_record(&rec).unwrap(), k);
+
+        // And through the record splitter, which extents records go through.
+        let mut node_record = rec.to_vec();
+        node_record.extend_from_slice(&[0xAA; 64]);
+        let (key, body) = split_extent_record(&node_record).expect("split");
+        assert_eq!(key, k);
+        assert_eq!(body.len(), 64);
+        assert!(body.iter().all(|b| *b == 0xAA));
+    }
+
+    #[test]
+    fn extent_keys_order_by_cnid_then_offset() {
+        let a = ExtentKey { file_id: 2, start_block: 100 };
+        let b = ExtentKey { file_id: 2, start_block: 200 };
+        let c = ExtentKey { file_id: 3, start_block: 0 };
+        assert_eq!(a.cmp_key(&b), std::cmp::Ordering::Less);
+        assert_eq!(b.cmp_key(&a), std::cmp::Ordering::Greater);
+        // CNID dominates: a higher CNID sorts after even with a smaller offset.
+        assert_eq!(a.cmp_key(&c), std::cmp::Ordering::Less);
+        assert_eq!(a.cmp_key(&a), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn a_truncated_extent_record_is_refused() {
+        assert!(split_extent_record(&[]).is_none());
+        assert!(split_extent_record(&[0u8; 5]).is_none());
+        assert!(split_extent_record(&[0u8; 9]).is_none());
     }
 
     #[test]
