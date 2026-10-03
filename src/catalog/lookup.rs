@@ -155,6 +155,59 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
         Ok(self.search(&key)?.map(|(_, record)| record))
     }
 
+    /// Every main record in the catalog, in key order, with its key.
+    ///
+    /// Deliberately not [`Catalog::all_objects`]: that resolves each object
+    /// through its thread record, so an object whose thread record is missing or
+    /// mis-keyed is *invisible* to it. A checker needs the opposite -- it must
+    /// see the file record that is there and notice that its thread record is
+    /// not -- so it walks the leaf chain directly.
+    ///
+    /// Thread records are not returned: they describe directory entries rather
+    /// than objects, and a caller counting objects should not see two per file.
+    ///
+    /// Mining reference: `lib_fsck_hfs/dfalib/SRepair.c` `RebuildCatalogBTree`
+    /// reads the leaf records directly rather than resolving through threads,
+    /// for the same reason.
+    pub fn all_records(&self) -> Result<Vec<(CatalogKey, CatalogRecord)>> {
+        let mut out = Vec::new();
+        let mut node_num = self.header().first_leaf_node;
+        let last = self.header().last_leaf_node;
+        let mut budget = self.header().total_nodes;
+
+        while budget > 0 {
+            budget -= 1;
+            let bytes = self.tree.read_node_bytes(node_num)?;
+            let node = self.tree.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            let count = node.num_records();
+            for i in 0..count {
+                let record = node.record(i).map_err(|_| {
+                    Error::invalid("catalog node", "a record offset ran past the node")
+                })?;
+                let (key, body) = split_record(record).ok_or_else(|| {
+                    Error::invalid("catalog node", "a record was shorter than its key")
+                })?;
+                if let Ok(parsed) = parse_record(body) {
+                    if !parsed.is_thread() {
+                        out.push((key, parsed));
+                    }
+                }
+            }
+            if node_num == last {
+                break;
+            }
+            let next = node.descriptor().f_link;
+            if next == 0 {
+                break;
+            }
+            node_num = next;
+        }
+        Ok(out)
+    }
+
     /// Look up a child and report the name the catalog *stores* for it.
     ///
     /// On a case-folding volume several spellings resolve to one record, so the

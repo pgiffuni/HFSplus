@@ -116,6 +116,28 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         &self.catalog
     }
 
+    /// The device this volume reads through.
+    ///
+    /// For a caller that needs a structure the `Volume` does not wrap -- the
+    /// extents overflow B-tree, when resolving a fork whose extents spill. That
+    /// tree is not catalog-shaped, so it cannot be reached through
+    /// [`Volume::catalog`]. Mining reference: `core/hfs_extents.c` opens it from
+    /// the same device the catalog came from.
+    pub fn device(&self) -> &'a D {
+        self.device
+    }
+
+    /// Read a fork whole, up to `limit` bytes.
+    ///
+    /// For the special files: the allocation bitmap is not a catalog object, so
+    /// there is no [`Object`] to read it through.
+    ///
+    /// Overflow extents are not resolved. A caller needing a fork that spills
+    /// must walk the extents B-tree, as [`crate::check::fork_blocks`] does.
+    pub fn read_fork(&self, fork: &ForkData, limit: usize) -> Result<Vec<u8>> {
+        ForkReader::new(self.device, fork, self.header.block_size).read_all(limit)
+    }
+
     /// Whether the volume was cleanly unmounted.
     ///
     /// A dirty volume needs `fsck` before it should be written to.

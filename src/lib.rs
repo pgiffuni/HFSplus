@@ -60,6 +60,7 @@ pub mod alloc;
 pub mod blockdev;
 pub mod btree;
 pub mod catalog;
+pub mod check;
 pub mod endian;
 pub mod error;
 pub mod extent;
