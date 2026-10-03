@@ -597,6 +597,7 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
                     }
                     if let Some(prev) = &previous {
                         if cat.compare_keys(prev, &key) != crate::unicode::Ordering::Less {
+                            // E_KeyOrd: "Keys out of order".
                             report.key_order.push((node_num, index as usize));
                         }
                     }
@@ -651,6 +652,9 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
     let has_thread = |cnid: u32| -> bool { threads.iter().any(|(_, t)| *t == cnid) };
     for cnid in &objects {
         if !has_thread(*cnid) {
+            // No catalog fsck code for this one: Apple reports it through the
+            // hierarchy pass rather than a single check, so the message is the
+            // description.
             report.missing_thread.push(*cnid);
         }
     }
@@ -660,6 +664,7 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
     for (cnid, declared) in &declared_valence {
         let counted = threads.iter().filter(|(parent, _)| parent == cnid).count() as u32;
         if counted != *declared {
+            // E_DirVal: "Invalid directory item count".
             report.valence.push((*cnid, *declared, counted));
         }
     }
@@ -730,6 +735,7 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
 
         let expected_height = (tree_depth as i64 - level as i64 + 1) as u8;
         if node.height() != expected_height {
+            // E_NHeight: "Invalid node height".
             report.node_height.push((name_u8(tree), node_num));
         }
 
@@ -780,6 +786,7 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
                 for index in 0..node.num_records() {
                     let child = node.child(index)?;
                     if child == 0 || child >= total_nodes {
+                        // E_IndxLk: "Invalid index link".
                         report.child_node.push((name_u8(tree), node_num, child));
                     } else {
                         // The child must itself be structurally sound, so walk
@@ -890,6 +897,7 @@ fn check_unused_nodes<D: crate::blockdev::BlockDevice + ?Sized>(
             continue;
         };
         if bytes.iter().any(|b| *b != 0) {
+            // E_UnusedNodeNotZeroed: "Unused node is not erased".
             report.unerased_node.push((name_u8(tree), node_num));
         }
     }

@@ -234,7 +234,10 @@ impl ForkData {
             if self.logical_size != 0 {
                 return Err(Error::invalid(
                     "ForkData.logicalSize",
-                    format!("{} bytes claimed by a fork with no blocks", self.logical_size),
+                    format!(
+                        "E_LEOF: {} bytes claimed by a fork with no blocks",
+                        self.logical_size
+                    ),
                 ));
             }
             return Ok(());
@@ -250,8 +253,9 @@ impl ForkData {
             return Err(Error::invalid(
                 "ForkData.logicalSize",
                 format!(
-                    "{} bytes of data in {} blocks of {block_size} -- an HFS+ data \
-                     fork cannot be sparse, so the excess is unaccounted for",
+                    "E_LEOF: {} bytes of data in {} blocks of {block_size} -- an \
+                     HFS+ data fork cannot be sparse, so the excess is unaccounted \
+                     for",
                     self.logical_size, self.total_blocks
                 ),
             ));
@@ -263,8 +267,8 @@ impl ForkData {
             return Err(Error::invalid(
                 "ForkData.totalBlocks",
                 format!(
-                    "{} blocks of {block_size} exceed the {} blocks its extents \
-                     describe",
+                    "E_PEOF: {} blocks of {block_size} exceed the {} blocks its \
+                     extents describe",
                     self.total_blocks, described_blocks
                 ),
             ));
