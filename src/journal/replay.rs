@@ -315,7 +315,7 @@ pub struct Journal<'a, D: ?Sized> {
     /// Whether the journal header's checksum matched, or `None` when it was not
     /// checked.
     checksum_ok: Option<bool>,
-    /// The volume's allocation block size, which `bnum` is measured in.
+    /// The volume's allocation block size, which the *device* is addressed in.
     block_size: u32,
     /// Where replay stopped short, if it did.
     truncated_at: Option<u64>,
@@ -344,6 +344,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     /// Returns `Ok(None)` when the volume is not journaled, which is the normal
     /// case and not an error. Mining reference: `core/hfs_vfsutils.c` only
     /// attempts to open a journal when `kHFSVolumeJournaledBit` is set.
+    /// The block size the journal addresses itself in.
     pub fn open(device: &'a D, journal_info_block: u32, block_size: u32) -> Result<Option<Self>> {
         let device_len = device.len()?;
 
@@ -595,7 +596,14 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
             // above can tell damage from the end of the journal.
             past_end = data_offset > header.end;
 
-            let next = data_offset.checked_add(used).ok_or(Error::overflow("block list cursor"))?;
+            // The cursor is *not* wrapped here. A real ring is full -- the writer
+            // only laps itself once every block has been used -- and `end` is the
+            // point the walk stops at, so a cursor that needs wrapping means the
+            // journal has no transactions left rather than one more somewhere
+            // unexpected. The *data* read does wrap; that is in `read_journal`.
+            let next = data_offset
+                .checked_add(used)
+                .ok_or(Error::overflow("block list cursor"))?;
             if next <= offset {
                 self.truncate_at(offset, "block list does not advance")?;
                 break;
@@ -671,19 +679,82 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     }
 
     /// Read `len` bytes at `offset` within the journal.
+    /// Read `len` bytes from within the journal, wrapping at its end.
+    ///
+    /// The public form of what the replay walk uses, for a caller inspecting a
+    /// journal by hand. Wrapping is what makes the offset meaningful: a read
+    /// starting near the end continues from the beginning rather than failing.
+    pub fn read_bytes(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        self.read_journal(offset, len)
+    }
+
+    /// Read `len` bytes from within the journal, wrapping at its end.
+    ///
+    /// The journal is a **ring**: when the writer reaches the end it starts again
+    /// just after the header, so a block list's replacement data may straddle the
+    /// wrap. Apple handles it in the walk:
+    ///
+    /// ```c
+    /// if (offset >= jnl->jhdr->size) {
+    ///     offset = jnl->jhdr->jhdr_size + (offset - jnl->jhdr->size);
+    /// }
+    /// ```
+    ///
+    /// Refusing a read that crosses the end instead would reject ordinary
+    /// journals -- a transaction that begins near the end is normal, not
+    /// damaged.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `replay_journal`, the "increment
+    /// offset" and "wrap to the beginning" comments.
     fn read_journal(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let end = offset
-            .checked_add(len as u64)
-            .ok_or(Error::overflow("journal read"))?;
-        if end > self.info.size {
-            return Err(Error::out_of_range("journal read", end, self.info.size));
+        let size = self.info.size;
+        let ring_start = self.journal_block_size();
+
+        // A ring smaller than the header cannot wrap: the write position would
+        // land on the header itself, so refuse rather than loop.
+        if ring_start == 0 || ring_start >= size {
+            let end = offset
+                .checked_add(len as u64)
+                .ok_or(Error::overflow("journal read"))?;
+            if end > size {
+                return Err(Error::out_of_range("journal read", end, size));
+            }
+            let abs = self
+                .info
+                .offset
+                .checked_add(offset)
+                .ok_or(Error::overflow("journal read"))?;
+            return self.device.read_vec(abs, len);
         }
-        let abs = self
-            .info
-            .offset
-            .checked_add(offset)
-            .ok_or(Error::overflow("journal read"))?;
-        self.device.read_vec(abs, len)
+
+        let mut out = Vec::with_capacity(len);
+        let mut at = offset;
+        let mut left = len;
+        // Bounded so a ring that somehow fails to make progress cannot spin.
+        let mut guard = 0usize;
+        while left > 0 {
+            guard += 1;
+            if guard > 2 {
+                return Err(Error::invalid(
+                    "journal read",
+                    "the wrap point made no progress",
+                ));
+            }
+            if at >= size {
+                at = ring_start + (at - size);
+            }
+            let available = (size - at) as usize;
+            let chunk = left.min(available);
+            let abs = self
+                .info
+                .offset
+                .checked_add(at)
+                .ok_or(Error::overflow("journal read"))?;
+            out.extend_from_slice(&self.device.read_vec(abs, chunk)?);
+            at += chunk as u64;
+            left -= chunk;
+        }
+        Ok(out)
     }
 
     /// Replace every block the transactions rewrote with its journal contents.
@@ -700,6 +771,21 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     /// original start -- so the damaged transaction and everything after it are
     /// dropped while everything before survives. Apple bounds this to three
     /// retries before abandoning the journal entirely.
+    /// The block size the journal addresses itself in.
+    ///
+    /// The journal header's own `jhdr_size` once it has been read, and the
+    /// volume's block size before that -- the header probe cannot know otherwise.
+    ///
+    /// Equal to `block_size` on every volume Apple writes today, and equal on
+    /// every image this project can generate, which is exactly why the
+    /// distinction has to be carried rather than assumed.
+    fn journal_block_size(&self) -> u64 {
+        match self.header {
+            Some(h) if h.jhdr_size != 0 => u64::from(h.jhdr_size),
+            _ => u64::from(self.block_size),
+        }
+    }
+
     fn build_overlay(&mut self) -> Result<()> {
         for index in 0..self.transactions.len() {
             let transaction = self.transactions[index].clone();
@@ -796,9 +882,20 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                     });
                 }
 
+                // `bnum` is measured in the *journal header's* block size, not the
+                // volume's. `add_block` computes `block_start = block_num *
+                // jhdr_size`, so a volume whose logical block size differs from
+                // the journal's -- which is what `journal_open` calls a resized
+                // volume -- would place every block at the wrong offset otherwise.
+                // The two agree on every image this project can generate, so the
+                // distinction is invisible without saying so.
+                //
+                // Mining reference: `core/hfs_journal.c` `add_block`, and the
+                // "the volume has probably been resized" comment in
+                // `journal_open`.
                 let device_offset = block
                     .bnum
-                    .checked_mul(u64::from(self.block_size))
+                    .checked_mul(self.journal_block_size())
                     .ok_or_else(|| ApplyFailure::Fatal(Error::overflow("replayed block offset")))?;
                 match self
                     .overlay
