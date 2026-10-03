@@ -315,9 +315,28 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         // A target is bounded by PATH_MAX; a longer one means a corrupt fork, and
         // allocating for it would be the wrong response to a bad on-disk length.
         const MAX_TARGET: usize = 4096;
+
+        // A symlink's target *is* its data fork, so an empty one names nothing.
+        // Returning "" would be a path, and a caller would try to resolve it --
+        // against the process's working directory, in the worst case. That is the
+        // kind of wrong answer a refusal is for.
+        //
+        // Mining reference: `core/hfs_xattr.c` reads a link target out of the
+        // file's data fork for HFSPlus, so the fork and the target cannot
+        // disagree; an empty fork is a corrupt symlink rather than a link to "".
+        if f.record.data_fork.logical_size == 0 {
+            return Err(Error::invalid(
+                "readlink",
+                "the symlink has an empty data fork, so it has no target",
+            ));
+        }
+
         let bytes = self
             .fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
             .read_all(MAX_TARGET)?;
+        // `write_journal_header` shows the target is stored without a terminator,
+        // but a writer that appends one is not a fault, so trailing NULs are
+        // trimmed rather than refused.
         let s = String::from_utf8_lossy(&bytes);
         Ok(s.trim_end_matches('\0').to_string())
     }
