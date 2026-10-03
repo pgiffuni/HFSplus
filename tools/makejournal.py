@@ -71,6 +71,21 @@ def checksum_with_zeroed_field(buf: bytearray, at: int, length: int) -> int:
     return calc_checksum(bytes(scratch))
 
 
+def make_payload(text, block_size, block):
+    """A whole block whose bytes are visibly non-zero throughout.
+
+    A zero-padded payload would make a read from the journal indistinguishable
+    from a read of a free block at the device, so the filler is non-zero.
+    """
+    marker = b"REPLAYED-BY-HFSPFUSE\n" if text is None else text.encode()
+    marker = marker[:block_size]
+    filler = bytes(((i * 7 + block) & 0xFF) or 0x5A for i in range(block_size))
+    out = bytearray(marker)
+    while len(out) < block_size:
+        out.append(filler[len(out)])
+    return bytes(out)
+
+
 def build_journal_header(start: int, end: int, size: int, jhdr_size: int,
                          blhdr_size: int, sequence_num: int) -> bytearray:
     """A journal header in big-endian, with a correct checksum.
@@ -95,28 +110,41 @@ def build_journal_header(start: int, end: int, size: int, jhdr_size: int,
     return raw
 
 
-def build_block_list(blocks, blhdr_size: int, first: bool) -> tuple[bytes, bytes]:
+def build_block_list(blocks, blhdr_size: int, first: bool,
+                     sequence_num: int = 1) -> tuple[bytes, bytes]:
     """A block list header and the data it describes.
 
     `blocks` is a list of (device_block_number, payload).
     Returns (header_block, data_block).
     """
-    n = len(blocks)
+    # binfo[0] is the transaction sequence-number slot, not a block: Apple
+    # declares `_blk_info` as `bsize` unioned with {cksum, sequence_num}, and
+    # core/hfs_journal.c replays `for (i = 1; i < num_blocks; i++)`. So a list
+    # describing n blocks has num_blocks == n + 1.
     prefix = 16
+    capacity = (blhdr_size - prefix) // 16
+    if len(blocks) + 1 > capacity:
+        sys.exit(f"error: {len(blocks)} blocks exceed one block list of {blhdr_size} bytes")
+    num_entries = len(blocks) + 1
+
     header = bytearray(blhdr_size)
-    struct.pack_into(">H", header, 0, n)            # max_blocks
-    struct.pack_into(">H", header, 2, n)            # num_blocks
+    struct.pack_into(">H", header, 0, num_entries)  # max_blocks
+    struct.pack_into(">H", header, 2, num_entries)  # num_blocks
     struct.pack_into(">I", header, 4, 0)            # bytes_used, filled below
+
     flags = BLHDR_FIRST_HEADER if first else 0
     if blocks and blocks[0][1] is not None:
         flags |= BLHDR_CHECK_CHECKSUMS
     struct.pack_into(">I", header, 12, flags)
 
+    # binfo[0] is the sequence-number slot: bsize 0, sequence in the unioned
+    # word. Apple reads it back as blhdr->binfo[0].u.bi.b.sequence_num.
+    struct.pack_into(">I", header, prefix + 8, 0)
+    struct.pack_into(">I", header, prefix + 12, sequence_num)
+
     data = bytearray()
     for i, (bnum, payload) in enumerate(blocks):
-        if i >= (blhdr_size - prefix) // 16:
-            sys.exit("error: too many blocks for one block list")
-        off = prefix + i * 16
+        off = prefix + (i + 1) * 16
         struct.pack_into(">Q", header, off, bnum)
         struct.pack_into(">I", header, off + 8, len(payload))
         struct.pack_into(">I", header, off + 12,
@@ -139,6 +167,11 @@ def main() -> None:
                     help="replacement payload; defaults to a recognisable pattern")
     ap.add_argument("--little-endian", action="store_true",
                     help="write the journal header little-endian, as x86 hosts do")
+    ap.add_argument("--extra", action="append", default=[], metavar="BLOCK:TEXT",
+                    help="add a further transaction rewriting BLOCK with TEXT; "
+                         "repeat for more. Later transactions supersede earlier "
+                         "writes to the same block, which is what a real journal "
+                         "does when a block is modified twice before the wrap.")
     args = ap.parse_args()
 
     with open(args.source, "rb") as f:
@@ -171,15 +204,7 @@ def main() -> None:
     # The whole block is filled with a visible, non-zero pattern so that a read
     # can be attributed to the journal or to the device by inspection. A
     # zero-padded payload would make the two indistinguishable at the tail.
-    if args.data is None:
-        marker = b"REPLAYED-BY-HFSPFUSE\n"
-    else:
-        marker = args.data.encode()
-    payload = bytearray(marker[:block_size])
-    filler = bytes(((i * 7) & 0xFF) or 0x5A for i in range(block_size))
-    while len(payload) < block_size:
-        payload.append(filler[len(payload)])
-    payload = bytes(payload)
+    payload = make_payload(args.data, block_size, args.block)
 
     # --- Journal geometry --------------------------------------------------
     # macOS sizes both the journal header and each block list to a filesystem
@@ -190,8 +215,24 @@ def main() -> None:
     if start + blhdr_size + block_size > journal_size:
         sys.exit("error: the journal is too small for a transaction")
 
-    header_raw, data_raw = build_block_list([(args.block, payload)], blhdr_size, True)
-    end = start + len(header_raw) + len(data_raw)
+    # Additional transactions, each a block list followed by its data. Writing
+    # more than one exercises the walk across transaction boundaries, which a
+    # single-transaction journal cannot.
+    transactions = [[(args.block, payload)]]
+    for spec in args.extra:
+        block_text, _, text = spec.partition(":")
+        try:
+            block = int(block_text)
+        except ValueError:
+            sys.exit(f"error: --extra expects BLOCK:TEXT, got {spec!r}")
+        transactions.append([(block, make_payload(text, block_size, block))])
+
+    layout = bytearray()
+    for i, blocks in enumerate(transactions):
+        header_raw, data_raw = build_block_list(blocks, blhdr_size, True, i + 1)
+        layout += header_raw
+        layout += data_raw
+    end = start + len(layout)
 
     journal = bytearray(journal_size)
     hdr = build_journal_header(start, end, journal_size, jhdr_size, blhdr_size, 1)
@@ -211,8 +252,7 @@ def main() -> None:
                          checksum_with_zeroed_field(le, 36, JOURNAL_HEADER_CKSUM_SIZE))
         hdr = le
     journal[0:len(hdr)] = hdr
-    journal[start:start + len(header_raw)] = header_raw
-    journal[start + blhdr_size:start + blhdr_size + len(data_raw)] = data_raw
+    journal[start:start + len(layout)] = layout
 
     img[journal_offset:journal_offset + journal_size] = journal
 
@@ -225,7 +265,8 @@ def main() -> None:
 
     print(f"{args.dest}: journal at {journal_offset}, transaction {start}..{end}")
     print(f"  block size {block_size}, jhdr_size {jhdr_size}, blhdr_size {blhdr_size}")
-    print(f"  rewrites device block {args.block} with {len(payload)} bytes")
+    print(f"  {len(transactions)} transaction(s), rewrites "
+          f"{[b[0] for t in transactions for b in t]} with {len(payload)}-byte blocks")
     print(f"  header byte order: {'little' if args.little_endian else 'big'}")
 
 
