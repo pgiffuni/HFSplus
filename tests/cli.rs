@@ -550,6 +550,44 @@ fn running_either_tool_leaves_the_image_untouched() {
 }
 
 #[test]
+fn the_journal_report_distinguishes_an_external_journal_from_none() {
+    // A volume whose journal lives on another device is journaled, and saying
+    // "journal: none" would tell a user the opposite. This is what a Time Machine
+    // volume looks like, so it is not an exotic state.
+    let img = replayed("journal-external");
+    if !require(&img) {
+        return;
+    }
+    let out = hfsls(&["-j", &img]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stdout(&out);
+
+    assert!(text.contains("journaled:       true"), "got:\n{text}");
+    assert!(
+        text.contains("journal:         on another device"),
+        "an external journal must not be reported as none:\n{text}"
+    );
+    assert!(
+        text.contains("0x00000006"),
+        "the flags should be shown, since they are what says where the journal is:\n{text}"
+    );
+}
+
+#[test]
+fn a_volume_without_a_journal_still_says_none() {
+    // The converse, so the new branch cannot swallow the ordinary case.
+    let img = generated("basic-hfsplus");
+    if !require(&img) {
+        return;
+    }
+    let text = stdout(&hfsls(&["-j", &img]));
+    assert!(
+        text.contains("journal:         none"),
+        "an unjournaled volume must still say none:\n{text}"
+    );
+}
+
+#[test]
 fn inspecting_a_torn_volume_does_not_recover_it() {
     // The recovered file is visible only through replay. `hfsls` lists the
     // filesystem, and it does not replay, so it must report the stale view. If
