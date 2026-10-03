@@ -8,12 +8,13 @@
 //! # Usage
 //!
 //! ```text
-//! hfsinspect [--json] [--verbose] <image>...
+//! hfsinspect [--json] [--verbose] [--btrees] <image>...
 //! ```
 //!
 //! Exit status is 0 if every image inspected cleanly, 1 on a usage error, and 2
 //! if any image failed to parse. A malformed image is a *result*, not a crash,
-//! so the tool reports it and keeps going rather than aborting.
+//! so the tool reports it and keeps going rather than aborting. `--help` is a
+//! successful request for usage, not a usage error, so it exits 0.
 
 use std::process::ExitCode;
 
@@ -26,23 +27,18 @@ use hfsplus::format::fork::ForkData;
 use hfsplus::format::volume_header::{FileSystemKind, VolumeHeader, VOLUME_HEADER_SIZE};
 
 fn main() -> ExitCode {
-    let Args { opts, paths } = match parse_args() {
-        Ok(Some(a)) => a,
-        Ok(None) => {
+    let (opts, paths) = match parse_args() {
+        Ok(Args::Help) => {
             print_usage();
-            return ExitCode::from(1);
+            return ExitCode::SUCCESS;
         }
+        Ok(Args::Run { opts, paths }) => (opts, paths),
         Err(msg) => {
             eprintln!("hfsinspect: {msg}");
             print_usage();
             return ExitCode::from(1);
         }
     };
-
-    if paths.is_empty() {
-        print_usage();
-        return ExitCode::from(1);
-    }
 
     let mut any_failed = false;
     for path in &paths {
@@ -78,12 +74,14 @@ struct Options {
     btrees: bool,
 }
 
-struct Args {
-    opts: Options,
-    paths: Vec<String>,
+/// What the command line asked for.
+#[derive(Debug)]
+enum Args {
+    Help,
+    Run { opts: Options, paths: Vec<String> },
 }
 
-fn parse_args() -> std::result::Result<Option<Args>, String> {
+fn parse_args() -> std::result::Result<Args, String> {
     let mut opts = Options { json: false, verbose: false, btrees: false };
     let mut paths = Vec::new();
     let it = std::env::args().skip(1);
@@ -92,19 +90,24 @@ fn parse_args() -> std::result::Result<Option<Args>, String> {
             "--json" => opts.json = true,
             "--verbose" | "-v" => opts.verbose = true,
             "--btrees" => opts.btrees = true,
-            "--help" | "-h" => return Ok(None),
+            // Asking for help is not a mistake, so it is reported as its own
+            // case rather than folded in with "no arguments", which is an error.
+            "--help" | "-h" => return Ok(Args::Help),
             s if s.starts_with('-') && s.len() > 1 => {
                 return Err(format!("unknown option `{s}`"))
             }
             s => paths.push(s.to_string()),
         }
     }
-    Ok(Some(Args { opts, paths }))
+    if paths.is_empty() {
+        return Err("no image given".to_string());
+    }
+    Ok(Args::Run { opts, paths })
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: hfsinspect [--json] [--verbose] <image>...\n\
+        "usage: hfsinspect [--json] [--verbose] [--btrees] <image>...\n\
          \n\
          Prints HFS+/HFSX volume header facts: signature, version, allocation\n\
          block size, block counts, special-file fork geometry, and journal state."
