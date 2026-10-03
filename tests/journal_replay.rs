@@ -23,11 +23,14 @@
 //!
 //! # What is deliberately *not* here
 //!
-//! A crash-consistent image: a volume whose journal is newer than its filesystem
-//! because the machine died mid-write. That cannot be produced without macOS or
-//! fault injection, so these images replay a block that the filesystem does not
-//! currently reference. The overlay is therefore verified for *precedence* and
-//! for *non-interference* rather than for repairing a torn catalog.
+//! Repairing a torn catalog. `makejournal.py` rewrites a block the filesystem
+//! does not reference, so these images verify the overlay for *precedence* and
+//! *non-interference* — that it wins over the device, and that it leaves
+//! everything else alone — but not that replay recovers anything. A block nothing
+//! references repairs nothing.
+//!
+//! `tests/journal_recovery.rs` covers that, using `tools/mktorn.py` to write a
+//! real catalog change into a journal instead.
 
 mod common;
 

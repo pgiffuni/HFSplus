@@ -174,14 +174,37 @@ supersedes an earlier write to the same block, or whether replay truncates at
 damage. Writing it is what found the `binfo[0]` sequence-slot bug described in
 `docs/hfs-format.md`.
 
-Each rewrites a block the filesystem does not currently reference. That is
-deliberate: a *crash-consistent* image, where the journal is newer than the
-filesystem because the machine died mid-write, cannot be produced without macOS
-or fault injection. So the overlay is verified for **precedence** (a replayed
-block reads from the journal, and differs from the device), for
-**non-interference** (an untouched block still reads from the device, and the
-volume still mounts through the overlay) and for **refusal** (a block failing its
-recorded checksum stops the replay). Repairing a torn catalog is not covered.
+Each of those rewrites a block the filesystem does not currently reference. That
+is deliberate, and it has a consequence worth stating plainly: they verify the
+overlay for **precedence** (a replayed block reads from the journal, and differs
+from the device), for **non-interference** (an untouched block still reads from
+the device, and the volume still mounts through the overlay) and for **refusal**
+(a block failing its recorded checksum stops the replay). They do **not** verify
+that replay *repairs* anything, because a block nothing references repairs
+nothing.
+
+## Torn metadata (`tests/images/replayed/journal-torn-catalog.img`)
+
+Produced by `tools/mktorn.py`, and the only image here that tests the reason a
+journal exists.
+
+It writes a real catalog change — a file record and its thread record — into a
+journal transaction and leaves the on-disk catalog alone. The result is a volume
+in the state a machine that lost power mid-write leaves behind: the filesystem is
+internally consistent but older than its journal.
+
+That gives the suite a property nothing else can have. Read straight off the
+image the root folder has two entries; read through the replay overlay it has
+three. `fsck.hfsplus` accepts the image, because the on-disk filesystem really is
+sound — a file that exists only in the journal is not a disk defect. So the
+image is crash-consistent rather than corrupt, and recovering it is the only way
+to see the file.
+
+The test asserts the two listings *differ*, which is the negative control that
+keeps the rest of the suite from being vacuous. It also checks the recovered file
+resolves by name **and** by CNID, that `nextCatalogID` advanced past it, that a
+second recovery gives the same answer, and that the image is byte-identical
+afterwards. See `docs/hfs-format.md` for what writing the tool uncovered.
 
 Eleven malformed images, none of which may mount.
 

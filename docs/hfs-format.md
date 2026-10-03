@@ -730,7 +730,7 @@ The corpus therefore proves detection, validation and the empty replay path, and
 **cannot** prove transaction replay: that needs a volume crashed mid-transaction,
 which cannot be produced without macOS or fault injection. `tests/journal_conformance.rs`
 asserts that gap so it stays visible rather than being implied by the absence of
-a test.
+a test. Two tools below close it, in two different senses.
 
 ### Closing the gap: tools/makejournal.py
 
@@ -764,8 +764,63 @@ What these images verify:
 - **Byte order**: the little-endian header is detected, not assumed.
 - **Read-only**: the image is byte-identical afterwards.
 
-What they do **not** verify: repairing a torn catalog, or any property that needs
-a genuinely crash-consistent volume.
+What they do **not** verify: repairing a torn catalog. That is a different kind
+of problem, and it took a different tool — see below.
+
+### Closing the second gap: tools/mktorn.py
+
+`makejournal.py` can only rewrite a block the filesystem does not reference,
+because it has no way to write a catalog record. So it proves *precedence* and
+*non-interference*, but nothing about the reason a journal exists: recovering a
+metadata write that never reached the disk.
+
+`tools/mktorn.py` writes a real catalog change into the journal and leaves the
+on-disk catalog alone. The image it produces is exactly what a machine that lost
+power mid-write leaves behind — a filesystem that is internally consistent but
+older than its journal. Three blocks go into one transaction, which is what a
+`create` does:
+
+```text
+block 0                  the volume header, with nextCatalogID advanced
+catalog header node      leafRecords incremented
+catalog leaf node        the new file record and its thread record
+```
+
+The file record and thread record are **cloned from records the formatter
+already wrote**, with the CNID changed and the data fork emptied. Cloning
+matters: the flags, timestamps, Finder info and permissions are Apple's bytes,
+so the new record cannot differ from its neighbours in any way unrelated to the
+test. The insertion point is chosen so the key order is the same under every
+comparator the volume might use, and then asserted rather than assumed.
+
+Writing it found three things that the replay tests could not have found, all of
+them real:
+
+- **`kBTLeafNode` is `-1`, not `0`.** The node kinds are a signed byte, so a leaf
+  is `0xFF` on disk. Writing `0` produces a node that parses as an *index* node,
+  and the reader correctly refuses it. The suite that would have caught this
+  needed a catalog record to exist first, because nothing else writes a leaf node.
+- **`keyLength` excludes itself**, and `HFSUniStr255`'s length is a `u16`, not a
+  `u32`. Packing the key as `>HII` shifts every following field by two bytes.
+- **A record's size comes from its `recordType`, not from the gap to the next
+  key.** The last record is followed by the node's free space, so a gap-derived
+  size is wrong by however much space is unused — which is most of a sparse node.
+
+What the resulting image verifies, in `tests/journal_recovery.rs`:
+
+- The **stale** view lists two files; the **replayed** view lists three. The two
+  lists are asserted to *differ*, which is the negative control that stops every
+  other assertion in the suite from being vacuous.
+- The recovered file resolves **by name and by CNID**, so it is reachable by both
+  routes a mount uses. A thread record with the wrong key would leave the file
+  visible in a listing but unreachable by identity.
+- The on-disk filesystem passes `fsck.hfsplus` on a copy. A file that lives only
+  in the journal is not a disk defect, and a checker that complained would be
+  wrong about what it found. This is what separates a crash-consistent volume
+  from a corrupt one.
+- `nextCatalogID` advances past the recovered CNID, so a later write cannot reuse
+  it.
+- Recovery is **idempotent** and leaves the image **byte-identical**.
 
 ### `binfo[0]` is the sequence slot, not a block
 
