@@ -206,6 +206,20 @@ resolves by name **and** by CNID, that `nextCatalogID` advanced past it, that a
 second recovery gives the same answer, and that the image is byte-identical
 afterwards. See `docs/hfs-format.md` for what writing the tool uncovered.
 
+## Files with data (`tests/images/generated/journal-with-files.img`)
+
+Produced by `tools/mkfiles.py` from `journaled-hfsplus`, and the only image in
+the corpus with a file that has content.
+
+`fragmented.bin` is eight single-block extents at physically scattered blocks,
+each block beginning with its own block number. `link` is a symbolic link whose
+target lives in its data fork. Records are cloned from the volume's own, and the
+allocation bitmap, file count, free block count and root valence are all updated,
+so `fsck.hfsplus` accepts the image and leaves it byte-identical — the check that
+the generator wrote something coherent rather than merely self-consistent.
+
+A sparse file is deliberately **not** here: see the limitations list below.
+
 Eleven malformed images, none of which may mount.
 
 ## Not yet covered
@@ -223,7 +237,14 @@ Requires real Apple metadata that `mkfs.hfsplus` cannot produce:
 - resource forks, FinderInfo, user xattrs
 - compressed files (zlib, LZVN, LZFSE via `decmpfs`)
 - hard links, and Time Machine-style directory hard links
-- sparse files, fragmented and multi-extent files
+- multi-extent files spilling past the inline eight -- covered
+  synthetically in `tests/extents_overflow.rs`, but no image exercises it through
+  `Volume::read`
+- sparse files: not merely absent but *impossible* in an HFS+ data fork.
+  `fsck.hfsplus` rejects both encodings -- an extent with `startBlock == 0` and
+  a non-zero count, and a `logicalSize` beyond the allocated blocks -- and
+  `MapFileBlockC` has no zero-fill path for either. A zero-start descriptor is the
+  attributes file's gap marker. So there is no such fixture to add
 - a directory with many entries
 
 ### Third-party images (`public/`)

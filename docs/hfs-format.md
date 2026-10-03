@@ -175,7 +175,7 @@ So the overflow key's `startBlock` is a **cumulative count of allocation blocks
 already described by preceding groups** — an offset within the fork's block
 space. It is not a physical block number and not a byte offset.
 
-Consequence: a sparse file with a large `logicalSize` and few allocated blocks
+Consequence: a file with a large `logicalSize` and few allocated blocks
 never touches the extents overflow B-tree. The unallocated region is a hole, not
 an extent. Getting this wrong makes every sparse file look like it needs overflow
 records.

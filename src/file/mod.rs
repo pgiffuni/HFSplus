@@ -5,18 +5,28 @@
 //! `core/hfs_vfsutils.c` (`hfs_MountHFSPlusVolume`) is where the volume block size
 //! that drives the mapping comes from.
 //!
-//! # Sparse files
+//! # Offsets past the allocated blocks
 //!
-//! An HFS+ fork's `logicalSize` may exceed the bytes it occupies, because the
-//! allocator can leave gaps and because a file can be truncated larger than it
-//! was written. Those gaps are holes: they read as zero, they have no extent, and
-//! they are not in the extents overflow B-tree. Mining reference: `core/hfs_extents.c`
+//! A read that lands beyond a fork's extents returns zeros rather than failing.
+//!
+//! Worth being precise about why, because the obvious explanation is wrong. An
+//! HFS+ data fork **cannot be sparse**: `fsck.hfsplus` rejects an extent with
+//! `startBlock == 0` and a non-zero count ("Invalid extent entry"), and rejects
+//! a `logicalSize` larger than the allocated blocks ("Incorrect size for file").
+//! `core/FileExtentMapping.c` `MapFileBlockC` has no zero-fill path for either --
+//! it returns whatever `SearchExtentFile` finds, and an error if it finds
+//! nothing. A zero-start descriptor is the *attributes* file's gap marker, not a
+//! data fork's.
+//!
+//! So zero-filling is a tolerance for images that do not satisfy those rules --
+//! a hand-written image, a partially recovered one, or a corrupt `totalBlocks` --
+//! and not a format feature. Mining reference: `core/hfs_extents.c`
 //! (`hfs_ext_iter_init`) sets the iterator's limit from `logicalSize`, while
 //! `hfs_ext_iter_next_group` stops once no group covers the requested block.
 //!
 //! Getting this wrong in either direction is a bug with no obvious symptom: too
-//! eager and a sparse file returns garbage for its holes, too reluctant and a
-//! perfectly good file reports end-of-file early.
+//! eager and the reader fabricates data for a fork that should have failed, too
+//! reluctant and a partially readable file reports end-of-file early.
 
 use crate::blockdev::BlockDevice;
 use crate::btree::io::BTreeFile;
@@ -86,8 +96,8 @@ impl<'a, D: BlockDevice + ?Sized> ForkReader<'a, D> {
     ///
     /// Returns fewer than `len` bytes at end of file, as POSIX `read` does. A
     /// range entirely within a hole returns zeros; the zero fill is real data as
-    /// far as a reader can tell, and returning it is what makes a sparse file
-    /// behave like the file it represents.
+    /// far as a reader can tell, and returning it keeps a fork whose `logicalSize`
+    /// outruns its extents readable up to the size it claims.
     pub fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
         let end = offset
             .checked_add(len as u64)
