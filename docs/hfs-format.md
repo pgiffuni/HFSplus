@@ -155,6 +155,24 @@ end of the partition and one 1024 bytes before the end of the filesystem. For an
 image whose partition and filesystem coincide — every image in this corpus — the
 two positions are identical.
 
+### It is written, not read
+
+The alternate header exists so that a volume can be *repaired* after the primary
+is damaged. It is **not** a mount fallback, and treating it as one is a mistake
+worth recording before write support arrives — the sort of assumption a Linux- or
+ZFS-shaped filesystem would invite.
+
+`hfs_MountHFSPlusVolume` computes `hfs_partition_avh_sector` and
+`hfs_fs_avh_sector`, but grepping the whole of `core/` finds no read of either at
+mount: they are computed on the mount path and consumed by `core/hfs_resize.c`,
+which writes them. So a volume whose primary header will not parse **does not
+mount**, here or on macOS — `VolumeHeader::read_from` refusing it is correct
+behaviour, not a missing feature, and `tests/images/malformed/` asserts it.
+
+The corollary for a writer, when there is one: both alternate headers must be
+updated on every write that changes the volume header, and the two positions
+diverge as soon as the partition is larger than the filesystem.
+
 ## Extents overflow is keyed on allocated blocks, not logical size
 
 `totalBlocks` is the number of allocation blocks a fork occupies, across all
