@@ -79,6 +79,14 @@ S_IFREG = 0o100000
 S_IFLNK = 0o120000
 S_IFDIR = 0o040000
 
+# `struct HFSPlusExtentKey`: forkType, pad, fileID, startBlock.
+EXTENT_KEY_ON_DISK_SIZE = 12
+EXTENT_KEY_BODY_LENGTH = 10
+K_DATA_FORK = 0
+K_BT_LEAF_NODE = 0xFF
+LEAF_NODE_HEIGHT = 1
+NODE_DESCRIPTOR_SIZE = 14
+
 FILE_RECORD_SIZE = 248
 FILE_RECORD_FILE_ID_OFFSET = 8
 # `struct HFSPlusCatalogFile`: recordType, flags, reserved1, fileID and five
@@ -148,12 +156,12 @@ def block_pattern(block_number: int, block_size: int) -> bytes:
 
 
 def set_data_fork(body: bytearray, extents, logical_size: int, block_size: int,
-                  clump: int = 0) -> None:
+                  clump: int = 0, total_blocks: int | None = None) -> None:
     """Write a data fork into a file record body."""
     off = FILE_RECORD_DATA_FORK_OFFSET
     struct.pack_into(">Q", body, off + FORK_LOGICAL_SIZE_OFFSET, logical_size)
     put32(body, off + FORK_CLUMP_SIZE_OFFSET, clump or block_size * 8)
-    total = sum(count for _, count in extents)
+    total = total_blocks if total_blocks is not None else sum(count for _, count in extents)
     put32(body, off + FORK_TOTAL_BLOCKS_OFFSET, total)
     for i in range(8):
         if i < len(extents):
@@ -165,11 +173,16 @@ def set_data_fork(body: bytearray, extents, logical_size: int, block_size: int,
 
 
 def build_file(template: bytes, cnid: int, mode: int, extents, logical_size: int,
-               block_size: int, target: str | None = None) -> bytes:
+               block_size: int, target: str | None = None,
+               total_blocks: int | None = None) -> bytes:
     """A file record with a mode, a data fork, and optionally a symlink target."""
     body = bytearray(build_file_record(template, cnid))
     put16(body, FILE_RECORD_BSD_INFO_OFFSET + BSD_INFO_FILE_MODE_OFFSET, mode)
-    set_data_fork(body, extents, logical_size, block_size)
+    # `totalBlocks` counts every allocated block, inline or in the tree, so a
+    # fork that overflows must declare all of them here even though only the first
+    # eight appear inline. fsck checks it against the tree.
+    set_data_fork(body, extents, logical_size, block_size,
+                  total_blocks=total_blocks)
     if target is not None:
         # Apple stores the symlink target in the data fork as UTF-8 with no
         # terminator, and the fork's logical size is its length. Mining
@@ -191,6 +204,7 @@ class Writer:
         self.next_cnid = be32(img, vh + NEXT_CATALOG_ID_OFFSET)
         self.file_count = be32(img, vh + FILE_COUNT_OFFSET)
 
+        self.extents_fork_start = be32(img, vh + 112 + 80 + 16)
         self.allocation_block = be32(img, vh + 112 + 16)
         self.catalog_start = be32(img, vh + 272 + 16)
         if self.catalog_start == 0:
@@ -210,6 +224,7 @@ class Writer:
         self.free = free_blocks(self.img, self.total_blocks)
         self.used_from_free = 0
         self.allocated = 0
+        self.overflow_records = []
         self.leaf_offset = [e[0] for e in read_leaf_records(self.leaf, self.node_size)]
 
     def catalog_node(self, n: int) -> bytearray:
@@ -263,14 +278,15 @@ class Writer:
         return chosen[:count]
 
     def add_file(self, name: str, mode: int, extents, logical_size: int,
-                 target: str | None = None, data_blocks: dict | None = None) -> int:
+                 target: str | None = None, data_blocks: dict | None = None,
+                 total_blocks: int | None = None) -> int:
         """Add one file to the root folder. Returns its CNID."""
         cnid = self.next_cnid
         self.next_cnid += 1
         self.file_count += 1
 
         body = build_file(self.file_template, cnid, mode, extents, logical_size,
-                          self.block_size, target)
+                          self.block_size, target, total_blocks)
         key = build_key(ROOT_FOLDER_ID, name)
         record = key + body
         thread = (build_key(cnid, "")
@@ -319,8 +335,116 @@ class Writer:
             return
         sys.exit("error: no folder record in the catalog leaf to update")
 
+    def add_overflow_extents(self, cnid: int, inline_count: int,
+                             overflow: list[ExtentDescriptor]) -> None:
+        """Record `overflow` in the volume's extents overflow B-tree.
+
+        A fork keeps at most `kHFSPlusExtentDensity` -- 8 -- extents inline, so
+        anything past that lives in the extents B-tree, keyed on
+        `(forkType, fileID, startBlock)` where `startBlock` is the number of
+        blocks already described. Since the inline record covers `inline_count`
+        blocks, the first overflow group is keyed `inline_count`.
+
+        Mining reference: `struct HFSPlusExtentKey` in `core/hfs_format.h`,
+        `kHFSPlusExtentDensity` beside it, and `core/hfs_extents.c`'s
+        `hfs_ext_iter_next_group`, which advances the key by the blocks already
+        described.
+        """
+        if self.extents_fork_start == 0:
+            sys.exit("error: the volume has no extents file, so nothing can overflow")
+        self.overflow_records.append((cnid, inline_count, list(overflow)))
+
+    @staticmethod
+    def extents_map_offset(header: bytes) -> int:
+        """Byte offset of the B-tree map inside a header node.
+
+        It is the start of record index 2, which the header node's offset array
+        holds at `nodeSize - 6`.
+        """
+        node_size = be16(header, 14 + 18)
+        return be16(header, node_size - 6)
+
+    def write_extents_tree(self) -> None:
+        """Write the overflow records as a header node plus one leaf.
+
+        `mkfs.hfsplus` allocates the extents fork on every volume but leaves the
+        tree empty, so the fork is there to be filled: node 0 is a valid header
+        and node 1 onward are free.
+        """
+        if not self.overflow_records:
+            return
+        bs = self.block_size
+        base = self.extents_fork_start
+
+        # A header node: the same three records mkfs wrote, with the leaf counts
+        # and pointers filled in. `struct BTNodeDescriptor` is 14 bytes and the
+        # header record follows it.
+        header = bytearray(self.img[base * bs:(base + 1) * bs])
+        hdr = 14
+        # `struct BTHeaderRec`: treeDepth, rootNode, leafRecords, firstLeafNode,
+        # lastLeafNode, nodeSize, maxKeyLength, totalNodes, freeNodes. The root
+        # has to point at the new leaf and the depth has to become 1, because
+        # fsck walks the tree from `rootNode` to decide which nodes are unused --
+        # and every node it considers unused must be entirely zero.
+        put16(header, hdr + 0, 1)                           # treeDepth
+        put32(header, hdr + 2, 1)                           # rootNode
+        put32(header, hdr + 6, len(self.overflow_records))   # leafRecords
+        put32(header, hdr + 10, 1)                          # firstLeafNode
+        put32(header, hdr + 14, 1)                          # lastLeafNode
+        # `freeNodes` is the header's count of *unused* nodes, and fsck recomputes
+        # it by walking the tree and comparing -- so a leaf that was just added
+        # makes it one smaller.
+        put32(header, hdr + 26, be32(header, hdr + 26) - 1)
+
+        # The B-tree map: one bit per node, MSB first, living in the header
+        # node's third record. fsck rebuilds this map by walking the tree and
+        # compares it against the stored one, so a node the walk visits has to
+        # have its bit set or it reports "Invalid map node".
+        #
+        # The map starts at the offset of record index 2 in the header node,
+        # which `mkfs.hfsplus` left at 0xf8 with 128 bytes of room -- more than
+        # the (totalNodes + 7) / 8 bytes a 64-node tree needs.
+        #
+        # Mining reference: lib_fsck_hfs/dfalib/SUtils.c allocates a node with
+        # `mask = 0x80 >> (nodeNumber % 8)` in byte `nodeNumber / 8`, the same
+        # convention as the volume allocation bitmap.
+        map_at = self.extents_map_offset(header)
+        needed = (64 + 7) // 8
+        if map_at + needed > bs:
+            sys.exit("error: the header node's map record is too small")
+        # Nodes 0 (header) and 1 (the new leaf) are in use.
+        header[map_at] |= 0b1100_0000
+
+        self.img[base * bs:(base + 1) * bs] = header
+
+        leaf = bytearray(bs)
+        leaf[8] = K_BT_LEAF_NODE
+        leaf[9] = LEAF_NODE_HEIGHT
+        put16(leaf, 10, len(self.overflow_records))
+        at = NODE_DESCRIPTOR_SIZE
+        offsets = []
+        for cnid, start_block, extents in self.overflow_records:
+            offsets.append(at)
+            put16(leaf, at, EXTENT_KEY_BODY_LENGTH)
+            leaf[at + 2] = K_DATA_FORK
+            leaf[at + 3] = 0            # pad
+            put32(leaf, at + 4, cnid)
+            put32(leaf, at + 8, start_block)
+            at += EXTENT_KEY_ON_DISK_SIZE
+            for i in range(8):
+                start, count = extents[i] if i < len(extents) else (0, 0)
+                put32(leaf, at, start)
+                put32(leaf, at + 4, count)
+                at += 8
+        for i, off in enumerate(offsets):
+            put16(leaf, bs - 2 * (i + 1), off)
+        put16(leaf, bs - 2 * (len(self.overflow_records) + 1), at)
+
+        self.img[(base + 1) * bs:(base + 2) * bs] = leaf
+
     def finish(self) -> None:
-        """Write the catalog, the bitmap and the volume header back."""
+        """Write the catalog, the extents tree, the bitmap and the volume header."""
+        self.write_extents_tree()
         assert_key_order(self.keys, "catalog leaf")
         new_leaf = pack_leaf(bytes(self.leaf), self.records)
 
@@ -369,7 +493,17 @@ def main() -> None:
     frag_cnid = w.add_file(
         "fragmented.bin", S_IFREG | 0o644, frag_extents, 8 * bs, data_blocks=frag_data)
 
-    # 2. A symlink, whose target lives in the data fork.
+    # 2. A file whose extents overflow into the extents B-tree: eight inline
+    #    plus two in the tree, so `Volume::read` has to resolve them.
+    over_blocks = w.take_blocks(10)
+    over_extents = [(b, 1) for b in over_blocks]
+    over_cnid = w.add_file(
+        "overflow.bin", S_IFREG | 0o644, over_extents[:8], 10 * bs,
+        data_blocks={b: block_pattern(b, bs) for b in over_blocks},
+        total_blocks=len(over_extents))
+    w.add_overflow_extents(over_cnid, 8, over_extents[8:])
+
+    # 3. A symlink, whose target lives in the data fork.
     target = "../elsewhere/target"
     link_blocks = w.take_blocks(1)
     link_payload = target.encode("utf-8")
@@ -380,13 +514,13 @@ def main() -> None:
         target=target, data_blocks=link_data)
 
     w._added = len(w.records) - added_before
-    w.bump_root_valence(2)
+    w.bump_root_valence(3)
     w.finish()
 
     # Mark the blocks we handed out. Only the real ones: a hole has no blocks,
     # and marking block 0 for it would be wrong.
     set_allocated(img, w.allocation_block,
-                  frag_blocks + link_blocks, True)
+                  frag_blocks + over_blocks + link_blocks, True)
 
     with open(args.dest, "wb") as f:
         f.write(img)
@@ -394,6 +528,8 @@ def main() -> None:
     if not args.quiet:
         print(f"{args.dest}:")
         print(f"  fragmented.bin  CNID {frag_cnid}, 8 extents at {frag_blocks}")
+        print(f"  overflow.bin    CNID {over_cnid}, 8 inline extents at "
+              f"{over_extents[:8]}, 2 more in the extents B-tree at {over_extents[8:]}")
         print(f"  link            CNID {link_cnid}, target {target!r}")
         print(f"  catalog: {added_before} -> {len(w.records)} records")
         print(f"  fileCount: {w.file_count}, nextCatalogID: {w.next_cnid}")

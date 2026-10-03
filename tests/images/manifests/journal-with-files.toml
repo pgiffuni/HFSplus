@@ -14,15 +14,15 @@ command = "mkfs.hfsplus -J -v Journaled tests/images/generated/journaled-hfsplus
 image = "tests/images/generated/journal-with-files.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "d440336c6e9e6ab0888244d747e49620b0b63125c1b6bdf38bf2185e751b247e"
+sha256_informational = "1b7e15e8e060c28641b24a6c5c37ec01390fe67de4938eae4990a334feb38bd7"
 
 [volume]
 block_size = 4096
 total_blocks = 8192
-free_blocks = 7859
+free_blocks = 7849
 volume_bytes = 33554432
-next_catalog_id = 20
-file_count = 4
+next_catalog_id = 21
+file_count = 5
 folder_count = 0
 attributes = "0x80002100"
 unmounted = true
@@ -81,9 +81,6 @@ checker_output_contains = "appears to be OK"
 # Hand-edited: what the volume must contain. `tools/genmanifests.sh` does not
 # write this section, because the expectation is the specification, not something
 # captured from the image.
-#
-# `sha256_of_data` is over the file's whole data fork as read through the public
-# API, so it pins the content, not merely the geometry.
 
 [[files]]
 name = "fragmented.bin"
@@ -92,15 +89,25 @@ size = 32768
 mode = "0o100644"
 cnid = 18
 extents = 8
-sparse = false
 note = "eight single-block extents at physically scattered blocks; each block begins with its own block number in big-endian"
+
+[[files]]
+name = "overflow.bin"
+kind = "file"
+size = 40960
+mode = "0o100644"
+cnid = 19
+extents = 10
+inline_extents = 8
+overflows = true
+note = "eight extents inline and two in the extents overflow B-tree, keyed on (forkType, fileID, startBlock); totalBlocks declares all ten while only eight are inline"
 
 [[files]]
 name = "link"
 kind = "symlink"
 size = 19
 mode = "0o120755"
-cnid = 19
+cnid = 20
 extents = 1
 target = "../elsewhere/target"
 note = "the target is stored in the data fork as UTF-8 with no terminator, which is where Apple keeps it"
