@@ -92,6 +92,32 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             header.is_hfsx(),
         )?;
 
+        // A journaled volume must be able to replay its journal before it is
+        // handed to a caller. Otherwise the volume opens on whatever is on the
+        // disk, and that filesystem is *stale*: every write the journal held is
+        // missing, with nothing saying so.
+        //
+        // Apple makes this a mount failure rather than a warning --
+        // `hfs_vfsops.c` `hfs_mount_existing` treats a NULL journal from
+        // `journal_open` as EINVAL. Here it surfaces as an error from `open`, and
+        // the journal itself is still fetched separately through
+        // [`Volume::journal`], which borrows the same device.
+        //
+        // The check is one journal-header read: `Journal::open` parses the info
+        // block, the header and any block lists, and the overlay it builds is
+        // dropped with the temporary.
+        //
+        // `Ok(None)` is *not* a failure: it is how an external journal reports
+        // itself, and such a volume is perfectly sound -- its journal is simply on
+        // a partition this reader was not given.
+        if header.is_journaled() {
+            crate::journal::Journal::open(
+                device,
+                header.journal_info_block,
+                header.block_size,
+            )?;
+        }
+
         Ok(Volume {
             device,
             header,
