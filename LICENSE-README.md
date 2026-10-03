@@ -6,10 +6,12 @@ documentation.
 
 ## 1. BSD-2-Clause — original code
 
-`LICENSE` (BSD-2-Clause) covers original glue code, tooling, tests and the
-test harness: crate scaffolding, the block-device abstraction, image
-generation scripts, the manifest format, the FUSE adapter, and the build and
-CI plumbing.
+`LICENSE` (BSD-2-Clause), Copyright (c) 2026 Pedro Giffuni, covers original glue
+code, tooling, tests and the test harness: crate scaffolding, the block-device
+abstraction, image generation scripts, the manifest format, the FUSE adapter, and
+the build and CI plumbing. Every file in this repository that is not listed in
+the derived-files table below is original work under this licence, including
+`tools/mktorn.py` and `tests/journal_recovery.rs`.
 
 ## 2. APSL-1.2 — code derived from Apple's HFS implementation
 
