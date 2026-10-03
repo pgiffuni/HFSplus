@@ -274,6 +274,28 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         })
     }
 
+    /// The volume's journal, if it has one.
+    ///
+    /// The returned [`Journal`] can hand out an overlaid device whose reads
+    /// consult the replayed blocks. Neither this nor the overlay writes to the
+    /// image: the volume type exposes no write path at all.
+    ///
+    /// Returns `Ok(None)` for a volume with no journal. The attribute bit is
+    /// checked *before* `journalInfoBlock` is used, because on a non-journaled
+    /// volume that field overlaps spare space and holds whatever was left there.
+    /// Mining reference: `core/hfs_vfsutils.c` (`hfs_MountHFSPlusVolume`) only
+    /// opens a journal when `kHFSVolumeJournaledBit` is set.
+    pub fn journal(&self) -> Result<Option<crate::journal::Journal<'a, D>>> {
+        if !self.header.is_journaled() {
+            return Ok(None);
+        }
+        crate::journal::Journal::open(
+            self.device,
+            self.header.journal_info_block,
+            self.header.block_size,
+        )
+    }
+
     /// The volume's allocation bitmap.
     pub fn allocation_bitmap(&self) -> Result<AllocationBitmap<'a, D>> {
         AllocationBitmap::open(
