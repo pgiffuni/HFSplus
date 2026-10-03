@@ -61,6 +61,11 @@ assert len(EXTERNAL_JOURNAL_UUID) == 16, "ext_jnl_uuid is 16 bytes"
 
 VOLUME_HEADER_OFFSET = 1024
 
+# `struct block_list_header`'s five fixed fields, before `binfo[]`.
+BLHDR_PREFIX_SIZE = 16
+# The block list checksum covers the first 32 bytes, with its own field zeroed.
+BLHDR_CHECKSUM_SIZE = 32
+
 JIB_OFFSET_OFFSET = 4 + 32
 JIB_SIZE_OFFSET = JIB_OFFSET_OFFSET + 8
 
@@ -265,6 +270,143 @@ def write_legacy_header(img: bytearray, args) -> None:
     print("  does this crate -- so the stale value must not stop the replay")
 
 
+def _block_list_offsets(img: bytearray) -> tuple[int, list[tuple[int, int]]]:
+    """Byte offsets of every block list in a written journal.
+
+    Returns the journal's byte offset and, per block list, the offsets of its
+    `max_blocks` field and of `binfo[0]`'s sequence word. Walking is the only
+    way to find them: the lists are a chain, each one's data length given by the
+    previous one's `bytes_used`, and nothing records where the last one ends.
+
+    Mining reference: `core/hfs_journal.c` `replay_journal` advances exactly this
+    way, by `blhdr_offset += bytes_used`.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    vh = VOLUME_HEADER_OFFSET
+    jib_off = struct.unpack_from(">I", img, vh + 12)[0] * bs
+    journal_offset = struct.unpack_from(">Q", img, jib_off + JIB_OFFSET_OFFSET)[0]
+    start = struct.unpack_from(">Q", img, journal_offset + 8)[0]
+    end = struct.unpack_from(">Q", img, journal_offset + 16)[0]
+    blhdr_size = struct.unpack_from(">I", img, journal_offset + 32)[0]
+
+    out = []
+    at = start
+    while at < end:
+        max_blocks_at = journal_offset + at
+        seq_at = journal_offset + at + BLHDR_PREFIX_SIZE + 12
+        out.append((max_blocks_at, seq_at))
+        used = struct.unpack_from(">I", img, journal_offset + at + 4)[0]
+        if used == 0:
+            break
+        at += blhdr_size + used
+    return journal_offset, out
+
+
+def _refresh_blhdr_checksum(img: bytearray, at: int, blhdr_size: int) -> None:
+    """Recompute a block list header's checksum after patching its fields.
+
+    Apple's checksum covers the whole header *and* `binfo[0]`, so patching the
+    sequence number or `max_blocks` invalidates it. Without this the fixtures
+    trip the checksum first and the rule under test is never reached -- a test
+    that passes because of a different check is worse than no test.
+
+    Mining reference: `core/hfs_journal.h` gives `checksum` the comment
+    "on-disk: checksum of this header and binfo[0]".
+    """
+    struct.pack_into(">I", img, at + 8, 0)
+    csum = checksum_with_zeroed_field(img[at:at + blhdr_size], 8, BLHDR_CHECKSUM_SIZE)
+    struct.pack_into(">I", img, at + 8, csum)
+
+
+def patch_sequences(img: bytearray, values: list[int]) -> None:
+    """Set each block list's transaction sequence number.
+
+    Sequence numbers are what tell a journal that continues from one that was
+    reset: `replay_journal` truncates when a list's number is neither the
+    previous one nor one more. Nothing else in the image records which generation
+    a list belongs to, so the numbers are the whole of it.
+
+    Mining reference: `core/hfs_journal.c`, the `last_sequence_num` comparison.
+    """
+    journal_offset, lists = _block_list_offsets(img)
+    if len(values) > len(lists):
+        sys.exit(f"error: {len(values)} sequences for {len(lists)} block lists")
+    blhdr_size = struct.unpack_from(
+        ">I", img, journal_offset + 32)[0]
+    at = struct.unpack_from(">Q", img, journal_offset + 8)[0]
+    for i, ((_max_at, seq_at), value) in enumerate(zip(lists, values)):
+        struct.pack_into(">I", img, seq_at, value)
+        _refresh_blhdr_checksum(img, journal_offset + at, blhdr_size)
+        # Walk to the next list so each checksum is refreshed at its own offset.
+        used = struct.unpack_from(">I", img, journal_offset + at + 4)[0]
+        at += blhdr_size + used
+        del i
+    print(f"  sequences set to {values}, checksums refreshed")
+
+
+def patch_max_blocks(img: bytearray, at_list: int, value: int) -> None:
+    """Overwrite one block list's `max_blocks`.
+
+    `max_blocks` is how many blocks the list could hold, so it cannot exceed the
+    blocks the journal has. `replay_journal` rejects a larger value.
+    """
+    journal_offset, lists = _block_list_offsets(img)
+    if at_list >= len(lists):
+        sys.exit(f"error: block list {at_list} does not exist ({len(lists)} present)")
+    max_blocks_at, _ = lists[at_list]
+    struct.pack_into(">H", img, max_blocks_at, value)
+    blhdr_size = struct.unpack_from(
+        ">I", img, journal_offset + 32)[0]
+    start = struct.unpack_from(">Q", img, journal_offset + 8)[0]
+    at = start
+    for _ in range(at_list):
+        used = struct.unpack_from(">I", img, journal_offset + at + 4)[0]
+        at += blhdr_size + used
+    _refresh_blhdr_checksum(img, journal_offset + at, blhdr_size)
+    print(f"  block list {at_list}: max_blocks set to {value}, checksum refreshed")
+
+
+def patch_replay_rules(img: bytearray, args) -> None:
+    """Build a journal that breaks one of the replay rules, for the tests.
+
+    Both faults are ones Apple refuses and the reader previously did not, so
+    without a fixture for each there is no evidence the refusal is wired in.
+
+    Mining reference: `core/hfs_journal.c` `replay_journal` -- the
+    `last_sequence_num` comparison, and the `max_blocks > size / jhdr_size` test.
+    """
+    with open(args.source, "rb") as f:
+        original = f.read()
+    # The rules apply to a journal with transactions in it, so start from one of
+    # the generated replay images rather than a fresh volume.
+    if args.dest.endswith(".img"):
+        pass
+
+    print(f"{args.dest}: replay-rule fixtures applied on top of the source")
+    if args.bad_sequence:
+        journal_offset, lists = _block_list_offsets(img)
+        n = len(lists)
+        if n < 2:
+            sys.exit("error: the source journal has fewer than two block lists")
+        # 1, 2, ... is the normal progression. Jumping from the second onwards is
+        # what a journal that was reset and appended to looks like, and is the
+        # case Apple truncates.
+        values = [1] + [9] * (n - 1)
+        patch_sequences(img, values)
+    if args.bad_max_blocks:
+        bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+        vh = VOLUME_HEADER_OFFSET
+        jib_off = struct.unpack_from(">I", img, vh + 12)[0] * bs
+        journal_offset = struct.unpack_from(">Q", img, jib_off + JIB_OFFSET_OFFSET)[0]
+        size = struct.unpack_from(">Q", img, jib_off + JIB_SIZE_OFFSET)[0]
+        jhdr_size = struct.unpack_from(">I", img, journal_offset + 40)[0] or bs
+        capacity = size // jhdr_size
+        patch_max_blocks(img, args.bad_max_blocks - 1, capacity + 1)
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source")
@@ -275,6 +417,11 @@ def main() -> None:
                     help="replacement payload; defaults to a recognisable pattern")
     ap.add_argument("--little-endian", action="store_true",
                     help="write the journal header little-endian, as x86 hosts do")
+    ap.add_argument("--bad-sequence", dest="bad_sequence", action="store_true",
+                    help="rewrite the transaction sequence numbers so they jump")
+    ap.add_argument("--bad-max-blocks", dest="bad_max_blocks", type=int,
+                    default=0, metavar="LIST",
+                    help="inflate block list LIST's max_blocks beyond the journal")
     ap.add_argument("--legacy-header", dest="legacy_header",
                     action="store_true",
                     help="rewrite the journal header magic to the old 'JHDR' value")
@@ -309,6 +456,8 @@ def main() -> None:
         return write_external_journal(img, journal_info_block, args)
     if args.legacy_header:
         return write_legacy_header(img, args)
+    if args.bad_sequence or args.bad_max_blocks:
+        return patch_replay_rules(img, args)
 
     # --- Journal info block ------------------------------------------------
     jib_off = journal_info_block * block_size

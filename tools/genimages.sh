@@ -130,6 +130,18 @@ if [[ -x tools/makejournal.py || -f tools/makejournal.py ]]; then
     --data "journal replayed block 300 on a 1k volume"
 fi
 
+echo "REPLAY RULE FIXTURES"
+# Two journals that break replay rules the reader previously did not enforce.
+# Both are patched over a *good* multi-transaction journal, and both refresh the
+# block-list checksum afterwards -- without that they trip the checksum first, and
+# the rule under test is never reached.
+if [[ -f tests/images/replayed/journal-replay-multi.img ]]; then
+  python3 tools/makejournal.py tests/images/replayed/journal-replay-multi.img \
+    tests/images/replayed/journal-bad-sequence.img --bad-sequence
+  python3 tools/makejournal.py tests/images/replayed/journal-replay-be.img \
+    tests/images/replayed/journal-bad-max-blocks.img --bad-max-blocks 1
+fi
+
 echo "TORN METADATA"
 # makejournal.py rewrites a block the filesystem does not reference, which
 # proves the overlay wins but not that replay repairs anything. mktorn.py writes
