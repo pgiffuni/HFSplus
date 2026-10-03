@@ -600,6 +600,131 @@ Observed on every corpus image:
 - `valence` is a reliable cross-check: it equals the number of entries `read_dir`
   returns for that directory.
 
+## The journal
+
+Mining reference: Apple `core/hfs_journal.h`, `core/hfs_journal.c`, and
+`core/hfs_vfsutils.c` for where the journal is located at mount time.
+
+### Finding the journal
+
+1. The volume header's `kHFSVolumeJournaledBit` must be set. On a non-journaled
+   volume `journalInfoBlock` overlaps spare space and holds whatever was there, so
+   it must not be consulted.
+2. `journalInfoBlock` names the *allocation block* holding a `JournalInfoBlock`.
+3. That block's `offset` and `size` place the journal on the device. Both must be
+   non-zero and the extent must lie inside the device.
+
+Measured on the corpus: `journalInfoBlock = 2`, journal offset 12288 with
+4096-byte blocks (7168 with 1024-byte blocks), size 524288 in both cases.
+
+### The journal header is not big-endian
+
+Every other HFS+ structure is big-endian. This one is **written in the native
+byte order of whichever machine wrote it**, and its `endian` field records that so
+a reader can tell:
+
+```c
+#define JOURNAL_HEADER_MAGIC  0x4a4e4c78   // 'JNLx'
+#define ENDIAN_MAGIC          0x12345678
+#define OLD_JOURNAL_HEADER_MAGIC 0x4a484452 // 'JHDR'
+```
+
+`mkfs.hfsplus` on x86 therefore writes a little-endian header inside a
+big-endian filesystem, and a reader that assumes big-endian finds a magic of zero.
+The magic itself is recognised in both orders — that is Apple's
+`jhdr->magic == SWAP32(JOURNAL_HEADER_MAGIC)` check — and the `endian` sentinel
+then selects how the numeric fields are read.
+
+Field offsets, for a 64-bit `off_t`:
+
+| Offset | Field |
+| --- | --- |
+| 0 | `magic` u32 |
+| 4 | `endian` u32 |
+| 8 | `start` u64 — first transaction |
+| 16 | `end` u64 — free space begins |
+| 24 | `size` u64 — total journal bytes |
+| 32 | `blhdr_size` u32 |
+| 36 | `checksum` u32 |
+| 40 | `jhdr_size` u32 |
+| 44 | `sequence_num` u32 |
+
+### The checksum field is zeroed before hashing
+
+The checksum field lies inside the byte range that is checksummed, so it must be
+zeroed first or it could never validate. Apple's writer:
+
+```c
+jnl->jhdr->sequence_num = sequence_num;
+jnl->jhdr->checksum = 0;
+jnl->jhdr->checksum = calc_checksum((char *)jnl->jhdr, JOURNAL_HEADER_CKSUM_SIZE);
+```
+
+and its verifier saves the original, zeroes the field, and recomputes.
+
+`JOURNAL_HEADER_CKSUM_SIZE` is `offsetof(journal_header, sequence_num)` = 44.
+Apple's comment explains the odd cutoff: the struct gained `sequence_num` after
+the checksum was defined, and checksumming it would invalidate every existing
+journal. `BLHDR_CHECKSUM_SIZE` is 32, chosen to cover the block-list header
+fields and its first entry.
+
+### The checksum is a discard-shift, not a rotate
+
+```c
+cksum = (cksum << 8) ^ (cksum + *(unsigned char *)ptr);
+return (~cksum);
+```
+
+The `<< 8` is a plain C shift on `unsigned int`, so the top bits fall off. A
+reimplementation using `wrapping_add` and `rotate_left(8)` produces different
+values and would reject every real journal. Observable difference: four bytes of
+`0xFF` leave the accumulator at `0xFEFFFFFC`, whereas a rotation would give
+`0xFFFFFFFF`.
+
+### A bad journal header checksum is not fatal
+
+`core/hfs_journal.c` `journal_open` prints a diagnostic and then:
+
+```c
+if (orig_checksum != checksum) {
+    printf("jnl: %s: open: journal checksum is bad ...
+", ...);
+    //goto bad_journal;
+}
+```
+
+The `goto` is commented out, so a volume with a stale journal-header checksum
+still mounts. Reporting it as information rather than refusing the mount is
+deliberate.
+
+### Every `mkfs_hfsplus -J` volume has an uninitialised journal
+
+Measured on both journaled corpus images:
+
+```
+flags = 0x00000005   kJIJournalInFSMask | kJIJournalNeedInitMask
+journal offset = 12288 (4096-byte blocks) or 7168 (1024-byte blocks)
+journal size = 524288
+journal header = all zeros
+```
+
+`kJIJournalNeedInitMask` means the journal exists but no transaction has ever been
+written, so the header area is untouched. A read-only mount must treat that as
+"nothing to replay", not as corruption.
+
+The corpus therefore proves detection, validation and the empty replay path, and
+**cannot** prove transaction replay: that needs a volume crashed mid-transaction,
+which cannot be produced without macOS or fault injection. `tests/journal_conformance.rs`
+asserts that gap so it stays visible rather than being implied by the absence of
+a test, and the transaction walk is covered by synthetic journals instead.
+
+### Journal replay is read-only by construction
+
+Replayed blocks go into an in-memory overlay, and reads consult it in preference
+to the device. Nothing opens the device for writing, so a wrong replay cannot
+damage the image. `tests/journal_conformance.rs` hashes the whole image before
+and after mounting, replaying and reading, and requires it to be byte-identical.
+
 ## Checklist for any new structure
 
 Before adding a parser:
