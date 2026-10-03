@@ -62,6 +62,21 @@ pub const END_BLK_NUM: u64 = 0xFFFF_FFFF;
 /// struct totals `32 * sizeof(u_int32_t)` for the leading fields, plus the UUID
 /// and serial number. The whole struct occupies one allocation block; this is the
 /// length of the declared fields, not of the block.
+///
+/// What follows the struct inside that block is **not** zero, and reading it as
+/// if it were would be wrong in either direction. `newfs_hfs`'s `makehfs.c`
+/// memsets each sector to `0xdb` before writing anything into it:
+///
+/// ```c
+/// memset(buffer, 0xdb, driveInfo->physSectorSize);
+/// ```
+///
+/// So on a volume from `mkfs_hfsplus -J` the block is 180 bytes of struct, then
+/// `0xdb` drive filler to the next 512-byte boundary, then zeros. Verified on
+/// `journaled-hfsplus`: bytes 180..512 are `0xdb`, and everything from 512 to the
+/// end of the 4096-byte block is zero. A reader that zero-fills the filler is
+/// fabricating bytes, and one that treats the filler as corruption is refusing a
+/// valid block.
 pub const JOURNAL_INFO_BLOCK_SIZE: usize = 4 + 32 + 8 + 8 + 37 + 48 + 43;
 
 /// Byte offset of the journal's byte offset within the info block.
