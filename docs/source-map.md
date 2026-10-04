@@ -356,7 +356,7 @@ compression metadata (7B.2) are done and appear above.
 | Area | Apple | Will become |
 | --- | --- | --- |
 | Catalog record updates | `core/hfs_catalog.c` `cat_update`, `catrec_update`, `buildrecord`; `core/hfs_xattr.c` | Milestone 9B |
-| Same-parent rename as an exchange | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | Milestone 9B |
+| A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | Milestone 9B |
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | Milestone 9B |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
@@ -365,6 +365,41 @@ compression metadata (7B.2) are done and appear above.
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
+
+### The "exchange" is not an exchange
+
+`cat_rename`'s `btExists` path was recorded here as a same-parent rename becoming an
+*exchange*, which is wrong, and reading it properly is worth the correction.
+
+The path allows the collision in exactly one case: after the insert reports that the
+destination exists, it searches there and compares — and proceeds only when
+
+```c
+if ((fromtype != recp->recordType) || (from_cdp->cd_cnid != cnid)) {
+        result = EEXIST;
+        goto exit;
+}
+/* The old name is a case variant and must be removed */
+```
+
+Same record type *and* same CNID. Anything else is `EEXIST`. So the case is not two
+objects swapping names; it is **one object under two spellings**, which on a
+case-insensitive volume are the same key to the tree. The comment says so: "the old
+name is a case variant".
+
+That makes it a re-key rather than a move, and it is why the ordering differs. The
+insert runs *before* the remove — the right order in general, because the new record
+carries the old body and nothing has to be reconstructed if the insert fails. But for
+a re-key the insert finds the very record that is about to leave and refuses it as a
+duplicate, so this case has to remove first, and the bytes are already read so a
+failure puts them straight back.
+
+Not implemented, and the reason is recorded rather than guessed: doing the remove
+first made the *removal* fail to find the record. That is the next thing to work out,
+and it is not a matter of a missing comparison — `catalog_record_bytes` matches names
+exactly and the source spelling is the one stored. Something else in the re-key path is
+wrong, and an attempt that removed the record and then failed to put it back was
+reverted rather than kept.
 
 ## What Milestone 8 has and has not reached
 

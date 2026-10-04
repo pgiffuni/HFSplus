@@ -314,18 +314,24 @@ volume refuses, and then asserts the volume is still clean by both checkers.
 
 What is *not* yet true of any mutation here:
 
-- **The catalog cannot grow.** Splitting allocates a node from the header's map,
-  and that is the only node source implemented. Extending the B-tree file means
-  allocating blocks for it, so a catalog with eight nodes fills at about forty
-  files and then reports `NoSpace` — honestly, and with nothing written.
-- **No folders.** A file can be created in the root or any existing folder, but no
-  folder can be created, and `folderCount` in the header is never written.
-
-- **No structural change.** The record is replaced only at its original length,
-  because a length change moves every later record in the node. No B-tree node
-  has been created, split or deleted, so the extent mapper and the node
-  descriptor are exercised as readers only. Growth stays inside the eight inline
-  extent slots for the same reason: the record's size cannot change.
+- **The catalog grows in clumps, and only eight times.** Growth allocates at least
+  one clump -- 32 KiB on this corpus -- and the catalog's extents live in the volume
+  header, which has eight inline slots. Past that the answer is a refusal naming the
+  extents B-tree, and the 1 MiB corpus volumes run out of contiguous clumps long
+  before that.
+- **No structural change to a record in place.** A record is replaced only at its
+  original length, because a length change moves every later record in the node.
+  That is why growth and shrinking stay inside the eight inline extent slots, and
+  why a rename *removes and re-inserts* rather than rewriting a key in place: a new
+  name is a different length.
+- **A rename between two spellings of one name is refused.** On a case-insensitive
+  volume `Readme.txt` and `README.TXT` are one key to the tree, so this is a re-key
+  rather than a move, and it needs the remove to happen first -- which is not the
+  order the general case uses. See `docs/source-map.md` for why, and for what is
+  still unexplained about it.
+- **A folder is never moved beneath itself or one of its own descendants.** The
+  check walks the destination path back to the root looking for the source
+  directory; nothing here does.
 - **No journal.** `WritableVolume::open` refuses a journaled volume, so every
   mutation above runs on a volume with no journal. The checker therefore never
   has to reason about a transaction it did not write.
