@@ -191,6 +191,16 @@ if [[ -f tests/images/generated/journaled-hfsplus.img ]]; then
     tests/images/replayed/journal-external.img --external-journal
 fi
 
+# A volume whose catalog is written from nothing rather than cloned. `mkfiles.py`
+# copies the records mkfs.hfsplus wrote, which is safe but cannot create the first
+# file -- and Milestones 8 and 9 both need to. Kept as a separate tool with an
+# explicit path; an attempt to fold it into mkfiles.py emitted keys with the wrong
+# keyLength and fsck.hfsplus rejected the image.
+if [[ -f tests/images/generated/basic-hfsplus.img ]]; then
+  python3 tools/mkbootstrap.py tests/images/generated/basic-hfsplus.img \
+    tests/images/generated/bootstrapped-catalog.img --volume BasicVolume
+fi
+
 echo "FILES WITH DATA"
 # mkfs.hfsplus creates an empty volume and cannot put a file in it, so the whole
 # corpus has no file with data except the two newfs_hfs makes for its journal.
