@@ -199,6 +199,13 @@ fi
 if [[ -f tests/images/generated/basic-hfsplus.img ]]; then
   python3 tools/mkbootstrap.py tests/images/generated/basic-hfsplus.img \
     tests/images/generated/bootstrapped-catalog.img --volume BasicVolume
+
+  # The same, plus one file. Milestone 8's first mutation needs a volume that is
+  # not journaled -- so writing to it does not need a journal, which is a later
+  # milestone -- and has a file whose record can be replaced in place.
+  python3 tools/mkbootstrap.py tests/images/generated/basic-hfsplus.img \
+    tests/images/generated/bootstrapped-with-file.img --volume BasicVolume \
+    --with-file payload.bin
 fi
 
 echo "FILES WITH DATA"

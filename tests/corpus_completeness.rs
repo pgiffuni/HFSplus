@@ -60,6 +60,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ("generated", "journal-with-files"),
     ("generated", "journal-with-attributes"),
     ("generated", "bootstrapped-catalog"),
+    ("generated", "bootstrapped-with-file"),
     // tools/makejournal.py, journal replay
     ("replayed", "journal-replay-be"),
     ("replayed", "journal-replay-le"),

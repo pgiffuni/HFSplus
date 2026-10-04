@@ -35,8 +35,20 @@ Mining reference: `core/hfs_format.h` `struct HFSPlusCatalogKey` and
 `HFSPlusCatalogThread`; `newfs_hfs/mkfshfs.c` for the two records a fresh volume
 starts with.
 
+A starter file
+-------------
+`--with-file NAME` adds one regular file with a single block of content, which is
+what the first mutation tests need: a volume that is not journaled (so writing to
+it does not require a journal, which is a later milestone) and has a file whose
+record can be replaced in place.
+
+The record is synthesised here rather than cloned because `mkfiles.py`'s cloning
+needs an existing file record and a bootstrapped catalog has none. Keeping
+synthesis in one place is the point: the attempt to do it in two tools is what
+produced the malformed-key generator that was reverted.
+
 Usage:
-    tools/mkbootstrap.py <in.img> <out.img> [--volume NAME]
+    tools/mkbootstrap.py <in.img> <out.img> [--volume NAME] [--with-file NAME]
 """
 import argparse
 import struct
@@ -50,11 +62,23 @@ CATALOG_KEY_PREFIX = 2
 CATALOG_KEY_PARENT_ID = 4
 CATALOG_KEY_NAME_LEN = 2
 
-# kHFSPlusCatalogThread and kHFSPlusFolderRecord, and sizeof(HFSPlusCatalogFolder).
+# kHFSPlusCatalogFile, kHFSPlusCatalogThread and kHFSPlusFolderRecord, and
+# sizeof(HFSPlusCatalogFolder).
+FILE_RECORD = 2
 THREAD_RECORD = 4
+FILE_THREAD_RECORD = 4
 FOLDER_THREAD_RECORD = 3
 FOLDER_RECORD = 1
 FOLDER_RECORD_SIZE = 88
+FILE_RECORD_SIZE = 248
+
+# Offset of a catalog record's data fork: past the type, flags, id, five
+# timestamps, reserved, the BSD info, both Finder info blocks, the text encoding
+# and the second reserved field.
+FILE_DATA_FORK = 88
+FILE_BSD_INFO = 32
+BSD_FILE_MODE = 10
+S_IFREG = 0o100000
 # The header node of a freshly formatted catalog holds the BTHeaderRec, which
 # carries maxKeyLength; the two values below are Apple's constants.
 CATALOG_MAX_KEY_LENGTH = 516
@@ -142,7 +166,41 @@ def root_folder_thread(volume_name: str) -> bytes:
     return key(ROOT_FOLDER_ID, "") + body
 
 
-def write_catalog(img: bytearray, volume_name: str) -> None:
+def file_record(cnid: int, start_block: int, logical_size: int, total_blocks: int) -> bytes:
+    """A synthesised `kHFSPlusFileRecord` with one block of data.
+
+    Every field the format requires is set; everything else is legitimately zero,
+    including the five timestamps, where zero means "never set" rather than 1904.
+    """
+    body = bytearray(FILE_RECORD_SIZE)
+    struct.pack_into(">h", body, 0, FILE_RECORD)
+    struct.pack_into(">I", body, 8, cnid)
+    struct.pack_into(">H", body, FILE_BSD_INFO + BSD_FILE_MODE, S_IFREG | 0o644)
+    # The data fork: logicalSize, clumpSize, totalBlocks, then eight descriptors.
+    struct.pack_into(">Q", body, FILE_DATA_FORK, logical_size)
+    struct.pack_into(">I", body, FILE_DATA_FORK + 12, total_blocks)
+    struct.pack_into(">II", body, FILE_DATA_FORK + 16, start_block, total_blocks)
+    return bytes(body)
+
+
+def file_thread(cnid: int, parent_id: int, name: str) -> bytes:
+    """A file's thread record.
+
+    The key's parentID is the *object itself* -- the file's CNID -- while the
+    body names the parent and repeats the object's own name. Passing zero for the
+    key would leave the record unreachable by name, which `fsck.hfsplus` reports
+    as an invalid catalog record type.
+    """
+    units = name.encode("utf-16-be")
+    body = (struct.pack(">h", FILE_THREAD_RECORD)
+            + struct.pack(">H", 0)
+            + struct.pack(">I", parent_id)
+            + struct.pack(">H", len(units) // 2)
+            + units)
+    return key(cnid, "") + body
+
+
+def write_catalog(img: bytearray, volume_name: str, starter: str | None) -> None:
     """Replace the catalog file with the two records a fresh volume starts with."""
     bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
     fork = VOLUME_HEADER_OFFSET + CATALOG_FORK_OFFSET
@@ -161,6 +219,39 @@ def write_catalog(img: bytearray, volume_name: str) -> None:
     # Order matters: the folder record sorts before its thread because the keys
     # differ, and the tree is only valid if they are in ascending order.
     records = [root_folder_record(volume_name), root_folder_thread(volume_name)]
+    if starter is not None:
+        cnid = FIRST_USER_CNID
+        # One free block for the content, taken from the bitmap's free list.
+        bitmap_start = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 112 + 16)[0]
+        total = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 44)[0]
+        free = [b for b in range(1, total)
+                if not img[bitmap_start * node_size + b // 8] & (0x80 >> (b % 8))]
+        if not free:
+            sys.exit("error: no free block for the starter file")
+        block = free[-1]
+        # A recognisable byte pattern, so a read from the wrong block shows.
+        img[block * node_size:(block + 1) * node_size] = bytes(
+            range(256)
+        ) * (node_size // 256)
+        img[bitmap_start * node_size + block // 8] |= 0x80 >> (block % 8)
+        # Allocating a block means updating the header's free count too; fsck
+        # recomputes it rather than trusting it ("Invalid volume free block count").
+        before_free = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 48)[0]
+        struct.pack_into(">I", img, VOLUME_HEADER_OFFSET + 48, before_free - 1)
+        print(f"  volume header freeBlocks {before_free} -> {before_free - 1}")
+        records.append(key(ROOT_FOLDER_ID, starter)
+                       + file_record(cnid, block, node_size, 1))
+        records.append(file_thread(cnid, ROOT_FOLDER_ID, starter))
+        # The root now has one child.
+        for i, rec in enumerate(records):
+            if struct.unpack_from(">h", rec, 2 + struct.unpack_from(">H", rec, 0)[0])[0] == FOLDER_RECORD:
+                rec = bytearray(rec)
+                struct.pack_into(">I", rec, 2 + struct.unpack_from(">H", rec, 0)[0] + 4, 1)
+                records[i] = bytes(rec)
+                break
+        print(f"  starter file {starter!r}: CNID {cnid}, block {block}, {node_size} bytes")
+        print(f"  fileCount 1, nextCatalogID {FIRST_USER_CNID + 1}")
+    records.sort(key=lambda r: key_parts(r))
     assert_key_order(records)
     offsets = []
     at = 14
@@ -231,7 +322,7 @@ def write_catalog(img: bytearray, volume_name: str) -> None:
     # `blockSize`, so writing 1 to the wrong slot sets the *block size* to one and
     # every later parse fails for an unrelated-looking reason.
     vh = VOLUME_HEADER_OFFSET
-    struct.pack_into(">I", img, vh + 32, 0)                    # fileCount: none yet
+    struct.pack_into(">I", img, vh + 32, 1 if starter else 0)  # fileCount
     # folderCount excludes the root directory itself, so a volume holding nothing
     # reports 0. fsck.hfsplus normalises 1 to 0, and counting the root here is the
     # kind of plausible value only an independent checker catches.
@@ -240,12 +331,26 @@ def write_catalog(img: bytearray, volume_name: str) -> None:
     # are reserved, with 2 the root folder. Handing out anything below that would
     # eventually collide with a reserved ID, and fsck.hfsplus normalises a smaller
     # value to 16 with "Volume header needs minor repair".
-    struct.pack_into(">I", img, vh + 64, FIRST_USER_CNID)  # nextCatalogID
+    struct.pack_into(">I", img, vh + 64,
+                     FIRST_USER_CNID + (1 if starter else 0))  # nextCatalogID
 
-    print(f"  catalog at block {start}: 2 records, node map 0xc0")
+    print(f"  catalog at block {start}: {len(records)} records, node map 0xc0")
     for rec, label in ((records[0], "root folder"), (records[1], "root thread")):
         declared = struct.unpack_from(">H", rec, 0)[0]
         print(f"    {label:12s} keyLength {declared}, record {len(rec)} bytes")
+
+
+def key_parts(rec: bytes) -> tuple:
+    """A record's key as `(parentID, nameLength, name)`.
+
+    Sorted on *length before content*, which is what Apple's catalog comparator
+    does -- so `"z"` sorts after `"abc"`. Extracted here so the sort and the
+    order check use the same reading.
+    """
+    parent = struct.unpack_from(">I", rec, CATALOG_KEY_PREFIX)[0]
+    count = struct.unpack_from(">H", rec, CATALOG_KEY_PREFIX + CATALOG_KEY_PARENT_ID)[0]
+    at = CATALOG_KEY_PREFIX + CATALOG_KEY_PARENT_ID + 2
+    return (parent, count, rec[at:at + count * 2])
 
 
 def assert_key_order(records: list[bytes]) -> None:
@@ -255,14 +360,7 @@ def assert_key_order(records: list[bytes]) -> None:
     comparator uses, so a shorter name sorts before a longer one regardless of its
     letters.
     """
-    def parts(rec: bytes) -> tuple:
-        parent = struct.unpack_from(">I", rec, CATALOG_KEY_PREFIX)[0]
-        count = struct.unpack_from(">H", rec, CATALOG_KEY_PREFIX + CATALOG_KEY_PARENT_ID)[0]
-        name = rec[CATALOG_KEY_PREFIX + CATALOG_KEY_PARENT_ID + 2:
-                   CATALOG_KEY_PREFIX + CATALOG_KEY_PARENT_ID + 2 + count * 2]
-        return (parent, count, name)
-
-    parsed = [parts(r) for r in records]
+    parsed = [key_parts(r) for r in records]
     for (p0, n0, b0), (p1, n1, b1) in zip(parsed, parsed[1:]):
         if (p0, n0, b0) >= (p1, n1, b1):
             sys.exit(
@@ -274,6 +372,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source")
     ap.add_argument("dest")
+    ap.add_argument("--with-file", dest="starter", default=None,
+                    help="also create one regular file with a single block of content")
     ap.add_argument("--volume", default=None,
                     help="volume name; read from the source when omitted")
     args = ap.parse_args()
@@ -288,7 +388,7 @@ def main() -> None:
         # must say what it is.
         sys.exit("error: --volume is required; the name is not in the header")
 
-    write_catalog(img, name)
+    write_catalog(img, name, args.starter)
     with open(args.dest, "wb") as f:
         f.write(bytes(img))
     print(f"{args.dest}: bootstrapped a catalog for volume {name!r}")
