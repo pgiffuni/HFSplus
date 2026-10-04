@@ -32,6 +32,37 @@ The write side is thinner than the read side, but the shapes are known:
 What does not exist: an allocator, a B-tree *writer* (insert, split, and the node
 map), and any notion of a volume being created or checked.
 
+## Milestone 7 — complete
+
+All five workstreams are done to the level the milestone asks for: the model is
+established and documented, not merely sketched.
+
+| workstream | state |
+| --- | --- |
+| 7A fork model | `src/format/fork.rs`, validated, non-sparse rule documented and enforced |
+| 7A.1 resource forks | a real catalog fork; the three findings and the four-way split on `Object` |
+| 7B attributes file | key, record and reader; `names.rs` for the system's own entries |
+| 7B.2 compression metadata | location and hiding established; decoding deliberately absent |
+| 7C timestamps | `HfsTimestamp`; epoch, clamp and unset rules documented and tested |
+| 7D writable device | `BlockDeviceMut` and `WritableVolume`, with a test that makes each a failure |
+| 7E mutation invariants | `docs/mutation-invariants.md` |
+
+Three things the mining overturned, each of which would have been expensive to
+discover later:
+
+- **FinderInfo is not in the catalog record.** The 16-byte `HFSPlusBSDInfo` has no
+  such field; HFS+ kept FinderInfo in the attributes tree. An assumption carried
+  over from classic HFS, and wrong.
+- **A resource fork is a real fork, not an attribute.** macOS also surfaces it as
+  `com.apple.ResourceFork`, but that name belongs to the POSIX boundary.
+- **A compressed file's data fork does not contain its contents**, and its
+  resource fork is reported *empty* rather than read. So "empty" and "truncated"
+  both have a second explanation that is not corruption.
+
+What is deliberately not built: any mutation. `WritableVolume` establishes that a
+volume is safe to change and then stops, so the next person inherits a boundary
+rather than an invitation.
+
 ## Where this actually stands
 
 More of step 2 and 3 than expected is done, because both turned out to be
