@@ -208,6 +208,24 @@ checker_output_contains = "appears to be OK"
 print(toml, end="")
 PYEOF
 )
+  # `[[files]]` is hand-edited -- AGENTS.md says so -- so a regenerated manifest
+  # must carry the previous one forward or every regeneration silently drops the
+  # file specification. The generated sections are reproducible; that one is not,
+  # and losing it is how a manifest stops describing what it is meant to.
+  #
+  # Preserved rather than regenerated deliberately: capturing what the volume
+  # actually holds from the volume it was generated from would make the
+  # specification a transcript rather than a claim.
+  if [[ -f "${MAN_DIR}/${name}.toml" ]]; then
+    hand_edited=$(awk '
+      /^# Hand-edited/ { capture = 1 }
+      capture { print }
+    ' "${MAN_DIR}/${name}.toml")
+    if [[ -n "${hand_edited}" ]]; then
+      printf '\n%s\n' "${hand_edited}" >> "${summary}"
+    fi
+  fi
+
   echo "$summary" > "${MAN_DIR}/${name}.toml"
   echo "done"
 done

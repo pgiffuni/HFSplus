@@ -1,8 +1,6 @@
-# Test images are generated, not committed. See tests/images/README.md.
+# Test images ARE committed: a suite that needs hfsprogs installed only runs
+# where hfsprogs is installed. They are small (1 MiB each) for that reason.
 /target
-tests/images/generated/
-tests/images/malformed/
-tests/images/replayed/
 tests/images/public/*
 tests/images/macos/*
 !tests/images/public/.gitkeep

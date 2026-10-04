@@ -74,25 +74,34 @@ echo "output       : ${OUT_DIR}"
 echo
 
 echo "BASIC"
-make_image basic-hfsplus      32 -v "BasicVolume"
-make_image basic-hfsplus-1k   32 -v "SmallBlocks"  -b 1024
-make_image basic-hfsplus-8k   64 -v "LargeBlocks"  -b 8192
-make_image basic-hfsplus-16k  64 -v "HugeBlocks"   -b 16384
+# Sizes are chosen to be the smallest that still exercises the volume, because
+# these images are committed rather than generated: at 1 MiB the whole corpus is
+# a few tens of megabytes and a clone carries its own fixtures, so the suite runs
+# on a platform with no hfsprogs -- FreeBSD, say.
+#
+# 1 MiB is the floor for the 4 KiB and smaller block sizes: mkfs reserves about
+# 645 blocks for the journal, the four special forks and the catalog, and the
+# fixtures below want a few dozen more. 16 KiB blocks need 2 MiB for the same
+# reason -- at 1 MiB a 16 KiB-block volume has only 64 blocks in total.
+make_image basic-hfsplus      1 -v "BasicVolume"
+make_image basic-hfsplus-1k   1 -v "SmallBlocks"  -b 1024
+make_image basic-hfsplus-8k   1 -v "LargeBlocks"  -b 8192
+make_image basic-hfsplus-16k  2 -v "HugeBlocks"   -b 16384
 
 echo "NAMES / CASE"
 # HFSX case-sensitive: -s changes the volume signature to kHFSXSigWord (0x4858).
-make_image hfsx-case-sensitive  32 -v "CaseSensitive" -s
-make_image hfsx-case-insensitive 32 -v "CaseInsensitive"
+make_image hfsx-case-sensitive  1 -v "CaseSensitive" -s
+make_image hfsx-case-insensitive 1 -v "CaseInsensitive"
 
 echo "JOURNALING"
 # -J creates a journaled volume. hfsprogs clamps the size to its own minimum.
-make_image journaled-hfsplus    32 -v "Journaled" -J
-make_image journaled-hfsplus-1k 32 -v "Journaled1K" -J -b 1024
+make_image journaled-hfsplus    1 -v "Journaled" -J
+make_image journaled-hfsplus-1k  1 -v "Journaled1K" -J -b 1024
 
 echo "LEGACY"
 # -h creates a classic HFS volume wrapped for Mac OS 9 bootability. This crate
 # must recognise the signature and refuse it cleanly, not misparse it.
-make_image classic-hfs          32 -h -v "ClassicVolume"
+make_image classic-hfs          1 -h -v "ClassicVolume"
 
 echo
 echo "JOURNAL REPLAY"

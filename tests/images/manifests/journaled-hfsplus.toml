@@ -14,13 +14,13 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/journaled-hfsplus.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "4182ff949788fe959936ffdd655bcaf8901a5aac3cfea61d3597452ea09c66e4"
+sha256_informational = "28eecc34a90fe89faa63ce8a110a3f5c6f6ef9f140b66a44288f1227bd3a5c6a"
 
 [volume]
 block_size = 4096
-total_blocks = 8192
-free_blocks = 7868
-volume_bytes = 33554432
+total_blocks = 256
+free_blocks = 92
+volume_bytes = 1048576
 next_catalog_id = 18
 file_count = 2
 folder_count = 0
@@ -34,16 +34,16 @@ logical_size = 4096
 total_blocks = 1
 
 [forks.extentsFile]
-logical_size = 262144
-total_blocks = 64
+logical_size = 32768
+total_blocks = 8
 
 [forks.catalogFile]
-logical_size = 262144
-total_blocks = 64
+logical_size = 32768
+total_blocks = 8
 
 [forks.attributesFile]
-logical_size = 262144
-total_blocks = 64
+logical_size = 65536
+total_blocks = 16
 
 [forks.startupFile]
 logical_size = 0

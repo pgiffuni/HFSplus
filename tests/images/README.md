@@ -1,8 +1,19 @@
 # HFS+ / HFSX test corpus
 
-Images are **not** committed. They are generated, verified, and described by
-manifests, because a 32 MiB image per case is not something to put in Git and
-because a regenerated image is evidence that the recipe still works.
+Images are **committed**, at 1 MiB each -- 2 MiB for the 16 KiB-block volume,
+which needs more blocks to cover the same metadata. They were not committed
+before, because they were 32 MiB each and that is not something to put in Git.
+
+They are now committed so that the suite runs anywhere. The previous policy
+meant `cargo test` required `hfsprogs` to be installed, which is a reasonable
+assumption on the machine that developed this and a false one anywhere else --
+a fresh FreeBSD box being the case that matters. A committed corpus makes the
+tests portable; the cost is 31 MB, and the images stay sparse on disk so they
+cost far less than that in a working tree.
+
+Regenerating is still how you change one, and `tests/corpus_completeness.rs`
+checks that the derived ones regenerate byte-identically -- so a committed image
+and a regenerated one cannot quietly diverge.
 
 ## Layout
 
@@ -10,8 +21,8 @@ because a regenerated image is evidence that the recipe still works.
 tests/images/
     README.md        this file
     manifests/       one TOML per image: the test specification (committed)
-    generated/       built by tools/genimages.sh   (gitignored)
-    malformed/       built by tools/genmalformed.sh (gitignored)
+    generated/       built by tools/genimages.sh   (committed)
+    malformed/       built by tools/genmalformed.sh (committed)
     public/          externally sourced images     (gitignored, see below)
     macos/           built on macOS with real Apple metadata (gitignored)
     expected/        expected tree listings and hashes for comparison (committed)

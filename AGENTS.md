@@ -65,13 +65,22 @@ cargo test                # everything
 cargo clippy --all-targets
 ```
 
-Images are generated, never committed:
+Images are generated *and committed*. They are small -- 1 MiB each, 2 MiB for the
+16 KiB-block volume -- because a suite that needs `hfsprogs` to run is a suite
+that only runs where `hfsprogs` is installed, which is not every platform worth
+testing on. A committed corpus means `cargo test` works on a fresh FreeBSD box.
 
 ```sh
 tools/genimages.sh        # 9 good images, each verified with fsck.hfsplus
 tools/genmanifests.sh     # one manifest per image, captured from ground truth
-tools/genmalformed.sh     # 11 deliberately corrupted images
+tools/genmalformed.sh     # 14 deliberately corrupted images
 ```
+
+Regenerating is still the way to change them, and the images stay reproducible:
+`tests/corpus_completeness.rs` checks every fixture exists and that the derived
+ones regenerate byte-identically. It exists because sixty-odd tests skip
+silently when a fixture is missing, which would turn a broken recipe into a green
+run.
 
 A manifest is the test specification. `[volume]`, `[forks]` and `[verify]` are
 generated from the image and from the Apple checker; only `[source]`,
