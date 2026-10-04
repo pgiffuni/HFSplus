@@ -1107,6 +1107,95 @@ backwards:
   the free offset moves down; the bytes above it are reused by the next insertion
   and are not cleared.
 
+### An index record holds the *first* key of its subtree
+
+The child for a search key is the index record with the **greatest key not
+exceeding it**. Both halves of that matter, and both have a plausible opposite:
+
+- The record's key is the first key of the subtree it points at -- not the last key
+  of the subtree *before* it, which is the other convention and which a binary
+  search reads just as happily.
+- So the search is an **upper bound** over the separators. A lower bound -- the
+  first separator greater than or equal to the key -- is the rule for the other
+  convention, and against this one it misses silently: the tree still parses, still
+  searches, and returns a subtree that does not contain the key.
+
+The child is the first `u32` after the key, so an index record is exactly
+`[u16 keyLength][key][u32 child]`. Copying a leaf record whole and appending the
+child puts the child after the *body*, where no reader looks: `GetChildNodeNum`
+reads from `CalcKeySize` bytes past the record's start, and `CalcKeySize` is
+`key.length16 + 2`.
+
+A key above every separator belongs to the **last** separator's subtree, which
+runs to the end of the tree with nothing above it to stop at. That is the ordinary
+case for every thread record once the file records are past the last one.
+
+### Node height is `treeDepth` less the number of index levels above
+
+Not the usual "root is tallest". A node's height is `treeDepth - levels`, so:
+
+| Tree | `treeDepth` | Root | Leaf |
+| --- | --- | --- | --- |
+| one leaf, which is the root | 1 | 1 (the leaf) | 1 |
+| an index node above the leaves | 2 | 2 | 1 |
+
+`mkfs.hfsplus` writes the first case as `treeDepth` 1 with the leaf at height 1,
+which is the same rule with zero index levels. Introducing an index node is
+therefore a change to the header *and* to the node: the new root takes the new
+depth, and the leaves keep height 1.
+
+### `treeDepth` counts the leaf level
+
+A catalog with one leaf has `treeDepth == 1` and its root *is* that leaf --
+`BTInsertRecord`'s empty-tree case creates a leaf and sets `treeDepth = 1`. So
+"does this leaf have a parent above it" is `rootNode == leafNode`, never
+`treeDepth == 0`: there is no such tree, and asking for one finds a depth-1 catalog
+whose root is a leaf and concludes a parent exists.
+
+### Nodes are allocated from a map *record inside the header node*
+
+From record index 2 onward, the header node's records are bitmaps -- one bit per
+node, most significant bit first, covering `record_length * 8` nodes each, chained
+by the header node's `fLink`. `GetMapNode` starts at `mapIndex = 2`; the records
+before it are the `BTHeaderRec` and a spare.
+
+Reading the header record as a bitmap hands out node 0, and node 0 is the header
+node: writing an index node over it produces a volume that still parses as a
+catalog and has simply lost its header record.
+
+## An open disagreement: `fsck` rejects a catalog above 40 files
+
+`fsck.hfsplus` accepts a catalog this crate builds up to 40 files in the
+`bootstrapped-with-file` fixture, and reports
+
+```
+** Checking catalog file.
+   Invalid index key
+(4, 7)
+```
+
+at 41 and above. This crate's own checker reports the volume clean at every size,
+and every invariant it checks still holds: key order within each leaf, ascending
+index keys, one index record per leaf, `leafRecords` matching the records present,
+the sibling chain, and the node heights.
+
+The boundary is exact, and the only thing that differs between 40 and 41 is the
+catalog's **last leaf**. It holds `payload.bin`, the file records that sort after
+it, and *every* thread record -- thread keys carry the file's CNID as their
+parentID, so they all sort past every parentID-2 key -- which means that leaf grows
+without ever splitting and without any of its records moving. Nothing else about
+the tree changes.
+
+Not yet explained. Recorded rather than resolved because the two authorities
+disagree and neither has been shown wrong; the test for node exhaustion therefore
+does not assert `fsck` cleanliness, with a comment saying why.
+
+Worth separating from this: `check::check`'s own height rule *was* wrong, in the
+same area, and fixing it is what brought the two into agreement below the threshold.
+Its formula read `tree_depth - level + 1` where the answer is `level`, and it
+appeared three times in that file. On a one-leaf catalog the two agree, which is
+why nothing noticed.
+
 ## Checklist for any new structure
 
 Before adding a parser:

@@ -350,20 +350,48 @@ Apple's — not proof of Apple compatibility.
 
 # Not yet mined
 
-Milestones 7 through 13 depend on all of these, and none has been translated:
+Milestones 9 through 13 depend on all of these. Resource fork semantics (7A.1) and
+compression metadata (7B.2) are done and appear above.
 
 | Area | Apple | Will become |
 | --- | --- | --- |
-| Resource fork semantics | `core/hfs_xattr.c`, `FileMgrInternal.h` | 7A.1 |
-| Catalog mutation | `core/hfs_catalog.c` `cat_create`, `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildkey`, `buildrecord`, `buildthread` | Milestone 9 |
+| Catalog mutation beyond create | `core/hfs_catalog.c` `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildrecord` | Milestone 9 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
-| Compression metadata | `core/hfs_attrlist.c`, `core/hfs_cnode.c` (`decmpfs`) | 7B.2 |
-| B-tree node splitting | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path; `core/BTreeAllocate.c` node allocation | Milestone 8F |
-| The extents B-tree | `core/hfs_extents.c` `extents_search`, `AddExtents`; overflow records | Milestone 8D |
+| Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records; `core/hfs_btreeio.c` `ExtendFile`, `BTAddNewBlock` | Milestone 8D |
+| **Extending a B-tree file** | `core/BTreeAllocate.c` `ExtendBTree`, `ExtendBTreeFile` | Milestone 8F |
+| Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
+| Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
 
-Until those rows are filled, this crate can create an empty file, and overwrite,
-grow or truncate its contents within eight inline extents. It cannot create a
-folder, remove or rename a file, overflow a fork into the extents tree, split a
-B-tree node, or write to a volume with a journal.
+## What Milestone 8 has and has not reached
+
+Done and `fsck`-verified: overwrite, grow and truncate a file's contents within
+its eight inline extents; create an empty file, keeping the file record, its
+thread record, the parent folder's child count and `nextCatalogID` in step; insert
+and remove a record in a node; and split a leaf, which is what lets a catalog grow
+past one node and is where three separate reader bugs were found.
+
+Three limits are structural rather than unfinished, and each is refused by name
+rather than approximated:
+
+- **The catalog cannot grow.** `AllocateNode` finds a spare node in the header's
+  map, and that is the only source this crate implements. Extending the B-tree
+  file means allocating blocks for it, which is Milestone 8F. So a catalog with
+  eight nodes fills at about forty files and then reports `NoSpace`.
+- **A fork cannot overflow into the extents tree.** Nine extents and the answer is
+  a refusal naming 8D.
+- **Nothing can be written to a journaled volume.** `WritableVolume::open` refuses
+  one, because a write that is not journalled leaves a journal that does not
+  describe the volume.
+
+Two things are refused for a different reason, because the alternative is worse
+than a refusal. A catalog more than two levels deep, whose parent index node would
+itself need splitting, is Milestone 8G; and a leaf split divides by bytes, so a
+tree that would end up three levels deep is refused rather than half-split.
+
+One unresolved disagreement is recorded in `docs/hfs-format.md`: above forty files
+in the `bootstrapped-with-file` fixture, `fsck.hfsplus` reports "Invalid index key"
+while every invariant this crate checks still holds. The boundary is exact and the
+only thing that changes across it is the catalog's last leaf, which takes every
+thread record and so grows without ever splitting. Not yet explained.

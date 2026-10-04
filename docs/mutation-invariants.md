@@ -163,8 +163,10 @@ from Apple's own code agrees with.
 
 # Coverage, as of this writing
 
-One mutation exists: `WritableVolume::write_file_contents`, replacing or growing
-a file's contents in place.
+One mutation entry point exists, `WritableVolume`, with four operations on it:
+`write_file_contents` (overwrite, grow or truncate in place), `truncate_file`,
+`create_file`, and the node splitting that `create_file` needs once a catalog leaf
+fills.
 
 | Invariant | Holds because | Tested by |
 | --- | --- | --- |
@@ -207,12 +209,34 @@ Node mutation is asserted by the property rather than by the bytes:
 checks that each original record is intact, that the new one is where it was asked
 for, and that the used region grew by exactly one record.
 
+Node mutation is asserted by the property rather than by the bytes, because the
+bytes were wrong four times before they were right:
+
+| Property | Test |
+| --- | --- |
+| every record survives an insertion, at its new offset, with its bytes intact | `every_record_is_still_findable_after_an_insertion`, at every index from 0 to the record count |
+| removal is the inverse of insertion | `removal_is_the_inverse_of_insertion`, at every index |
+| a split leaves a tree a reader can still search | `creating_enough_files_splits_the_catalog_and_leaves_it_consistent`, and `every_file_survives_a_split_findable_by_name_and_by_cnid` — every file, by both routes |
+| a split keeps the header's counts honest | `leafRecords` recounted against the leaves; one index record per leaf |
+
+That last one exists because a split that forgets to advance `leafRecords` for the
+record that *caused* it leaves the count short by one, and `fsck` recounts.
+
+**Two independent checkers, and where they agree.** Node splitting was the first
+mutation to produce an image with an index node, and therefore the first to
+exercise the reader's tree descent. Three reader bugs surfaced at once: a child
+pointer read one past its own end, a search key above every separator refused
+instead of descending, and `check::check` walking the leaf chain by `bLink`. All
+three are invisible on a one-leaf catalog, which is every image the corpus
+committed before this. That is the argument for a committed fixture with a split
+catalog, and it is the one gap in the corpus now.
+
 What is *not* yet true of any mutation here:
 
-- **No node splitting.** A catalog leaf with no room is refused by name. Splitting
-  means redistributing records across two nodes, updating the parent's index, and
-  allocating a node from the free list — so a volume whose catalog leaf fills up
-  becomes read-only to this crate rather than corrupt.
+- **The catalog cannot grow.** Splitting allocates a node from the header's map,
+  and that is the only node source implemented. Extending the B-tree file means
+  allocating blocks for it, so a catalog with eight nodes fills at about forty
+  files and then reports `NoSpace` — honestly, and with nothing written.
 - **No folders.** A file can be created in the root or any existing folder, but no
   folder can be created, and `folderCount` in the header is never written.
 

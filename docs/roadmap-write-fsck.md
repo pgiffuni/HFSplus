@@ -3,6 +3,16 @@
 Recorded 2026-10-03 as a standing decision, so the ordering and the reasoning
 survive past the conversation that produced it.
 
+> **Addendum 2026-10-04.** The standing decision holds; two of the four steps below
+> are overtaken. `AllocationBitmap` is no longer read-only — `AllocationMap` has
+> reserved, released and searched from a hint since Milestone 7A, and it now has a
+> *writer* on a mutation path. Write support has gone past step 1: overwrite, grow,
+> truncate and file creation are done, with node splitting, and the order in which
+> the remaining gaps should be filled is in `docs/source-map.md` under *What
+> Milestone 8 has and has not reached*. The body below is left as it was written,
+> because a plan that is edited to match its outcome stops being a record of the
+> reasoning.
+
 ## The decision
 
 After write support, this project carries its own formatter and its own checker,
