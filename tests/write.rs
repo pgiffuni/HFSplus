@@ -776,6 +776,155 @@ fn growing_the_catalog_keeps_both_volume_headers_in_step() {
     assert_fsck_clean(&path, "a catalog grown past its original eight nodes");
 }
 
+// --- Deletion, which removes -----------------------------------------------
+
+#[test]
+fn removing_a_file_takes_both_its_records_and_fixes_the_counts() {
+    // A file is a record and a thread record. Removing one without the other leaves
+    // something the checker calls `missing_thread` and `fsck.hfsplus` rejects, so
+    // the test looks for neither half rather than for the absence of a name.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let victim_cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let cnid = writable
+            .create_file(parent, &units("doomed.bin"))
+            .expect("create");
+        writable
+            .remove(parent, &units("doomed.bin"))
+            .expect("remove the file just created");
+        // The writer borrows the device, so it has to go before the device can be
+        // synced.
+        drop(writable);
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("doomed.bin"))
+            .expect("lookup")
+            .is_none(),
+        "the name must no longer resolve"
+    );
+    assert!(
+        vol.lookup_cnid(hfsplus::catalog::cnid::Cnid(victim_cnid))
+            .expect("lookup by CNID")
+            .is_none(),
+        "and neither may the CNID: a file record with no thread record is exactly \
+         what `missing_thread` reports"
+    );
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("payload.bin"))
+            .expect("lookup")
+            .is_some(),
+        "and nothing else may go with it"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a removed file");
+}
+
+#[test]
+fn removing_something_with_contents_is_refused_rather_than_stranding_its_blocks() {
+    // The blocks are what the file's extents describe, so removing the record first
+    // would leave them allocated with nothing pointing at them. Truncating first
+    // releases them, and `truncate_file` already does that.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let err = writable
+            .remove(parent, &units("payload.bin"))
+            .expect_err("payload.bin has a block of contents");
+        assert!(
+            format!("{err}").contains("contents"),
+            "the refusal must say why, or a caller cannot tell this from a missing \
+             file; got: {err}"
+        );
+
+        // Truncate first, and it goes.
+        writable
+            .truncate_file(16, 0)
+            .expect("truncate payload.bin to nothing");
+        writable
+            .remove(parent, &units("payload.bin"))
+            .expect("remove it");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .is_none());
+    // Truncating released the block, so removing the record strands nothing.
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a file emptied and then removed");
+}
+
+#[test]
+fn removing_something_that_is_not_there_is_reported_as_missing() {
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let before = std::fs::read(&path).expect("read image");
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    let err = writable
+        .remove(parent, &units("never-existed.bin"))
+        .expect_err("there is no such file");
+    assert!(
+        matches!(err, hfsplus::Error::NotFound { .. }),
+        "a name that is not there is NotFound, not a silent success; got {err:?}"
+    );
+    dev.sync().expect("flush");
+    drop(dev);
+    assert_untouched(&path, &before, "a remove of something that is not there");
+}
+
+#[test]
+fn the_root_folder_and_reserved_cnids_cannot_be_removed() {
+    // `cat_delete`'s preflight: a CNID at or below the reserved range, or the root
+    // folder itself, is `EINVAL` -- before anything is written.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let before = std::fs::read(&path).expect("read image");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    writable
+        .remove(parent, &units("no-such-root.bin"))
+        .expect_err("the root folder cannot be reached by an ordinary name");
+    dev.sync().expect("flush");
+    drop(dev);
+    assert_untouched(&path, &before, "a refused remove");
+}
+
 // --- Truncation, which frees -----------------------------------------------
 
 /// Grow `payload.bin` to 8192 bytes so there is a block to give back.

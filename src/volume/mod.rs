@@ -880,6 +880,210 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         Ok(cnid)
     }
 
+    /// Delete the object called `name` in folder `parent`, and return its CNID.
+    ///
+    /// The inverse of [`Self::create_file`], and it is the first mutation here
+    /// that *removes* something, which is why it is worth reading what it refuses:
+    ///
+    /// - **The root folder**, and anything at or below the reserved CNID range.
+    /// - **A file with blocks.** `unlink` refuses a file that still has data; the
+    ///   blocks would have to be released, and a file's allocation is what its
+    ///   extents describe, so removing the record first would strand them.
+    /// - **A folder with children.** Same reason, one level up: a folder's
+    ///   `valence` is its child count, and a folder that claims children it does
+    ///   not have is what `fsck.hfsplus` reports as "Invalid directory item
+    ///   count".
+    ///
+    /// # Order, and rollback
+    ///
+    /// Apple's `cat_delete` removes the record and then the thread record, and if
+    /// the *second* fails it marks the volume inconsistent rather than trying to
+    /// recover. That is a kernel with a mount to invalidate; a library has neither,
+    /// so this puts both records back instead.
+    ///
+    /// Both records' bytes are read before anything is written, so a rollback is an
+    /// insert of bytes that are known-good rather than a reconstruction. The CNID
+    /// counter is not involved -- a delete consumes nothing.
+    ///
+    /// Mining reference: `core/hfs_catalog.c` `cat_delete`, including its preflight
+    /// (`cd_cnid < kHFSFirstUserCatalogNodeID || cd_parentcnid == kHFSRootParentID`
+    /// is `EINVAL`) and its "delete thread record, and on error mark the volume
+    /// inconsistent". The valence and count adjustments live in the unlink/rmdir
+    /// path above it, which is where they belong: `cat_delete` is the record layer.
+    pub fn remove(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
+        let parent_cnid = Cnid(parent);
+        let object = {
+            use crate::catalog::lookup::Catalog;
+            let catalog = Catalog::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            catalog.lookup(parent_cnid, name)?.ok_or(Error::NotFound {
+                what: "catalog entry",
+            })?
+        };
+        let (cnid, is_folder, blocked) = match &object {
+            crate::catalog::record::CatalogRecord::File(f) => (
+                f.file_id.0,
+                false,
+                f.data_fork.total_blocks > 0 || f.data_fork.logical_size > 0,
+            ),
+            crate::catalog::record::CatalogRecord::Folder(fo) => {
+                (fo.folder_id.0, true, fo.valence > 0)
+            }
+            // A thread record cannot be named, so a lookup by name cannot return
+            // one; this arm exists only so the match is total.
+            crate::catalog::record::CatalogRecord::Thread(_) => {
+                return Err(Error::invalid(
+                    "remove",
+                    "a thread record cannot be deleted by name",
+                ))
+            }
+        };
+
+        if cnid <= ROOT_FOLDER_ID.0 {
+            return Err(Error::invalid(
+                "remove",
+                format!("CNID {cnid} is reserved, so it cannot identify a deletable object"),
+            ));
+        }
+        if parent_cnid.0 == ROOT_FOLDER_ID.0 && parent == ROOT_FOLDER_ID.0 && is_folder {
+            return Err(Error::invalid(
+                "remove",
+                "the root folder cannot be deleted",
+            ));
+        }
+        if blocked {
+            return Err(Error::invalid(
+                "remove",
+                if is_folder {
+                    "the folder is not empty".to_string()
+                } else {
+                    "the file still has contents; truncating it first would release \
+                     the blocks"
+                        .to_string()
+                },
+            ));
+        }
+
+        // Read both records before touching either, so a rollback puts back exactly
+        // what was there.
+        let child_key = crate::catalog::key::CatalogKey::for_child(parent_cnid, name);
+        let thread_key = crate::catalog::key::CatalogKey::for_child(Cnid(cnid), &[]);
+        let child_bytes = self
+            .catalog_record_bytes(&child_key)?
+            .ok_or(Error::NotFound {
+                what: "catalog record",
+            })?;
+        let thread_bytes = self
+            .catalog_record_bytes(&thread_key)?
+            .ok_or(Error::NotFound {
+                what: "thread record",
+            })?;
+
+        self.remove_catalog_record(&child_key)?;
+        if let Err(e) = self.remove_catalog_record(&thread_key) {
+            let _ = self.insert_catalog_record(&child_bytes);
+            return Err(e);
+        }
+        if let Err(e) = self.change_folder_valence(parent, -1) {
+            let _ = self.insert_catalog_record(&thread_bytes);
+            let _ = self.insert_catalog_record(&child_bytes);
+            return Err(e);
+        }
+
+        // The header's counts. A folder's removal decrements `folderCount`; a
+        // file's decrements `fileCount`.
+        let (offset, current) = if is_folder {
+            (36u64, self.header.folder_count)
+        } else {
+            (32u64, self.header.file_count)
+        };
+        let updated = current
+            .checked_sub(1)
+            .ok_or_else(|| Error::overflow("volume header count"))?;
+        if let Err(e) = self.write_header_u32(offset, updated) {
+            let _ = self.change_folder_valence(parent, 1);
+            let _ = self.insert_catalog_record(&thread_bytes);
+            let _ = self.insert_catalog_record(&child_bytes);
+            return Err(e);
+        }
+        if is_folder {
+            self.header.folder_count = updated;
+        } else {
+            self.header.file_count = updated;
+        }
+        Ok(cnid)
+    }
+
+    /// Change a folder's declared child count by `delta`.
+    fn change_folder_valence(&mut self, cnid: u32, delta: i64) -> Result<()> {
+        let mut record = self.read_folder_record(cnid)?;
+        let valence = i64::from(record.valence)
+            .checked_add(delta)
+            .filter(|v| *v >= 0)
+            .ok_or_else(|| Error::overflow("folder valence"))?;
+        record.valence = u32::try_from(valence).map_err(|_| Error::overflow("folder valence"))?;
+        record.content_mod_date = crate::timestamp::now_hfs(self.header.has_expanded_times())
+            .map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+        let body = record.to_bytes();
+        self.replace_catalog_body(cnid, &body)
+    }
+
+    /// The bytes of the catalog record under exactly this key, if it is there.
+    ///
+    /// Whole records, so a caller can put one back. That is what makes a removal
+    /// reversible, and a removal has to be reversible: a delete touches two records
+    /// and a folder's child count, and a failure after the first leaves a file
+    /// record with no thread record.
+    fn catalog_record_bytes(
+        &self,
+        key: &crate::catalog::key::CatalogKey,
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::lookup::split_record;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let mut node_num = btree_header.first_leaf_node;
+        let mut budget = btree_header.total_nodes;
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            for index in 0..node.num_records() {
+                let record = node.record(index)?;
+                let Some((existing, _)) = split_record(record) else {
+                    continue;
+                };
+                if existing.parent_id == key.parent_id && existing.name == key.name {
+                    return Ok(Some(record.to_vec()));
+                }
+            }
+            if node_num == btree_header.last_leaf_node {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            if node_num == 0 || node_num >= btree_header.total_nodes {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
     /// Remove the catalog record with exactly this key, if it is there.
     ///
     /// The inverse of [`Self::insert_catalog_record`] for one key, and what makes a
@@ -892,48 +1096,44 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// and this is one fewer.
     fn remove_catalog_record(&mut self, key: &crate::catalog::key::CatalogKey) -> Result<()> {
         use crate::btree::io::BTreeFile;
-        use crate::btree::node::{num_records, remove_record, NodeKind};
-        use crate::catalog::lookup::split_record;
+        use crate::btree::node::{num_records, remove_record};
 
-        let hit = {
+        let hit = self.catalog_record_bytes(key)?;
+        let Some(bytes_of) = hit else {
+            return Err(Error::NotFound {
+                what: "catalog record to remove",
+            });
+        };
+        // Re-locate: the walk above and the edit below must agree on the node and
+        // index, and doing it twice is cheaper than holding a borrow across the
+        // write.
+        let node_num = self.leaf_for(
+            &bytes_of,
+            self.btree_header_u32(crate::btree::header::FIRST_LEAF_OFFSET)?,
+        )?;
+        let node_index = {
             let bt = BTreeFile::open(
                 &*self.device,
                 &self.header.catalog_file,
                 self.header.block_size,
                 self.header.is_hfsx(),
             )?;
-            let btree_header = *bt.header();
-            let mut node_num = btree_header.first_leaf_node;
-            let mut budget = btree_header.total_nodes;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
             let mut found = None;
-            while budget > 0 && node_num != 0 && found.is_none() {
-                budget -= 1;
-                let bytes = bt.read_node_bytes(node_num)?;
-                let node = bt.parse_node(&bytes)?;
-                if node.kind() != NodeKind::Leaf {
-                    break;
-                }
-                for index in 0..node.num_records() {
-                    let Some((existing, _)) = split_record(node.record(index)?) else {
-                        continue;
-                    };
-                    if existing.parent_id == key.parent_id && existing.name == key.name {
-                        found = Some((node_num, usize::from(index)));
-                        break;
-                    }
-                }
-                if node_num == btree_header.last_leaf_node {
-                    break;
-                }
-                node_num = node.descriptor().f_link;
-                if node_num == 0 || node_num >= btree_header.total_nodes {
+            for index in 0..node.num_records() {
+                let record = node.record(index)?;
+                let Some((existing, _)) = crate::catalog::lookup::split_record(record) else {
+                    continue;
+                };
+                if existing.parent_id == key.parent_id && existing.name == key.name {
+                    found = Some(index);
                     break;
                 }
             }
             found
         };
-
-        let Some((node_num, index)) = hit else {
+        let Some(index) = node_index else {
             return Err(Error::NotFound {
                 what: "catalog record to remove",
             });
@@ -948,7 +1148,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 self.header.is_hfsx(),
             )?;
             let mut buf = bt.read_node_bytes(node_num)?;
-            remove_record(&mut buf, index)?;
+            remove_record(&mut buf, usize::from(index))?;
             let count = num_records(&buf)?;
             (bt.node_offset(node_num)?, buf, count)
         };
