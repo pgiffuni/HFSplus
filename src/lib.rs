@@ -57,6 +57,7 @@
 #![warn(missing_debug_implementations)]
 
 pub mod alloc;
+pub mod attributes;
 pub mod blockdev;
 pub mod btree;
 pub mod catalog;

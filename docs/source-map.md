@@ -143,6 +143,49 @@ Two key layouts were wrong here and are now pinned by tests:
 | Rust | `src/timestamp.rs` |
 | Differences | the native representation is `HfsTimestamp`, not `SystemTime`. `SystemTime` cannot represent 1904 and has no "unset", and converting through it would lose both the clamp and the zero-means-unset rule. |
 
+## Attributes File
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_format.h` `struct HFSPlusAttrKey`, `HFSPlusAttrData`, `HFSPlusAttrForkData`, `HFSPlusAttrExtents`, `union HFSPlusAttrRecord`, and the `kHFSPlusAttr{InlineData,ForkData,Extents}` enum |
+| Structures | `AttrKey`, `AttrRecord` |
+| Invariants | `keyLength` excludes itself but includes the `pad` that follows it, so the body is 266 and the record 268; the type values 0x10/0x20/0x30 are disjoint from the catalog's 1..4 and 1000; a fork attribute's value continues through further records chained by the key's `startBlock` |
+| Rust | `src/attributes/key.rs`, `src/attributes/record.rs` |
+| Differences | the `pad` is read and discarded rather than validated — Apple writes zero and reads nothing, so refusing a non-zero value would reject volumes macOS mounts. The obsolete `HFSPlusAttrInlineData` spelling decodes identically, since only the struct name changed and not the type value or the layout. |
+
+Two layout errors here were the same shape as the extent key's, which is now
+worth naming as a habit rather than a coincidence:
+
+- the key body was computed without the `pad`, giving 264 rather than 266
+- `HFSPlusAttrData.reserved` is an *array* of two, so `attrSize` is at offset 12
+  and the value at 16; reading them four bytes early took the length out of the
+  reserved field
+
+Both were caught by unit tests rather than by the corpus, because no image in it
+carries an attribute — `mkfs.hfsplus` creates no files.
+
+**What is deliberately not built yet.** The Attributes File is a second B-tree
+with its own key layout, and its records chain continuation records for a
+fragmented value. Parsing one record is most of that; *resolving* a value —
+following the chain, distinguishing an inline value from a forked one, and
+mapping an attribute name to a value — is not done. Nothing reads the tree yet,
+because nothing in the corpus contains one.
+
+Three distinctions this module exists to keep straight, since they are routinely
+conflated:
+
+```text
+data fork        catalog record's dataFork
+resource fork    catalog record's rsrcFork   -- a real fork, not an attribute
+FinderInfo       an attribute in this tree
+```
+
+FinderInfo is the one that surprises: the catalog record's `HFSPlusBSDInfo` is 16
+bytes with **no** FinderInfo field. HFS+ kept FinderInfo in the attributes tree,
+where classic HFS had no equivalent to move it to. A POSIX extended attribute is
+a fourth thing again — which attributes become `getxattr` is a decision for the
+FUSE adapter, not for this module.
+
 ## Checker
 
 | | |
@@ -165,7 +208,6 @@ Milestones 7 through 13 depend on all of these, and none has been translated:
 
 | Area | Apple | Will become |
 | --- | --- | --- |
-| Attributes File | `core/hfs_attrlist.c`, `hfs_attrlist.h` | `src/attributes/` |
 | Resource fork semantics | `core/hfs_xattr.c`, `FileMgrInternal.h` | 7A.1 |
 | Catalog mutation | `core/hfs_catalog.c` `cat_create`, `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildkey`, `buildrecord`, `buildthread` | Milestone 9 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
