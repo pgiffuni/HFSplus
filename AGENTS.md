@@ -61,9 +61,25 @@ far, all recorded in `docs/hfs-format.md`:
 ## Tests
 
 ```sh
-cargo test                # everything
-cargo clippy --all-targets
+cargo test                                        # everything
+cargo +nightly clippy --all-targets -- -D warnings
+cargo fmt -- --check
 ```
+
+Those three are exactly what `.github/workflows/ci.yml` runs, and the last two
+have `-D warnings` / `--check` because a warning or a formatting diff fails the
+build. Run them before pushing, not after CI tells you.
+
+The clippy leg is **nightly** on purpose: stable clippy lags the lints by a
+release, and two key-length constants in this crate were wrong for exactly as
+long as the stable lints stayed quiet about them. A newer nightly can therefore
+introduce a lint that fails the build on an unrelated commit -- that is the price
+of catching things early, and `cargo +nightly clippy --all-targets` locally is
+what keeps it from arriving unannounced.
+
+`clippy::pedantic` is deliberately *not* enabled. It wants a `# Errors` section
+on every fallible function and `#[must_use]` on nearly everything, which is a
+large opinionated diff for lints this codebase has no opinion about.
 
 Images are generated *and committed*. They are small -- 1 MiB each, 2 MiB for the
 16 KiB-block volume -- because a suite that needs `hfsprogs` to run is a suite

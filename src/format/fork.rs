@@ -351,8 +351,11 @@ mod tests {
     fn fork_with_blocks_past_the_eighth_extent_needs_overflow() {
         let mut fork = ForkData::default();
         fork.logical_size = 0;
-        for i in 0..INLINE_EXTENT_COUNT {
-            fork.extents.raw[i] = ExtentDescriptor {
+        // Iterated rather than indexed: the index is only there to number the
+        // descriptors, and `enumerate` says so. Each descriptor gets its own
+        // start block so the layout is not accidentally contiguous.
+        for (i, extent) in fork.extents.raw.iter_mut().enumerate() {
+            *extent = ExtentDescriptor {
                 start_block: i as u32 * 2,
                 block_count: 2,
             };
@@ -366,8 +369,11 @@ mod tests {
     #[test]
     fn eight_exact_extents_do_not_need_overflow() {
         let mut fork = ForkData::default();
-        for i in 0..INLINE_EXTENT_COUNT {
-            fork.extents.raw[i] = ExtentDescriptor {
+        // Iterated rather than indexed: the index is only there to number the
+        // descriptors, and `enumerate` says so. Each descriptor gets its own
+        // start block so the layout is not accidentally contiguous.
+        for (i, extent) in fork.extents.raw.iter_mut().enumerate() {
+            *extent = ExtentDescriptor {
                 start_block: i as u32 * 2,
                 block_count: 2,
             };

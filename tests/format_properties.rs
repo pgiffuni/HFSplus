@@ -201,12 +201,12 @@ fn overflow_accounting_is_consistent_for_every_extent_layout() {
         let mut fork = ForkData::default();
         let mut described = 0u64;
         let live = rng.below(9) as usize;
-        for slot in 0..live {
+        for extent in fork.extents.raw.iter_mut().take(live) {
             // At least one block: a zero block count is the terminator, so a
             // live descriptor with zero would end the list before the rest.
             let count = 1 + rng.below(64) as u32;
-            fork.extents.raw[slot].start_block = rng.below(1 << 20) as u32;
-            fork.extents.raw[slot].block_count = count;
+            extent.start_block = rng.below(1 << 20) as u32;
+            extent.block_count = count;
             described += u64::from(count);
         }
 
