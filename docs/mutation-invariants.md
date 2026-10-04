@@ -236,52 +236,71 @@ The separator test was checked for teeth before being trusted: with the refresh
 disabled it fails on exactly the property `fsck` reports — the separator's key
 length is the thread record's 6 where the leaf's real first key is 28.
 
-## The one defect Milestone 8 leaves behind
+## The defect Milestone 8 fixed last: the writer and the reader disagreed
 
-`lookup_cnid` misses some files once the catalog has grown past a single node, and
-the cause is a **leaf-chain ordering violation**: two adjacent leaves overlap in key
-space, so a search for a key in the overlap is sent to the wrong one. Every file is
-still findable by *name*, and `fsck.hfsplus` accepts the volume, because the
-overlap happens to fall between two file records and between two thread records
-rather than across a lookup that every tool performs.
+`lookup_cnid` missed some files once the catalog had grown past a single node, and
+the cause was that **the writer's descent and the reader's descent used opposite
+bounds over the index separators**.
 
-### Where it starts
+An HFS+ index record holds the first key of the subtree it points at, so the child
+for a search key is the record whose key is the greatest not exceeding it: an
+**upper** bound. The reader's `descend_index` had been corrected to that while
+chasing `fsck`'s "Invalid index key"; `leaf_for`, the writer's copy of the same
+descent, was left on the lower bound.
 
-Exactly at the **first catalog growth** — the 48th file, which is the first create
-that needs a node and therefore the first that extends the file. Up to 47 files the
-leaves are in ascending key order and every file is findable both ways; from 48 the
-last two leaves of the chain overlap.
+The two then disagreed in a way nothing noticed. A key above every separator in a
+run of `(parent, name)` keys resolved to the leaf holding the *thread* records --
+because a thread key carries its file's CNID as its parentID, so every thread key
+sorts past every `(parent, name)` key, and the last separator is the first thread
+key. The record landed in a leaf that was internally ordered and perfectly valid,
+and simply was not the leaf it belonged in.
 
-That is a much sharper lead than "it breaks at some size", and it points at
-`grow_catalog` rather than at the split: a split at 47 is fine, and the only thing
-different at 48 is that the file grew first.
+So the chain's leaves overlapped in key space, and the overlap fell between two
+file records and between two thread records rather than across a lookup any tool
+performs: every file stayed findable *by name*, `fsck.hfsplus` accepted the volume,
+and `check::check` called it clean.
 
-### The two things growth does that could do it
+Three lessons, all of which cost more than the bug did:
 
-- **Node numbering.** New nodes are numbered from `oldTotalNodes` and their map bits
-  are marked *after* the map nodes are written. If a bit lands in the wrong map
-  record, `allocate_node` hands out a node number that is already in use — and a
-  node written over a leaf is exactly the shape of this symptom, except that the
-  record count came out right.
-- **The in-memory header.** Growth updates `self.header.catalog_file` when the fork
-  is written, and `total_nodes` and `free_nodes` are re-read afterwards. A stale
-  value anywhere in that chain makes `leaf_for` resolve through an index whose
-  separators no longer describe the leaves.
+- **The first break was at the 49th file, not "past some size"**, and that number
+  is what made it tractable: it is one file past the first catalog growth, which
+  moved the suspicion from the split to the growth.
+- **The check that found it was the wrong one at first.** Comparing *first* keys of
+  adjacent leaves reports this tree as ordered, because the ranges overlap without
+  inverting. Comparing the previous leaf's *last* key with the next leaf's *first*
+  is the check that sees it.
+- **A search that returns a plausible wrong answer is worse than one that errors.**
+  Over unsorted separators, a binary search of either kind returns a node rather
+  than a complaint, so a wrong-leaf insert makes the separators disagree more. That
+  is self-reinforcing, and it is why the first break is the thing worth fixing.
 
-`leaf_for` is the thing that suffers, and it suffers silently: an upper-bound search
-over *unsorted* separators returns a plausible answer rather than an error. Once
-the separators disagree with the chain, a wrong-leaf insert makes them disagree
-more, so the corruption is self-reinforcing — which is why it is worth fixing the
-first break rather than the visible symptom.
+`every_file_is_reachable_by_both_routes_once_the_catalog_has_grown` covers 200
+files, past both the growth threshold and the first misplacement.
 
-### What would settle it
+## The defect Milestone 8 leaves behind: a create is not atomic
 
-Compare, at file 48, the separators in the index node against the actual first key
-of each leaf. If they match, the chain was already wrong before the index was
-rebuilt and the fault is in the split. If they do not, the fault is in the rebuild.
+A create writes four things: the CNID counter, the file record, the thread record,
+and the parent folder's child count. A failure between the file record and the
+thread record leaves a file record with **no thread record**, which is exactly what
+`check::check` reports as `missing_thread` and what `fsck.hfsplus` rejects.
 
-Not yet done. `every_file_is_still_findable_by_cnid_before_the_catalog_grows` pins
-the working half, so the boundary is a fact rather than a suspicion.
+This is not an edge case: it is the normal outcome of a create that fails, and
+failing is normal once a volume is full. The order is a deliberate trade rather
+than an oversight -- the CNID counter goes first precisely so a retry cannot be
+handed a CNID that a half-finished record already claims -- but the trade leaves
+this behind.
+
+Reordering the two inserts trades one inconsistency for another: an orphan thread
+record is not flagged as a missing thread, but the folder's `valence` is counted
+*from* thread records, so an orphan makes the declared child count disagree with
+what is there. Neither order is correct.
+
+What is correct is a rollback -- `src/btree/node.rs` already has `remove_record`
+for exactly this, written when node mutation landed and not yet used -- or a
+journal. Both are real work and neither is done, so this is stated rather than
+worked around: `a_volume_that_cannot_grow_any_further_says_what_ran_out` asserts
+only that the failure is *named*, and says in a comment why it does not assert
+that the volume is afterwards consistent. It is not.
 
 What is *not* yet true of any mutation here:
 

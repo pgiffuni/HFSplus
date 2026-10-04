@@ -1973,10 +1973,21 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                         "key could not be decoded",
                     ));
                 };
-                if catalog.compare_keys(&k, &incoming) == Ordering::Less {
-                    lo = mid + 1;
-                } else {
+                // Upper bound, not a lower one: the child for a key is the record
+                // whose key is the greatest not exceeding it.
+                //
+                // This was a lower bound while the reader's `descend_index` had
+                // already been corrected to an upper one, and the two disagreed --
+                // the reader right, the writer wrong. A key above the last
+                // separator in a *parentID=2* leaf range then resolved to the leaf
+                // holding the thread records, which sorts after every one of them:
+                // the record went to a valid, correctly ordered leaf that simply was
+                // not the one it belonged in, and the chain's leaves overlapped in
+                // key space.
+                if catalog.compare_keys(&k, &incoming) == Ordering::Greater {
                     hi = mid;
+                } else {
+                    lo = mid + 1;
                 }
             }
             // A key greater than every index key belongs to the child of the *last*
@@ -1991,7 +2002,12 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             if node.num_records() == 0 {
                 return Ok(fallback_leaf);
             }
-            let lo = lo.min(node.num_records() - 1);
+            // `lo` is now the number of separators not greater than the key, so the
+            // answer is one before it -- the *upper* bound's answer. Clamping it to
+            // `num_records - 1` instead is the lower bound's fallback, and mixing
+            // the two sends any key above the last separator to the last separator's
+            // leaf, which is the leaf holding the thread records.
+            let lo = lo.saturating_sub(1);
             let body = match split_record(node.record(lo)?) {
                 Some((_, body)) => body,
                 None => return Ok(fallback_leaf),
