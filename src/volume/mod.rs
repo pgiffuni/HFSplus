@@ -897,7 +897,10 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.device.write_at(
             crate::blockdev::VOLUME_HEADER_OFFSET + offset,
             &value.to_be_bytes(),
-        )
+        )?;
+        // Every header write has to move the copy at the end of the volume with it.
+        // See `sync_backup_header`.
+        self.sync_backup_header()
     }
 
     /// Split the first leaf so `record` has somewhere to go, and insert it.
@@ -965,7 +968,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             ));
         }
 
-        let total_nodes = self.btree_header_u32(crate::btree::header::TOTAL_NODES_OFFSET)?;
+        let mut total_nodes = self.btree_header_u32(crate::btree::header::TOTAL_NODES_OFFSET)?;
         let mut free_nodes = self.btree_header_u32(FREE_NODES_OFFSET)?;
         let first_leaf = self.btree_header_u32(crate::btree::header::FIRST_LEAF_OFFSET)?;
         // The leaf the key belongs to, not necessarily the first one. With an index
@@ -981,7 +984,26 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // the map exactly as it was.
         let needed = if leaf_is_root { 2u32 } else { 1u32 };
         if free_nodes < needed {
-            return Err(Error::no_space(needed, u64::from(free_nodes)));
+            // No node free. Growing the catalog is the alternative to refusing, and
+            // it is what makes a volume writable more than a few dozen times. The
+            // node count asked for is Apple's: one per index level of depth, plus
+            // the two this split needs, plus every node currently in use -- because
+            // the nodes that are in use are the ones that were full, and they will
+            // need splitting again.
+            let want = u32::from(tree_depth)
+                .saturating_add(1)
+                .saturating_add(total_nodes - free_nodes)
+                .saturating_add(needed);
+            self.grow_catalog(want)?;
+            // Both counts come back from the header rather than being assumed:
+            // growth raised `totalNodes`, and `allocate_node` refuses to hand out a
+            // node at or above it, so a stale value here looks exactly like a full
+            // tree.
+            free_nodes = self.btree_header_u32(crate::btree::header::FREE_NODES_OFFSET)?;
+            total_nodes = self.btree_header_u32(crate::btree::header::TOTAL_NODES_OFFSET)?;
+            if free_nodes < needed {
+                return Err(Error::no_space(needed, u64::from(free_nodes)));
+            }
         }
 
         let mut header = self.read_catalog_node(0)?;
@@ -1317,6 +1339,39 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.device.write_at(at + offset, &value.to_be_bytes())
     }
 
+    /// Copy the volume header to the copy at the end of the volume.
+    ///
+    /// HFS+ keeps a second, identical volume header in the last 1024 bytes of the
+    /// volume, and `fsck.hfsplus` compares the two: a primary header that has moved
+    /// on without it reports "Volume header needs minor repair", and the repair
+    /// rewrites *this* copy from the primary. That repair is right and it is also a
+    /// repair, so a volume this crate produced would come back from `fsck` having
+    /// been modified -- which is the one thing a test asserting `fsck` accepts an
+    /// image cannot allow.
+    ///
+    /// Apple writes it in the same transaction as the primary, as part of an
+    /// unmount or a header update; a library with no unmount to hang it on has to
+    /// write it whenever the header changes.
+    ///
+    /// Mining reference: `core/hfs_vfsops.c` writes the "alternate volume header
+    /// located at 1024 bytes before end of the partition"; the same file notes that
+    /// where the filesystem size equals the partition size this is the only such
+    /// header worth tracking.
+    fn sync_backup_header(&mut self) -> Result<()> {
+        let volume_bytes = u64::from(self.header.total_blocks) * u64::from(self.header.block_size);
+        if volume_bytes <= 1024 {
+            // A volume that cannot hold both headers has no backup to keep in step,
+            // and this is not a volume any formatter produces.
+            return Ok(());
+        }
+        // The primary header is at byte 1024, not at 0 -- the first kilobyte of an
+        // HFS+ volume is reserved, and the boot blocks live there.
+        let mut buf = [0u8; 1024];
+        self.device
+            .read_at(crate::blockdev::VOLUME_HEADER_OFFSET, &mut buf)?;
+        self.device.write_at(volume_bytes - 1024, &buf)
+    }
+
     /// Read a `u32` field of the catalog's B-tree header record.
     fn btree_header_u32(&self, offset: u64) -> Result<u32> {
         let node = self.read_catalog_node(0)?;
@@ -1560,6 +1615,265 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 )
             }
         }
+    }
+
+    /// Grow the catalog so it holds at least `want_nodes` nodes.
+    ///
+    /// The only way a B-tree gets bigger, and it is two separate things that are
+    /// easy to confuse:
+    ///
+    /// 1. **The file gets more blocks**, which is ordinary fork extension: allocate
+    ///    contiguously, append an extent, and raise the fork's `logicalSize` and
+    ///    `totalBlocks` in the volume header. The catalog's extents live *there*,
+    ///    not in the catalog, so every one of those is a volume-header write.
+    /// 2. **The node map gets more records**, which is arithmetic on the header
+    ///    node. A map record covers `record_length * 8` nodes, and once `totalNodes`
+    ///    passes what the existing records cover, the new nodes need map records of
+    ///    their own -- nodes that describe the node map, allocated from the node
+    ///    map. The map records are therefore written *and then* their own bits are
+    ///    marked, in that order, because the bit for a new map node lives in a map
+    ///    record that did not exist when the node did.
+    ///
+    /// # The growth size
+    ///
+    /// A request smaller than the fork's clump size is raised to it, and the whole
+    /// is rounded up to a multiple of the node size. So a tree needing one more node
+    /// grows by eight, and the volume pays for a clump whether it needed one node or
+    /// thirty-two. That is Apple's behaviour and it is worth keeping: growth
+    /// infrequent and large is what keeps the catalog from needing a map record
+    /// every few files.
+    ///
+    /// Mining reference: `core/BTreeAllocate.c` `ExtendBTree` for the map
+    /// arithmetic (`mapNodeRecSize = nodeSize - sizeof(BTNodeDescriptor) - 6`, the
+    /// new map nodes numbered from `oldTotalNodes` and chained by `fLink`), and
+    /// `core/hfs_btreeio.c` `ExtendBTreeFile` for the file half -- `bytesToAdd` is
+    /// raised to `ff_clumpsize`, and the allocation is contiguous
+    /// (`kEFContigMask | kEFMetadataMask | kEFNoClumpMask`), retried from
+    /// `vcb->nextAllocation`.
+    fn grow_catalog(&mut self, want_nodes: u32) -> Result<()> {
+        use crate::btree::header::{FREE_NODES_OFFSET, TOTAL_NODES_OFFSET};
+        use crate::format::extents::ExtentDescriptor;
+
+        let node_size = self.catalog_node_size()? as u64;
+        let clump = u64::from(self.header.catalog_file.clump_size.max(1));
+        let old_total = self.btree_header_u32(TOTAL_NODES_OFFSET)?;
+        let want_nodes = want_nodes.max(old_total + 1);
+        let eof = self.header.catalog_file.logical_size;
+        let min_eof = u64::from(want_nodes) * node_size;
+        if eof >= min_eof {
+            return Ok(());
+        }
+
+        // Raised to the clump, then rounded up to whole nodes.
+        let mut bytes_to_add = min_eof - eof;
+        if bytes_to_add < clump {
+            bytes_to_add = clump;
+        }
+        // `div_ceil` is 1.73 and this crate is 1.70.
+        bytes_to_add = (bytes_to_add + node_size - 1) / node_size * node_size;
+
+        // Blocks needed, and where they go.
+        let blocks_needed = u32::try_from(bytes_to_add / node_size)
+            .map_err(|_| Error::overflow("catalog fork block count"))?;
+        let mut map = self.load_allocation_map()?;
+        let hint = self.header.next_allocation.max(1);
+
+        // Contiguous first, as `kEFContigMask` asks: a node is read with one I/O, so
+        // a tree whose nodes are scattered pays for it on every read afterwards.
+        // `reserve` searches from the hint and then from the first allocatable
+        // block, so it covers the whole range exactly once, and it returns the whole
+        // run or an error. A B-tree cannot be extended by part of a node, which is
+        // why the short-run case is not a result here.
+        let start = map.reserve(hint, blocks_needed)?;
+        let count = blocks_needed;
+
+        // The catalog's extents live in the volume header, so extending the fork is
+        // a header write: append the extent, then raise the two counts.
+        let mut fork = self.header.catalog_file;
+        let slot = fork.extents.next_free().ok_or_else(|| {
+            Error::invalid(
+                "catalogFile",
+                "the catalog fork has no free inline extent; growing it past eight \
+                 extents needs the extents B-tree, which is not implemented",
+            )
+        })?;
+        fork.extents.set(
+            slot,
+            ExtentDescriptor {
+                start_block: start,
+                block_count: count,
+            },
+        )?;
+        fork.total_blocks += count;
+        fork.logical_size += u64::from(count) * node_size;
+
+        let free_blocks = self
+            .header
+            .free_blocks
+            .checked_sub(count)
+            .ok_or_else(|| Error::overflow("volume_header.freeBlocks"))?;
+        // Bitmap and free count first: a crash in between leaves the fork claiming
+        // blocks the bitmap still calls free, which is the one ordering that lets
+        // two things share them.
+        self.write_allocation_bitmap(&map, free_blocks)?;
+        self.write_catalog_fork(&fork, free_blocks)?;
+        // The in-memory header moves with the on-disk one *here*, not at the end of
+        // this method. Everything below re-opens the B-tree through
+        // `self.header.catalog_file`, and the volume header is the only place that
+        // fork's length is recorded -- so a stale copy here pairs the new
+        // `totalNodes` with the old `logicalSize` and the tree refuses to open.
+        self.header.catalog_file = fork;
+
+        let new_total = u32::try_from(fork.logical_size / node_size).unwrap_or(old_total + count);
+        let new_map_nodes = self.extend_node_map(old_total, new_total)?;
+        let added = new_total - old_total;
+        self.write_btree_header_u32(TOTAL_NODES_OFFSET, new_total)?;
+        self.write_btree_header_u32(
+            FREE_NODES_OFFSET,
+            self.btree_header_u32(FREE_NODES_OFFSET)? + added - new_map_nodes,
+        )?;
+
+        self.header.free_blocks = free_blocks;
+        Ok(())
+    }
+
+    /// Add map records to cover `new_total` nodes, and return how many it took.
+    ///
+    /// Each new map node is one node of the tree, so it is numbered from
+    /// `old_total` and costs a node as well as a record.
+    fn extend_node_map(&mut self, old_total: u32, new_total: u32) -> Result<u32> {
+        use crate::btree::node::{set_record_count, write_offset, NODE_DESCRIPTOR_SIZE};
+
+        let node_size = self.catalog_node_size()?;
+        let map_rec_size = node_size
+            .checked_sub(NODE_DESCRIPTOR_SIZE + 6)
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                Error::invalid(
+                    "BTHeaderRec.nodeSize",
+                    format!("{node_size} is too small for a node map record"),
+                )
+            })?;
+
+        // How many nodes the existing records already describe. The header node
+        // holds the first of them at record index 2; any further map nodes are
+        // chained by the header node's `fLink`.
+        let header = self.read_catalog_node(0)?;
+        let header_records = crate::btree::node::num_records(&header)? as usize;
+        let mut total_bits = 0u64;
+        let mut cursor = header[0..4]
+            .iter()
+            .fold(0u32, |a, b| (a << 8) | u32::from(*b));
+        let mut budget = 64u32;
+        loop {
+            let map_len = map_record_len(&header, 2, header_records)?;
+            total_bits += u64::from(map_len as u32) * 8;
+            if cursor == 0 || budget == 0 {
+                break;
+            }
+            budget -= 1;
+            let node = self.read_catalog_node(cursor)?;
+            let records = crate::btree::node::num_records(&node)? as usize;
+            map_rec_size_check(node_size);
+            total_bits += u64::from(map_record_len(&node, 0, records)? as u32) * 8;
+            cursor = u32::from_be_bytes([node[0], node[1], node[2], node[3]]);
+        }
+        if u64::from(new_total) <= total_bits {
+            return Ok(0);
+        }
+
+        let extra_bits = u64::from(new_total - old_total);
+        let new_map_nodes = u32::try_from((extra_bits >> 3) / map_rec_size as u64 + 1)
+            .map_err(|_| Error::overflow("node map count"))?;
+
+        // Write the map nodes, chained. The last one's `fLink` is zero, and the
+        // previous map node -- the header node, when there is only one map record --
+        // points at the first of them.
+        for i in 0..new_map_nodes {
+            let node_num = old_total + i;
+            let mut node = vec![0u8; node_size];
+            node[0..4].copy_from_slice(&(old_total + i + 1).to_be_bytes());
+            if i == new_map_nodes - 1 {
+                node[0..4].copy_from_slice(&0u32.to_be_bytes());
+            }
+            node[8] = 0x02; // kBTMapNode
+            write_offset(&mut node, 0, NODE_DESCRIPTOR_SIZE)?;
+            // The free-space offset Apple writes at `nodeSize - 4`: a map node has
+            // no records after the map itself, and the offset array holds two
+            // entries for the single record and the free offset.
+            write_offset(&mut node, 1, node_size - 6)?;
+            set_record_count(&mut node, 1)?;
+            self.write_catalog_node(node_num, &node)?;
+        }
+        // Chain the last existing map node to the first new one.
+        let last_existing = if header[0..4]
+            .iter()
+            .fold(0u32, |a, b| (a << 8) | u32::from(*b))
+            == 0
+        {
+            0
+        } else {
+            // Walk to the end of the existing chain.
+            let mut cursor = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            let mut budget = 64u32;
+            while budget > 0 && cursor != 0 {
+                budget -= 1;
+                let node = self.read_catalog_node(cursor)?;
+                let next = u32::from_be_bytes([node[0], node[1], node[2], node[3]]);
+                if next == 0 {
+                    break;
+                }
+                cursor = next;
+            }
+            cursor
+        };
+        if last_existing == 0 {
+            let mut h = self.read_catalog_node(0)?;
+            h[0..4].copy_from_slice(&old_total.to_be_bytes());
+            self.write_catalog_node(0, &h)?;
+        } else {
+            let mut node = self.read_catalog_node(last_existing)?;
+            node[0..4].copy_from_slice(&old_total.to_be_bytes());
+            self.write_catalog_node(last_existing, &node)?;
+        }
+
+        // Mark each new map node's own bit. They must be marked *after* they are
+        // written: the bit for a new map node lives in a map record that did not
+        // exist when the node did.
+        for i in 0..new_map_nodes {
+            let node_num = old_total + i;
+            let header = self.read_catalog_node(0)?;
+            let bits_covered = map_record_len(&header, 2, header_records)? * 8;
+            if (node_num as usize) < bits_covered {
+                // Inside a record the header node already holds.
+                let mut h = self.read_catalog_node(0)?;
+                crate::btree::header::set_map_bit(&mut h, 2, node_num)?;
+                self.write_catalog_node(0, &h)?;
+            } else {
+                // Beyond it: the bit lives in one of the map nodes just written.
+                let first_new = old_total;
+                let into = node_num - first_new;
+                let per_record = map_rec_size * 8;
+                let which = (into / per_record as u32) as usize;
+                let node_num_of_record = first_new + which as u32;
+                let bit_in_record = into % per_record as u32;
+                let mut node = self.read_catalog_node(node_num_of_record)?;
+                crate::btree::header::set_map_bit(&mut node, 0, bit_in_record)?;
+                self.write_catalog_node(node_num_of_record, &node)?;
+            }
+        }
+        Ok(new_map_nodes)
+    }
+
+    /// Write the catalog fork and the volume header's free count.
+    fn write_catalog_fork(
+        &mut self,
+        fork: &crate::format::fork::ForkData,
+        free_blocks: u32,
+    ) -> Result<()> {
+        let at = crate::blockdev::VOLUME_HEADER_OFFSET + 112 + 80 * 2; // the catalog is the third of the five forks
+        self.device.write_at(at, &fork.to_bytes())?;
+        self.write_header_u32(48, free_blocks)
     }
 
     /// Rebuild the index from the leaf chain.
@@ -2181,7 +2495,6 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         map: &crate::alloc::AllocationMap,
         free_blocks: u32,
     ) -> Result<()> {
-        use crate::blockdev::VOLUME_HEADER_OFFSET;
         use crate::extent::mapper::ExtentMapper;
 
         let block_size = self.header.block_size as usize;
@@ -2204,8 +2517,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             self.device.write_at(at, &bytes[i..i + span])?;
             i += span;
         }
-        self.device
-            .write_at(VOLUME_HEADER_OFFSET + 48, &free_blocks.to_be_bytes())
+        self.write_header_u32(48, free_blocks)
     }
 
     /// Read a file's catalog record.
@@ -2373,6 +2685,31 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         })
     }
 }
+
+/// The length of map record `index` in a node with `records` records.
+fn map_record_len(node: &[u8], index: usize, records: usize) -> Result<usize> {
+    if index >= records {
+        return Err(Error::invalid(
+            "node map",
+            format!("map record {index} of a node holding {records}"),
+        ));
+    }
+    let start = crate::btree::node::read_offset(node, index)?;
+    let end = crate::btree::node::read_offset(node, index + 1)?;
+    if end < start || end > node.len() {
+        return Err(Error::invalid(
+            "node map",
+            format!(
+                "map record {index} spans {start}..{end} in a {} byte node",
+                node.len()
+            ),
+        ));
+    }
+    Ok(end - start)
+}
+
+/// A no-op kept for the symmetry of the map-node loop.
+fn map_rec_size_check(_node_size: usize) {}
 
 /// One half of a divided leaf.
 ///

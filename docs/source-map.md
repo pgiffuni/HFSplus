@@ -357,8 +357,7 @@ compression metadata (7B.2) are done and appear above.
 | --- | --- | --- |
 | Catalog mutation beyond create | `core/hfs_catalog.c` `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildrecord` | Milestone 9 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
-| Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records; `core/hfs_btreeio.c` `ExtendFile`, `BTAddNewBlock` | Milestone 8D |
-| **Extending a B-tree file** | `core/BTreeAllocate.c` `ExtendBTree`, `ExtendBTreeFile` | Milestone 8F |
+| Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
@@ -375,12 +374,14 @@ past one node and is where three separate reader bugs were found.
 Three limits are structural rather than unfinished, and each is refused by name
 rather than approximated:
 
-- **The catalog cannot grow.** `AllocateNode` finds a spare node in the header's
-  map, and that is the only source this crate implements. Extending the B-tree
-  file means allocating blocks for it, which is Milestone 8F. So a catalog with
-  eight nodes fills at about forty files and then reports `NoSpace`.
+- **The catalog grows, but in clumps, and only eight times.** `ExtendBTreeFile`
+  raises any request below the fork's clump size to it, so a tree needing one more
+  node grows by eight on this corpus; and the catalog's extents live in the volume
+  header, which has eight inline slots. Past that the answer is a refusal naming the
+  extents B-tree (Milestone 8D). The 1 MiB corpus volumes run out of contiguous
+  clumps long before that.
 - **A fork cannot overflow into the extents tree.** Nine extents and the answer is
-  a refusal naming 8D.
+  a refusal naming 8D. That is also what stops a catalog growing indefinitely.
 - **Nothing can be written to a journaled volume.** `WritableVolume::open` refuses
   one, because a write that is not journalled leaves a journal that does not
   describe the volume.

@@ -354,6 +354,42 @@ pub fn allocate_node(
     ))
 }
 
+/// Set one bit in map record `index` of `node`, where bit 0 is the record's first
+/// bit -- node 0 of the map -- and is the high bit of the first `u16`.
+///
+/// # Errors
+///
+/// Refuses a node number beyond what the record can describe. Writing past it would
+/// set a bit in the next record, which describes a different range of nodes, and the
+/// mistake is invisible: the map still parses, and the node it now claims is
+/// somewhere else entirely.
+pub fn set_map_bit(node: &mut [u8], index: usize, node_number: u32) -> Result<()> {
+    let records = super::node::num_records(node)? as usize;
+    if index >= records {
+        return Err(Error::invalid(
+            "node map",
+            format!("map record {index} of a node holding {records}"),
+        ));
+    }
+    let at = super::node::read_offset(node, index)?;
+    let end = super::node::read_offset(node, index + 1)?;
+    let len = end.saturating_sub(at);
+    let bits = (len as u32) * 8;
+    if node_number >= bits {
+        return Err(Error::out_of_range(
+            "map bit",
+            u64::from(node_number),
+            u64::from(bits),
+        ));
+    }
+    let byte = at + (node_number as usize / 8);
+    let bit = node_number % 8;
+    if let Some(b) = node.get_mut(byte) {
+        *b |= 0x80 >> bit;
+    }
+    Ok(())
+}
+
 /// Byte offset of `treeDepth` within the header record. A `u16`.
 pub const TREE_DEPTH_OFFSET: u64 = 0;
 

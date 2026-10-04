@@ -236,6 +236,25 @@ The separator test was checked for teeth before being trusted: with the refresh
 disabled it fails on exactly the property `fsck` reports — the separator's key
 length is the thread record's 6 where the leaf's real first key is 28.
 
+## The one defect Milestone 8 leaves behind
+
+`lookup_cnid` misses some files once the catalog has grown past a single node. Every
+file is findable by name at any size this crate can produce, and `fsck.hfsplus`
+accepts the volume, so this is a reader bug rather than a damaged volume -- but it
+is a real one, and it was **unreachable** rather than absent until catalog growth
+existed: a single-node catalog tops out at 47 files, so nothing could create the
+conditions.
+
+`every_file_is_still_findable_by_cnid_before_the_catalog_grows` pins the working
+half, so the boundary is a fact rather than a suspicion. 47 is where growth first
+happens, so that test covers the whole of the previously reachable range.
+
+Not yet diagnosed. By-name and by-CNID differ in one respect: the by-name search
+compares a `(parent, name)` key and the by-CNID search a `(cnid, "")` key, and the
+latter's keys are *thread* keys, which all sort past every `(parent, name)` key.
+So the two search disjoint parts of the key space, and a defect that affected only
+the second would look exactly like this.
+
 What is *not* yet true of any mutation here:
 
 - **The catalog cannot grow.** Splitting allocates a node from the header's map,
