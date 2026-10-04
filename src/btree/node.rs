@@ -642,8 +642,16 @@ pub fn read_offset(node: &[u8], index: usize) -> Result<usize> {
     ])))
 }
 
+/// Set the record count in a node's descriptor.
+///
+/// The counterpart of [`num_records`], for a mutation. Public because a caller
+/// rebuilding a node from a list of records has to set it.
+pub fn set_record_count(node: &mut [u8], count: u16) -> Result<()> {
+    set_num_records(node, count)
+}
+
 /// Write the offset slot for record `index`.
-fn write_offset(node: &mut [u8], index: usize, value: usize) -> Result<()> {
+pub fn write_offset(node: &mut [u8], index: usize, value: usize) -> Result<()> {
     let node_size = node.len();
     let at = offset_slot(node_size, index).ok_or(Error::Truncated {
         what: "btree node offset slot",

@@ -908,7 +908,12 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
         if node_num == last_leaf {
             break;
         }
-        let next = u32::from_be_bytes([node.raw()[4], node.raw()[5], node.raw()[6], node.raw()[7]]);
+        // `fLink` is at 0 and `bLink` at 4. Walking `bLink` goes *backwards*, which
+        // on a catalog with one leaf is indistinguishable from walking forwards --
+        // there is no second leaf to be missed -- and on any larger catalog silently
+        // examines one leaf and reports every object in it as having no thread
+        // record. Which is exactly what it did.
+        let next = u32::from_be_bytes([node.raw()[0], node.raw()[1], node.raw()[2], node.raw()[3]]);
         if next == 0 {
             break;
         }
@@ -1001,7 +1006,16 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
         let bytes = bt.read_node_bytes(node_num)?;
         let node = bt.parse_node(&bytes)?;
 
-        let expected_height = (tree_depth as i64 - level as i64 + 1) as u8;
+        // Height is `tree_depth` minus the number of index levels above the node:
+        // the root sits at `tree_depth` and a leaf directly under a single index
+        // node at 1. `level` *is* that count -- it starts at `tree_depth` and drops
+        // by one per index level -- so the expectation is `level` itself.
+        //
+        // Reading it as `level - 1` inverts the whole tree, and nothing notices on a
+        // catalog with one leaf, where the two agree. `fsck.hfsplus` does notice: it
+        // rejects a depth-2 catalog whose index node is at 1 and whose leaves are at
+        // 2, which is exactly what the inverted rule asks for.
+        let expected_height = level as u8;
         if node.height() != expected_height {
             // E_NHeight: "Invalid node height".
             report.node_height.push((name_u8(tree), node_num));
@@ -1036,7 +1050,7 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
                         report.sibling_link.push((name_u8(tree), next));
                         break;
                     }
-                    let expected_height = (tree_depth as i32 - level as i32 + 1) as u8;
+                    let expected_height = level as u8;
                     if next_node.height() != expected_height {
                         report.node_height.push((name_u8(tree), next));
                     }
@@ -1186,7 +1200,11 @@ fn check_child<D: crate::blockdev::BlockDevice + ?Sized>(
     }
     let bytes = bt.read_node_bytes(child)?;
     let node = bt.parse_node(&bytes)?;
-    let expected = (tree_depth as i32 - level as i32 + 1) as u8;
+    // `level` is the depth-minus-index-levels count for this node, which *is* its
+    // height. The `- level + 1` form of this formula appears three times in this
+    // file and all three were wrong in the same way; see the root check above.
+    let _ = tree_depth;
+    let expected = level as u8;
     if node.height() != expected {
         report.node_height.push((name_u8(tree), child));
     }

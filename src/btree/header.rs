@@ -276,6 +276,99 @@ impl BTreeHeader {
     }
 }
 
+/// Allocate a node number from the header node's node map, and mark it in use.
+///
+/// # What a node map is
+///
+/// A B-tree cannot grow by reallocating, so a spare node has to be *found* rather
+/// than created. It is found in a map: the header node's records from index 2
+/// onward are bitmaps, one bit per node, most significant bit first like every
+/// other bitmap in HFS+. A set bit is a node in use. Each map record covers
+/// `record_length * 8` nodes, and further map nodes are chained from the header
+/// node's `fLink`.
+///
+/// This is not guessable from the outside -- the map is a *record inside the header
+/// node*, sharing its offset array -- and getting the starting index wrong reads
+/// the `BTHeaderRec` as a bitmap and hands out node 0, which is the header node
+/// itself. Writing an index node over node 0 is then the most natural-looking
+/// corruption in the world: the tree still parses, and the header record is simply
+/// gone.
+///
+/// # Errors
+///
+/// Nothing free below `total_nodes`: the file would have to grow, which means
+/// allocating blocks for it. Named rather than done, because growing a B-tree file
+/// is the same problem as growing a fork, one level down.
+///
+/// Mining reference: `AllocateNode` and `GetMapNode` in `core/BTreeAllocate.c`.
+/// `GetMapNode` starts at `mapIndex = 2`, which is where the map records begin.
+pub fn allocate_node(
+    header_node: &mut [u8],
+    total_nodes: u32,
+    free_nodes: &mut u32,
+) -> Result<u32> {
+    let records = super::node::num_records(header_node)? as usize;
+    let mut node_number = 0u32;
+
+    for index in 2..records {
+        let at = super::node::read_offset(header_node, index)?;
+        let end = super::node::read_offset(header_node, index + 1)?;
+        let Some(map) = header_node.get_mut(at..end) else {
+            continue;
+        };
+        // A word at a time, high bit first: bit 0 of the record is node 0, and the
+        // high bit of the first `u16` is that bit 0.
+        for (word_index, chunk) in map.chunks_mut(2).enumerate() {
+            if chunk.len() < 2 {
+                break;
+            }
+            let word = u16::from_be_bytes([chunk[0], chunk[1]]);
+            if word == u16::MAX {
+                continue;
+            }
+            let bit = (!word).leading_zeros();
+            let found = node_number + (word_index as u32) * 16 + bit;
+            if found >= total_nodes {
+                return Err(Error::invalid(
+                    "BTHeaderRec.totalNodes",
+                    format!(
+                        "every node below {total_nodes} is in use; the B-tree file \
+                         would have to grow, which needs block allocation"
+                    ),
+                ));
+            }
+            // `bit` counts from the word's most significant bit, so it is a byte
+            // index and a bit within that byte.
+            chunk[(bit / 8) as usize] |= 0x80 >> (bit % 8);
+            // `freeNodes` is a cached count the header carries so allocation need
+            // not scan; Apple decrements it here for the same reason.
+            *free_nodes = free_nodes.saturating_sub(1);
+            return Ok(found);
+        }
+        node_number += (map.len() * 8) as u32;
+    }
+    Err(Error::invalid(
+        "BTHeaderRec",
+        "the header node has no free map record left; the node map itself would \
+         have to be extended",
+    ))
+}
+
+/// Byte offset of `treeDepth` within the header record. A `u16`.
+pub const TREE_DEPTH_OFFSET: u64 = 0;
+
+/// Byte offset of `rootNode` within the header record.
+pub const ROOT_NODE_OFFSET: u64 = 2;
+
+/// Byte offset of `lastLeafNode` within the header record.
+pub const LAST_LEAF_OFFSET: u64 = 14;
+
+/// Byte offset of `totalNodes` within the header record.
+pub const TOTAL_NODES_OFFSET: u64 = 22;
+
+/// Byte offset of `freeNodes` within the header record.
+pub const FREE_NODES_OFFSET: u64 = 26;
+
 #[cfg(test)]
 mod tests {
     use super::*;

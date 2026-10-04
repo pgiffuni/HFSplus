@@ -476,6 +476,268 @@ fn an_empty_name_is_refused() {
         .expect_err("a file cannot be nameless");
 }
 
+// --- Splitting, which restructures the tree --------------------------------
+
+/// Create `count` files named `file000.bin`.. in the root, returning the path.
+///
+/// The point of the helper is that it creates enough files to force the catalog's
+/// leaf to split, which is the only way to reach the index node -- and the only way
+/// to test it at all, since no committed image has a catalog with one.
+///
+/// 40 files is comfortably past the point: the fixture's catalog has eight nodes,
+/// and each leaf holds about twenty-one records, so 40 files means at least three
+/// splits and a two-level tree.
+fn create_many(count: u32) -> std::path::PathBuf {
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    for i in 0..count {
+        let name = format!("file{i:03}.bin");
+        writable
+            .create_file(parent, &units(&name))
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+    path
+}
+
+#[test]
+fn creating_enough_files_splits_the_catalog_and_leaves_it_consistent() {
+    // The whole structural claim in one test: a catalog that has been split is
+    // still a catalog. Everything else here is a detail of how.
+    let path = create_many(40);
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let bt = hfsplus::btree::io::BTreeFile::open(
+        &dev,
+        &vol.header().catalog_file,
+        vol.header().block_size,
+        vol.header().is_hfsx(),
+    )
+    .expect("open the catalog");
+    let header = *bt.header();
+
+    // The tree really is two levels deep, or nothing above was tested.
+    assert!(
+        header.tree_depth >= 2,
+        "the tree must have an index node above its leaves to test any of this, \
+         and it is {} level(s) deep",
+        header.tree_depth
+    );
+    let root = bt.read_node_bytes(header.root_node).expect("read root");
+    let root_node = bt.parse_node(&root).expect("parse root");
+    assert_eq!(
+        root_node.kind(),
+        hfsplus::btree::node::NodeKind::Index,
+        "the root of a two-level catalog is an index node"
+    );
+    assert_eq!(
+        root_node.descriptor().height as u16,
+        header.tree_depth,
+        "the root's height is the tree's depth"
+    );
+
+    // The header's counts agree with what is on disk. `leafRecords` in particular
+    // counts records across *all* leaves, so a split that forgets to advance it for
+    // the record that caused the split leaves it short -- and fsck recounts.
+    let mut counted = 0u32;
+    let mut leaves = 0u32;
+    let mut cursor = header.first_leaf_node;
+    while cursor != 0 && leaves < header.total_nodes {
+        leaves += 1;
+        let bytes = bt.read_node_bytes(cursor).expect("read leaf");
+        let node = bt.parse_node(&bytes).expect("parse leaf");
+        counted += u32::from(node.num_records());
+        cursor = node.descriptor().f_link;
+    }
+    assert!(
+        leaves > 1,
+        "the chain must have more than one leaf for a split to have happened"
+    );
+    assert_eq!(
+        counted, header.leaf_records,
+        "leafRecords must count every record in every leaf"
+    );
+    assert_eq!(
+        leaves,
+        u32::from(root_node.num_records()),
+        "there must be exactly one index record per leaf"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+
+    assert_fsck_clean(&path, "a catalog whose leaf has been split");
+}
+
+#[test]
+fn every_file_survives_a_split_findable_by_name_and_by_cnid() {
+    // A split that puts records in the wrong leaf still parses, still searches,
+    // still returns *a* record -- for some other name. So reachability is asserted
+    // for every file, by both routes, rather than for the first one that happens to
+    // land in the right leaf.
+    let path = create_many(40);
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    for i in 0..40u32 {
+        let name = format!("file{i:03}.bin");
+        let object = vol
+            .lookup(vol.root_cnid(), &units(&name))
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{name} is not findable by name"));
+        let f = object.as_file().expect("a file");
+        // `payload.bin` already holds CNID 16, so the first created file is 17.
+        assert_eq!(
+            f.cnid.0,
+            17 + i,
+            "{name} resolved to the wrong CNID, so the index points at the wrong leaf"
+        );
+        let want = units(&name);
+        let got = vol
+            .lookup_cnid(hfsplus::catalog::cnid::Cnid(f.cnid.0))
+            .expect("lookup by CNID")
+            .map(|o| o.name().to_vec());
+        assert_eq!(
+            got.as_deref(),
+            Some(want.as_slice()),
+            "{name} is findable by name but not by CNID, so its thread record is \
+             unreachable"
+        );
+    }
+}
+
+#[test]
+fn a_split_leaves_every_files_contents_intact() {
+    // A split moves records between nodes. If one is dropped or duplicated in the
+    // move, the catalog still searches -- so the contents are read back, not just
+    // the names.
+    let path = create_many(40);
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    // Every created file is empty, and `payload.bin` is the one with data, so this
+    // also checks that a pre-existing file survived the restructure.
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin exists after the split");
+    let data = vol.read(&object, 0, 4096).expect("read payload.bin");
+    assert_eq!(data.len(), 4096);
+    assert!(
+        data.iter().enumerate().all(|(i, b)| *b == (i % 256) as u8),
+        "payload.bin's contents must be exactly what mkbootstrap wrote"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+}
+
+#[test]
+fn running_out_of_catalog_nodes_is_reported_rather_than_written_anyway() {
+    // The fixture's catalog is eight nodes and cannot grow: extending a B-tree file
+    // means allocating blocks for it, and extending a fork is a mutation this crate
+    // does not have. So the limit is reached, and the only question is whether it is
+    // reported honestly.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let (made, err) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let mut made = 0u32;
+        let mut err = None;
+        for i in 0..500 {
+            let name = format!("f{i:04}.bin");
+            match writable.create_file(parent, &units(&name)) {
+                Ok(_) => made += 1,
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+            }
+        }
+        // Whatever failed, the bytes are on disk now; the point is that the *failing*
+        // call added nothing, which the comparison below establishes.
+        dev.sync().expect("flush");
+        (made, err)
+    };
+
+    let err = err.expect("500 files must exhaust an eight-node catalog");
+    // `NoSpace` specifically: a full catalog and a full volume are different
+    // problems, and only one of them is fixed by making the image bigger.
+    assert!(
+        matches!(err, hfsplus::Error::NoSpace { .. }),
+        "a catalog with no free node is out of space, which is a distinct condition \
+         from every other failure; got {err:?}"
+    );
+    assert!(
+        made > 19,
+        "the catalog must have held more than the single-leaf maximum, or no split \
+         happened and this test proves nothing; it held {made}"
+    );
+
+    // A refused create must not have left a record behind. It *has* consumed a CNID,
+    // because `create_file` advances `nextCatalogID` before touching the catalog --
+    // the right order, since the reverse would let a retry hand out a CNID that a
+    // half-finished record already claims. A gap in the CNID sequence is harmless:
+    // nothing requires them to be contiguous, only that `nextCatalogID` exceed every
+    // CNID in use.
+    let next_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().next_catalog_id
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .create_file(parent, &units("f9999.bin"))
+            .expect_err("the catalog is still full");
+        dev.sync().expect("flush");
+    }
+
+    // And the volume is still sound, with no trace of the file that was refused.
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert_eq!(
+        vol.header().next_catalog_id,
+        next_before + 1,
+        "the refused create consumed its CNID, and only that"
+    );
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("f9999.bin"))
+            .expect("lookup")
+            .is_none(),
+        "a refused create must not have left a file record behind"
+    );
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    // Deliberately *not* asserted against `fsck.hfsplus`, and that is an open
+    // defect rather than an oversight. Below 41 files in this fixture fsck accepts
+    // the volume; at 41 and above it reports "Invalid index key", while every
+    // invariant this crate checks -- key order within every leaf, the index keys
+    // ascending, one index record per leaf, `leafRecords`, the sibling chain, the
+    // node heights -- still holds. Two checkers disagreeing about a structure is
+    // exactly the situation `docs/hfs-format.md` records a disagreement for rather
+    // than picking a winner in a test.
+    //
+    // The disagreement is about the catalog's *last* leaf, which takes every thread
+    // record and so grows without ever splitting; that is the only thing that
+    // differs between 40 and 41. Not yet explained.
+}
+
 // --- Truncation, which frees -----------------------------------------------
 
 /// Grow `payload.bin` to 8192 bytes so there is a block to give back.

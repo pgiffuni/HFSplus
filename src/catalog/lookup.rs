@@ -375,6 +375,16 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
         let mut lo = 0u16;
         let mut hi = node.num_records();
 
+        // An HFS+ index record holds the *first* key of the subtree it points at, so
+        // the child for a key is the one whose first key is the greatest not
+        // exceeding it: an **upper** bound over the separators. A lower bound -- the
+        // first separator greater than or equal to the key -- reads as though the
+        // record held the *last* key of the subtree before it, and sends every key
+        // to the following subtree: lookups miss, silently, on a tree that is
+        // perfectly valid.
+        //
+        // `lo` ends up one past the answer, because the loop keeps the first
+        // separator that is strictly greater than the key.
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             let rec = node.record(mid)?;
@@ -384,25 +394,36 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
                     "key could not be decoded",
                 ));
             };
-            if self.compare_keys(&k, key) == Ordering::Less {
-                lo = mid + 1;
-            } else {
+            if self.compare_keys(&k, key) == Ordering::Greater {
                 hi = mid;
+            } else {
+                lo = mid + 1;
             }
         }
+        // A key below every separator belongs to the first subtree, which is why
+        // this saturates rather than being an error: the first leaf holds the root
+        // folder and everything sorted before the second leaf's first key.
+        let lo = lo.saturating_sub(1);
 
         // The child pointer is the first u32 *after* the key, so the record has to
         // be re-read to find where it starts.
+        //
+        // `record_key_len` returns the key's size on disk -- its length plus the
+        // two-byte prefix, padded to an even count -- so the child begins exactly
+        // there. Adding 4 to it lands one past the child's *end*, which the bounds
+        // check below then reads as a truncated record. That check has to be on
+        // `child_off + 4`, not on `child_off`: a record whose key ends at the very
+        // last byte satisfies `child_off <= len` and still has no child in it.
         let rec = node.record(lo)?;
         let key_len = record_key_len(rec, max_key)?;
-        let child_off = key_len
-            .checked_add(4)
-            .filter(|off| *off <= rec.len())
-            .ok_or(Error::Truncated {
+        let child_off = key_len;
+        if child_off.saturating_add(4) > rec.len() {
+            return Err(Error::Truncated {
                 what: "catalog index record",
-                needed: key_len + 4,
+                needed: child_off.saturating_add(4),
                 available: rec.len(),
-            })?;
+            });
+        }
         let child = u32::from_be_bytes(
             rec.get(child_off..child_off + 4)
                 .and_then(|s| s.try_into().ok())

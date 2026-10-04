@@ -741,6 +741,12 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// give two objects the same identity -- which for a filesystem means a hard
     /// link, silently, rather than an error.
     ///
+    /// The header goes down *first*, before the catalog is touched, so a failure
+    /// later in this method leaves a CNID consumed rather than a record claiming one
+    /// the header would hand out again. The cost is a gap in the sequence on every
+    /// refused create, which is harmless: HFS+ requires only that `nextCatalogID`
+    /// exceed every CNID in use, never that they be contiguous.
+    ///
     /// # What it refuses
     ///
     /// - **A name that already exists**, rather than creating a second record under
@@ -829,9 +835,14 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.insert_catalog_record(&child)?;
         self.insert_catalog_record(&thread_record)?;
         self.bump_folder_valence(parent, now)?;
-        self.write_header_u32(32, self.header.file_count + 1)?;
+        // Both counters advance in memory as well as on disk. Writing
+        // `self.header.file_count + 1` without incrementing it writes the *same*
+        // value on every call, so a volume that gains three files reports one --
+        // and fsck counts files independently, so it is fsck that catches it.
+        let file_count = self.header.file_count + 1;
+        self.header.file_count = file_count;
         self.header.next_catalog_id = cnid + 1;
-        self.header.file_count += 1;
+        self.write_header_u32(32, file_count)?;
         Ok(cnid)
     }
 
@@ -887,6 +898,462 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             crate::blockdev::VOLUME_HEADER_OFFSET + offset,
             &value.to_be_bytes(),
         )
+    }
+
+    /// Split the first leaf so `record` has somewhere to go, and insert it.
+    ///
+    /// Called only when an insertion into a leaf has been refused for want of room.
+    /// Four structures change, each for its own reason:
+    ///
+    /// 1. **A new leaf node**, allocated from the header node's map. The records are
+    ///    divided at the midpoint by *bytes*, not by count: a leaf holding one huge
+    ///    record and many tiny ones, divided by count, would leave one half nearly
+    ///    empty and the other overfull, and the overfull one would split again
+    ///    immediately.
+    /// 2. **The leaf chain**, which is doubly linked, so inserting a leaf touches
+    ///    three links and not one. `before: leaf <-> next` becomes
+    ///    `leaf <-> new <-> next`: the new leaf inherits `next`, and `next`'s
+    ///    `bLink` is repointed at it. Giving the new leaf an `fLink` of zero --
+    ///    what a "the new leaf is last" shortcut yields -- truncates the chain, and
+    ///    fsck reports the remainder as an invalid sibling link while every leaf it
+    ///    can still reach looks fine.
+    /// 3. **The parent**, which gains a key pointing at the new leaf.
+    /// 4. **The header**, which loses two `freeNodes`.
+    ///
+    /// `leafRecords` does **not** change: a split redistributes records between two
+    /// nodes, so the total across all leaves is the same before and after.
+    ///
+    /// # Is the leaf its own parent?
+    ///
+    /// Tested as `root_node == leaf_num`, *not* `tree_depth == 0`. Apple counts the
+    /// leaf level in `treeDepth`: `BTInsertRecord`'s empty-tree case creates a leaf
+    /// and sets `treeDepth = 1`, so a tree with one leaf has `treeDepth == 1` and its
+    /// root *is* the leaf. Reaching for `depth == 0` finds a tree of depth 1 with a
+    /// leaf as its root, concludes there is a parent, and writes an index record
+    /// into a leaf -- which still parses and still searches, and returns a leaf that
+    /// does not contain the key.
+    ///
+    /// # What it refuses
+    ///
+    /// A tree more than one level deep, whose parent index node would itself need
+    /// splitting. That is the same algorithm one level up, and refusing by name
+    /// beats a half-split index node.
+    ///
+    /// Mining reference: `core/BTree.c` `BTInsertRecord` checks the fit and hands off
+    /// to `InsertTree`; `GetNewNode` sets the new node's kind and height, and
+    /// `firstLeafNode`/`lastLeafNode` are updated with the control block *before*
+    /// the node is written, because `UpdateNode` compares the node's height against
+    /// `treeDepth`.
+    fn split_leaf_and_insert(&mut self, record: &[u8], at: u16) -> Result<()> {
+        use crate::btree::header::{
+            allocate_node, FREE_NODES_OFFSET, LAST_LEAF_OFFSET, ROOT_NODE_OFFSET, TREE_DEPTH_OFFSET,
+        };
+
+        let node_size = self.catalog_node_size()?;
+        // 2 is the normal depth for a catalog with an index node above its leaves,
+        // so it is not a case to refuse. 3 or more means the leaf's parent is *not*
+        // the root, and adding a key to it may require splitting that parent too --
+        // the same algorithm one level up, and refused rather than half-done.
+        let tree_depth = self.btree_header_u16(TREE_DEPTH_OFFSET)?;
+        if tree_depth > 2 {
+            return Err(Error::invalid(
+                "catalog leaf",
+                format!(
+                    "the catalog is {tree_depth} levels deep and its leaf is full; \
+                     splitting the parent index node as well is not implemented"
+                ),
+            ));
+        }
+
+        let total_nodes = self.btree_header_u32(crate::btree::header::TOTAL_NODES_OFFSET)?;
+        let mut free_nodes = self.btree_header_u32(FREE_NODES_OFFSET)?;
+        let first_leaf = self.btree_header_u32(crate::btree::header::FIRST_LEAF_OFFSET)?;
+        // The leaf the key belongs to, not necessarily the first one. With an index
+        // node above the leaves they stop being interchangeable, and splitting the
+        // wrong one produces halves whose keys straddle another leaf's.
+        let leaf_num = self.leaf_for(record, first_leaf)?;
+        let last_leaf = self.btree_header_u32(LAST_LEAF_OFFSET)?;
+        let root_node = self.btree_header_u32(ROOT_NODE_OFFSET)?;
+        let leaf_is_root = root_node == leaf_num;
+
+        // Two nodes when the leaf is the root -- a new leaf and a new index node --
+        // and one otherwise. Checked before allocating anything, so a refusal leaves
+        // the map exactly as it was.
+        let needed = if leaf_is_root { 2u32 } else { 1u32 };
+        if free_nodes < needed {
+            return Err(Error::no_space(needed, u64::from(free_nodes)));
+        }
+
+        let mut header = self.read_catalog_node(0)?;
+        let new_leaf = allocate_node(&mut header, total_nodes, &mut free_nodes)?;
+        let new_root = if leaf_is_root {
+            Some(allocate_node(&mut header, total_nodes, &mut free_nodes)?)
+        } else {
+            None
+        };
+        // The map goes to disk before anything points into it. A node allocated and
+        // not yet referenced is a spare node; a node referenced and not yet
+        // allocated is a tree that follows a link off its own map.
+        self.write_catalog_node(0, &header)?;
+        self.write_btree_header_u32(FREE_NODES_OFFSET, free_nodes)?;
+
+        let leaf = self.read_catalog_node(leaf_num)?;
+        // A node's height is `treeDepth` less the number of index levels above it:
+        // the root sits at `treeDepth`, and a leaf under a single index node at 1.
+        // A one-leaf catalog is the degenerate case -- the root *is* the leaf -- and
+        // `mkfs.hfsplus` writes it at height 1 with `treeDepth` 1, which is the same
+        // rule.
+        //
+        // So the leaves keep height 1 across a split, and the index node introduced
+        // above them takes the new `treeDepth`. Getting that backwards is invisible
+        // until a catalog has two levels, at which point every node in it disagrees
+        // with the depth.
+        let height = leaf[9];
+        let count = usize::from(crate::btree::node::num_records(&leaf)?);
+        let split_at = Self::split_point(&leaf, count, node_size)?;
+        let (lower, upper) = Self::divide(&leaf, split_at, record, at)?;
+
+        let old_f_link = u32::from_be_bytes([leaf[0], leaf[1], leaf[2], leaf[3]]);
+        // The new leaf inherits the old leaf's forward link and points back at it;
+        // the old leaf's forward link becomes the new leaf, and its own back link is
+        // unchanged because its predecessor has not moved.
+        self.write_catalog_node(
+            new_leaf,
+            &Self::build_node(node_size, 0xFF, height, old_f_link, leaf_num, &upper.0)?,
+        )?;
+        // The split leaf keeps its own back link. Zeroing it is only right when the
+        // split leaf is the first, and a tree with one leaf is the only place that
+        // is true -- so zeroing it unconditionally breaks the chain the moment a
+        // second leaf exists, which fsck reports as an invalid sibling link.
+        self.write_catalog_node(
+            leaf_num,
+            &Self::build_node(
+                node_size,
+                0xFF,
+                height,
+                new_leaf,
+                u32::from_be_bytes([leaf[4], leaf[5], leaf[6], leaf[7]]),
+                &lower.0,
+            )?,
+        )?;
+        if old_f_link != 0 {
+            let mut successor = self.read_catalog_node(old_f_link)?;
+            successor[4..8].copy_from_slice(&new_leaf.to_be_bytes());
+            self.write_catalog_node(old_f_link, &successor)?;
+        }
+        if last_leaf == leaf_num {
+            self.write_btree_header_u32(LAST_LEAF_OFFSET, new_leaf)?;
+        }
+
+        // The parent. Either a brand-new root, or -- since the tree is one level of
+        // index above the leaves -- the root index node, rebuilt.
+        //
+        // Rebuilt rather than patched, and that is not a shortcut. A key inserted at
+        // a searched position is correct only if the search agrees with the
+        // partitioning the insert is meant to maintain; one wrong comparison and the
+        // index describes leaves its keys do not lead to. fsck reports that as an
+        // invalid index link and no reader can detect it -- the tree still searches,
+        // and returns a leaf that does not contain the key. Walking the chain cannot
+        // be wrong, because the chain is the truth.
+        if let Some(root) = new_root {
+            let node = Self::build_node(
+                node_size,
+                // `kBTIndexNode` is 0. `kBTHeaderNode` is 1, and using it produces a
+                // node that parses as a header -- so the `BTHeaderRec` at offset 14
+                // is read as its first record, and fsck reports "Invalid key
+                // length" from inside a record that is not a record at all.
+                0x00,
+                // The root index node's height is the tree's depth -- the root sits
+                // at `treeDepth` -- and this is the *new* depth, one more than the
+                // tree the leaf was the root of. Writing the old depth here gives the
+                // root the same height as the leaves below it, which fsck reports as
+                // an invalid node height.
+                (tree_depth + 1) as u8,
+                0,
+                0,
+                &[
+                    Self::index_record(&lower.0[0], leaf_num)?,
+                    Self::index_record(&upper.0[0], new_leaf)?,
+                ],
+            )?;
+            self.write_catalog_node(root, &node)?;
+            self.write_btree_header_u32(ROOT_NODE_OFFSET, root)?;
+            // `treeDepth` counts the index levels *above* the leaves, so a tree with
+            // an index node is one deeper than the tree it replaces. Apple creates
+            // the first leaf with `treeDepth = 1`, and the split that introduces an
+            // index node makes it 2 -- leaving it at 1 is what makes fsck report
+            // "Invalid node height", because the root index node is then shallower
+            // than the tree it roots.
+            //
+            // The depth goes in *before* the root pointer: `UpdateNode` compares a
+            // node's height against `treeDepth`, and a writer that sees the new root
+            // before the depth is 2 reads a header describing a deeper tree than the
+            // nodes do.
+            self.write_btree_header_u16(TREE_DEPTH_OFFSET, tree_depth + 1)?;
+        } else {
+            let records = self.index_records_for_chain()?;
+            let root = self.read_catalog_node(root_node)?;
+            let node = Self::build_node(node_size, 0x00, root[9], 0, 0, &records)?;
+            self.write_catalog_node(root_node, &node)?;
+        }
+        Ok(())
+    }
+
+    /// One index record per leaf, in chain order: each leaf's first record's key,
+    /// then that leaf's node number.
+    ///
+    /// The index record is `[u16 keyLength][key][u32 child]` -- the key copied
+    /// verbatim from the leaf record, including its length prefix, so the two can
+    /// never disagree about how long the key is. Mining reference:
+    /// `GetChildNodeNum` reads the child from `CalcKeySize` bytes past the record,
+    /// and `CalcKeySize` is `key.length16 + 2` with no masking.
+    ///
+    /// Bounded by the node count, so a chain with a cycle in it terminates instead
+    /// of spinning.
+    fn index_records_for_chain(&self) -> Result<Vec<Vec<u8>>> {
+        let total = self.btree_header_u32(crate::btree::header::TOTAL_NODES_OFFSET)?;
+        let mut records = Vec::new();
+        let mut cursor = self.btree_header_u32(crate::btree::header::FIRST_LEAF_OFFSET)?;
+        let mut seen = 0u32;
+        while cursor != 0 && seen < total {
+            seen += 1;
+            let leaf = self.read_catalog_node(cursor)?;
+            if leaf[8] != 0xFF {
+                return Err(Error::invalid(
+                    "catalog leaf chain",
+                    format!("node {cursor} is in the leaf chain but is not a leaf"),
+                ));
+            }
+            // A leaf with no records has no first key, and an index record needs
+            // one -- a key every search in this subtree would be compared against.
+            if crate::btree::node::num_records(&leaf)? == 0 {
+                return Err(Error::invalid(
+                    "catalog leaf chain",
+                    format!("node {cursor} is an empty leaf in the chain"),
+                ));
+            }
+            let first = Self::record_at(&leaf, 0)?;
+            records.push(Self::index_record(&first, cursor)?);
+            cursor = u32::from_be_bytes([leaf[0], leaf[1], leaf[2], leaf[3]]);
+        }
+        Ok(records)
+    }
+
+    /// Build a node of `kind` and `height` holding `records`.
+    ///
+    /// Laid out as `mkfs.hfsplus` writes it: the descriptor first, then records
+    /// ascending from byte 14, then the offset array at the end. `fLink` is at 0 and
+    /// `bLink` at 4 -- a descriptor's links come *before* its kind and height, and
+    /// swapping them produces a node that parses but links nowhere.
+    fn build_node(
+        node_size: usize,
+        kind: u8,
+        height: u8,
+        f_link: u32,
+        b_link: u32,
+        records: &[Vec<u8>],
+    ) -> Result<Vec<u8>> {
+        use crate::btree::node::{set_record_count, write_offset, NODE_DESCRIPTOR_SIZE};
+
+        let total: usize = records.iter().map(Vec::len).sum();
+        let needed = NODE_DESCRIPTOR_SIZE + total + (records.len() + 1) * 2;
+        if needed > node_size {
+            return Err(Error::no_space(needed as u32, node_size as u64));
+        }
+        let mut node = vec![0u8; node_size];
+        node[0..4].copy_from_slice(&f_link.to_be_bytes());
+        node[4..8].copy_from_slice(&b_link.to_be_bytes());
+        node[8] = kind;
+        node[9] = height;
+        let mut at = NODE_DESCRIPTOR_SIZE;
+        for (i, rec) in records.iter().enumerate() {
+            node[at..at + rec.len()].copy_from_slice(rec);
+            write_offset(&mut node, i, at)?;
+            at += rec.len();
+        }
+        write_offset(&mut node, records.len(), at)?;
+        set_record_count(&mut node, records.len() as u16)?;
+        Ok(node)
+    }
+
+    /// An index record: the key, then the child.
+    ///
+    /// `record` is a whole leaf record, and only its *key* is copied -- the bytes
+    /// up to and including the key. Copying the body too produces an index record
+    /// whose child is not where a reader looks for it: `GetChildNodeNum` reads the
+    /// child `CalcKeySize` bytes past the record's start, which is immediately
+    /// after the key, so the first four bytes of the *body* are read as the child.
+    /// On a catalog that is the file record's type and flags word, and fsck reports
+    /// the result as an invalid index link -- while a reader that happens to take
+    /// the child from the end of the record works perfectly, which is what makes
+    /// it so easy to ship.
+    fn index_record(record: &[u8], child: u32) -> Result<Vec<u8>> {
+        let key_len = usize::from(u16::from_be_bytes([record[0], record[1]]));
+        let end = 2usize.checked_add(key_len).ok_or(Error::Truncated {
+            what: "catalog key",
+            needed: key_len + 2,
+            available: record.len(),
+        })?;
+        let mut rec = record
+            .get(..end)
+            .ok_or(Error::Truncated {
+                what: "catalog key",
+                needed: end,
+                available: record.len(),
+            })?
+            .to_vec();
+        rec.extend_from_slice(&child.to_be_bytes());
+        Ok(rec)
+    }
+
+    /// Record `index`'s bytes.
+    ///
+    /// Bounds-checked rather than sliced: a node with no records has no slot 1 to
+    /// read an end offset from, and the slot that is there belongs to whatever was
+    /// in the node before -- which can be *larger*, giving an inverted range. That
+    /// is a panic, and a panic on an untrusted image is the one thing this crate
+    /// must never do.
+    fn record_at(node: &[u8], index: usize) -> Result<Vec<u8>> {
+        let count = usize::from(crate::btree::node::num_records(node)?);
+        if index >= count {
+            return Err(Error::invalid(
+                "btree node record",
+                format!("record {index} of a node holding {count}"),
+            ));
+        }
+        let start = crate::btree::node::read_offset(node, index)?;
+        let end = crate::btree::node::read_offset(node, index + 1)?;
+        let bytes = node.get(start..end).ok_or(Error::Truncated {
+            what: "btree node record",
+            needed: end,
+            available: node.len(),
+        })?;
+        Ok(bytes.to_vec())
+    }
+
+    /// The index at which to divide a leaf's records, by bytes.
+    fn split_point(node: &[u8], count: usize, node_size: usize) -> Result<usize> {
+        let mut used = 0usize;
+        let mut split = 0usize;
+        for i in 0..count {
+            let start = crate::btree::node::read_offset(node, i)?;
+            let end = crate::btree::node::read_offset(node, i + 1)?;
+            used += end - start;
+            split = i + 1;
+            if used.saturating_mul(2) >= node_size {
+                break;
+            }
+        }
+        // Both halves non-empty, and never a no-op.
+        Ok(split.clamp(1, count.saturating_sub(1).max(1)))
+    }
+
+    /// Divide a leaf's records at `split_at`, putting `record` into whichever half
+    /// its insertion index falls in.
+    fn divide(
+        node: &[u8],
+        split_at: usize,
+        record: &[u8],
+        at: u16,
+    ) -> Result<(SplitHalf, SplitHalf)> {
+        let count = usize::from(crate::btree::node::num_records(node)?);
+        let mut lower = Vec::new();
+        let mut upper = Vec::new();
+        for i in 0..count {
+            let rec = Self::record_at(node, i)?;
+            if i < split_at {
+                lower.push(rec);
+            } else {
+                upper.push(rec);
+            }
+        }
+        let target = usize::from(at);
+        if target <= split_at {
+            lower.insert(target.min(lower.len()), record.to_vec());
+        } else {
+            upper.insert(
+                target.saturating_sub(split_at).min(upper.len()),
+                record.to_vec(),
+            );
+        }
+        // A split must leave *both* halves non-empty. With one record to divide --
+        // a leaf holding a single record, which a leaf holding only a folder and
+        // its thread does -- `split_at` lands such that one half would take nothing
+        // but the new record's neighbour, and a leaf with no records has no offset
+        // slot to read, so the tree's own descent cannot find it. One record moves
+        // across to keep the invariant.
+        if upper.is_empty() && lower.len() > 1 {
+            upper.push(lower.pop().expect("lower is not empty"));
+        } else if lower.is_empty() && upper.len() > 1 {
+            lower.push(upper.remove(0));
+        }
+        Ok((SplitHalf(lower), SplitHalf(upper)))
+    }
+
+    /// Read a `u16` field of the catalog's B-tree header record.
+    fn btree_header_u16(&self, offset: u64) -> Result<u16> {
+        let node = self.read_catalog_node(0)?;
+        let at = crate::btree::header::HEADER_RECORD_OFFSET + offset as usize;
+        let bytes = node.get(at..at + 2).ok_or(Error::Truncated {
+            what: "BTHeaderRec",
+            needed: at + 2,
+            available: node.len(),
+        })?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    /// Write a `u16` field of the catalog's B-tree header record.
+    fn write_btree_header_u16(&mut self, offset: u64, value: u16) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        let at = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            bt.node_offset(0)? + crate::btree::header::HEADER_RECORD_OFFSET as u64
+        };
+        self.device.write_at(at + offset, &value.to_be_bytes())
+    }
+
+    /// Read a `u32` field of the catalog's B-tree header record.
+    fn btree_header_u32(&self, offset: u64) -> Result<u32> {
+        let node = self.read_catalog_node(0)?;
+        let at = crate::btree::header::HEADER_RECORD_OFFSET + offset as usize;
+        let bytes = node.get(at..at + 4).ok_or(Error::Truncated {
+            what: "BTHeaderRec",
+            needed: at + 4,
+            available: node.len(),
+        })?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// The catalog B-tree's node size, from the tree header rather than recomputed.
+    fn catalog_node_size(&self) -> Result<usize> {
+        use crate::btree::io::BTreeFile;
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        Ok(bt.node_size())
+    }
+
+    /// Write one catalog node's bytes.
+    fn write_catalog_node(&mut self, node_num: u32, bytes: &[u8]) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        let at = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            bt.node_offset(node_num)?
+        };
+        self.device.write_at(at, bytes)
     }
 
     /// Locate any catalog record whose body names `cnid` in its `fileID`/`folderID`.
@@ -964,7 +1431,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // Everything that reads the device happens inside this one scope, because
         // `BTreeFile` and `Catalog` both borrow it and the write below needs it
         // mutably. The only things that cross the boundary are owned values.
-        let (at_node_offset, buf) = {
+        let (at_node_offset, patched) = {
             let bt = BTreeFile::open(
                 &*self.device,
                 &self.header.catalog_file,
@@ -972,7 +1439,9 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 self.header.is_hfsx(),
             )?;
             let btree_header = *bt.header();
-            let node_num = btree_header.first_leaf_node;
+            // The leaf the key belongs to, not necessarily the first: with an index
+            // node above the leaves they stop being interchangeable.
+            let node_num = self.leaf_for(record, btree_header.first_leaf_node)?;
             let bytes = bt.read_node_bytes(node_num)?;
             let node = bt.parse_node(&bytes)?;
             if node.kind() != NodeKind::Leaf {
@@ -1028,32 +1497,201 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             }
 
             let mut buf = bytes;
-            match insert_record(&mut buf, usize::from(at), record) {
-                Ok(()) => {}
-                Err(crate::error::Error::NoSpace { .. }) => {
-                    return Err(Error::invalid(
-                        "catalog leaf",
-                        format!(
-                            "the catalog's leaf node has no room for a {}-byte \
-                             record; splitting a node is not implemented",
-                            record.len()
-                        ),
-                    ))
-                }
-                Err(e) => return Err(e),
-            }
-            (bt.node_offset(node_num)?, buf)
+            let fits = insert_record(&mut buf, usize::from(at), record).is_ok();
+            (
+                bt.node_offset(node_num)?,
+                if fits { Some(buf) } else { None },
+            )
         };
-        self.device.write_at(at_node_offset, &buf)?;
-        // `leafRecords` in the B-tree header counts the records in *all* leaf
-        // nodes. Leaving it alone is not a cosmetic omission: fsck counts the
-        // records it finds and reports "Invalid leaf record count" when the header
-        // disagrees, and every other implementation reading this tree uses the
-        // field to size its leaf-node map.
-        self.write_btree_header_u32(
-            crate::btree::header::LEAF_RECORDS_OFFSET,
-            self.btree_header_leaf_records()? + 1,
-        )
+        // The index the record would have taken, needed only by the split, which
+        // divides the records itself and puts `record` in whichever half this falls
+        // in. Computed outside the scope above because that scope holds the only
+        // borrow of the device that lets the split allocate nodes.
+        let at = if patched.is_some() {
+            0
+        } else {
+            self.insert_index(record)?
+        };
+        match patched {
+            Some(buf) => {
+                self.device.write_at(at_node_offset, &buf)?;
+                // `leafRecords` in the B-tree header counts the records in *all*
+                // leaf nodes. Leaving it alone is not a cosmetic omission: fsck
+                // counts the records it finds and reports "Invalid leaf record
+                // count" when the header disagrees, and every other implementation
+                // reading this tree uses the field to size its leaf-node map.
+                self.write_btree_header_u32(
+                    crate::btree::header::LEAF_RECORDS_OFFSET,
+                    self.btree_header_leaf_records()? + 1,
+                )
+            }
+            // The split writes the leaf itself, new record included.
+            None => {
+                self.split_leaf_and_insert(record, at)?;
+                // `leafRecords` counts records across *all* leaves, and the record
+                // that caused the split is one of them. A split redistributes what
+                // is already there -- that part changes no count -- but the record
+                // that triggered it is new, so the header still advances by one.
+                // Forgetting this leaves the count short by one per split, which
+                // fsck reports as "Invalid leaf record count" and which no reader
+                // would notice.
+                self.write_btree_header_u32(
+                    crate::btree::header::LEAF_RECORDS_OFFSET,
+                    self.btree_header_leaf_records()? + 1,
+                )
+            }
+        }
+    }
+
+    /// The leaf that should receive `record`.
+    ///
+    /// The *first* leaf only while there is one leaf. With an index node above
+    /// them, leaves stop being interchangeable: inserting into the first leaf puts
+    /// a key where it does not belong, and the damage shows later rather than now
+    /// -- the leaf still searches, still returns a record for some other name, and
+    /// the next split divides it into halves whose keys *straddle* another leaf's.
+    ///
+    /// So the tree is descended rather than guessed at, and the descent uses the
+    /// same rule as the reader's -- `Catalog::descend_index`: the child for a key
+    /// is the **first** index record whose key is greater than or equal to it.
+    ///
+    /// # Which way round that is
+    ///
+    /// An HFS+ index record holds the *first key of the subtree it points at*, not
+    /// the last key of the subtree before it. So the child for `K` is the first
+    /// record with key >= K -- a lower bound. Reaching for the greatest key <= K
+    /// instead, which is the other plausible reading, sends every key to the last
+    /// leaf whose first key does not exceed it: keys accumulate in the wrong leaves,
+    /// the leaves stop being contiguous ranges, and a split of a leaf produces two
+    /// halves whose keys interleave with another leaf's. The tree still searches,
+    /// and still returns a record for some other name.
+    ///
+    /// The comparison is the tree's own comparator, because a byte comparison would
+    /// put `file10` before `file9` on a case-insensitive volume.
+    fn leaf_for(&self, record: &[u8], fallback_leaf: u32) -> Result<u32> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let max_key = usize::from(btree_header.max_key_length);
+        let incoming = CatalogKey::from_record(record, max_key)
+            .map_err(|e| Error::invalid("catalog key", e.to_string()))?;
+        let catalog = crate::catalog::lookup::Catalog::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+
+        let mut node_num = btree_header.root_node;
+        // Bounded by the node count, so a cycle in a corrupted tree terminates.
+        let mut budget = btree_header.total_nodes;
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            match node.kind() {
+                NodeKind::Leaf => return Ok(node_num),
+                NodeKind::Header => return Ok(fallback_leaf),
+                _ => {}
+            }
+
+            // Lower bound over the node's keys.
+            let mut lo = 0u16;
+            let mut hi = node.num_records();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some((k, _)) = split_record(node.record(mid)?) else {
+                    return Err(Error::invalid(
+                        "catalog index record",
+                        "key could not be decoded",
+                    ));
+                };
+                if catalog.compare_keys(&k, &incoming) == Ordering::Less {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            // A key greater than every index key belongs to the child of the *last*
+            // index record, not to the first leaf. That case is not exotic: it is
+            // every key above the largest one in the tree when the last leaf has
+            // room, which is the common case while a tree is growing. Falling back
+            // to `firstLeafNode` there puts those keys in the first leaf, and since
+            // they sort above the first leaf's own keys the leaf stops being a
+            // contiguous range -- so the next split cuts it into halves that
+            // interleave with another leaf's, and the chain is no longer in key
+            // order.
+            if node.num_records() == 0 {
+                return Ok(fallback_leaf);
+            }
+            let lo = lo.min(node.num_records() - 1);
+            let body = match split_record(node.record(lo)?) {
+                Some((_, body)) => body,
+                None => return Ok(fallback_leaf),
+            };
+            if body.len() < 4 {
+                return Err(Error::invalid(
+                    "catalog index record",
+                    format!(
+                        "index record body is {} bytes, too short for a child",
+                        body.len()
+                    ),
+                ));
+            }
+            node_num = u32::from_be_bytes([
+                body[body.len() - 4],
+                body[body.len() - 3],
+                body[body.len() - 2],
+                body[body.len() - 1],
+            ]);
+        }
+        Ok(fallback_leaf)
+    }
+
+    /// The index at which `record` would be inserted into the leaf it belongs to.
+    fn insert_index(&self, record: &[u8]) -> Result<u16> {
+        use crate::btree::io::BTreeFile;
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let max_key = usize::from(bt.header().max_key_length);
+        let leaf = self.leaf_for(record, bt.header().first_leaf_node)?;
+        let bytes = bt.read_node_bytes(leaf)?;
+        let node = bt.parse_node(&bytes)?;
+        let incoming = CatalogKey::from_record(record, max_key)
+            .map_err(|e| Error::invalid("catalog key", e.to_string()))?;
+        let catalog = crate::catalog::lookup::Catalog::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        for index in 0..node.num_records() {
+            let Some((existing, _)) = split_record(node.record(index)?) else {
+                continue;
+            };
+            if catalog.compare_keys(&existing, &incoming) != Ordering::Less {
+                return Ok(index);
+            }
+        }
+        Ok(node.num_records())
     }
 
     /// Read `leafRecords` from the catalog's B-tree header.
@@ -1692,6 +2330,12 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         })
     }
 }
+
+/// One half of a divided leaf.
+///
+/// A newtype so the signature reads as two halves rather than as
+/// `Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)>`, which says nothing about which is which.
+struct SplitHalf(Vec<Vec<u8>>);
 
 /// `kHFSPlusCatalogFile`, the catalog record type for a file.
 const CATALOG_FILE_RECORD: i16 = 2;
