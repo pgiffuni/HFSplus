@@ -832,9 +832,43 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         let mut thread_record = thread_key.to_record();
         thread_record.extend_from_slice(&thread);
 
+        // The two records go in together or not at all.
+        //
+        // A file record with no thread record is the worst of the possible partial
+        // states: the checker reports it as `missing_thread`, `fsck.hfsplus` rejects
+        // the volume, and the file is unreachable by CNID because a thread record is
+        // what a CNID resolves through. An orphan *thread* record is milder -- no
+        // check calls it out -- but the containing folder's `valence` is counted
+        // from thread records, so an orphan makes the declared child count disagree
+        // with what is there.
+        //
+        // So this rolls back rather than reordering. Reordering the two inserts
+        // would avoid the missing thread and introduce the valence disagreement
+        // instead, which is a trade and not a fix.
+        //
+        // The CNID counter is *not* rolled back. It is written first, before
+        // anything else, precisely so that a failure here cannot hand the same CNID
+        // out twice; undoing it would reintroduce that. A gap in the CNID sequence
+        // is harmless -- HFS+ requires only that `nextCatalogID` exceed every CNID
+        // in use, never that they be contiguous.
+        let undo = |w: &mut Self| {
+            // Best effort: a rollback that itself fails leaves the volume as it is,
+            // which is no worse than not having tried, and reporting the rollback
+            // failure instead of the original error would hide why the create
+            // failed.
+            let _ = w.remove_catalog_record(&thread_key);
+            let _ = w.remove_catalog_record(&child_key);
+        };
+
         self.insert_catalog_record(&child)?;
-        self.insert_catalog_record(&thread_record)?;
-        self.bump_folder_valence(parent, now)?;
+        if let Err(e) = self.insert_catalog_record(&thread_record) {
+            undo(self);
+            return Err(e);
+        }
+        if let Err(e) = self.bump_folder_valence(parent, now) {
+            undo(self);
+            return Err(e);
+        }
         // Both counters advance in memory as well as on disk. Writing
         // `self.header.file_count + 1` without incrementing it writes the *same*
         // value on every call, so a volume that gains three files reports one --
@@ -844,6 +878,92 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.header.next_catalog_id = cnid + 1;
         self.write_header_u32(32, file_count)?;
         Ok(cnid)
+    }
+
+    /// Remove the catalog record with exactly this key, if it is there.
+    ///
+    /// The inverse of [`Self::insert_catalog_record`] for one key, and what makes a
+    /// create rollback-able. Records are located by key rather than by CNID because
+    /// the keys are what the caller built and what it has to name again: the thread
+    /// record's CNID is in its *key*, not its body, and the file record's key is
+    /// `(parent, name)`.
+    ///
+    /// `leafRecords` is decremented, because it counts records across all leaves
+    /// and this is one fewer.
+    fn remove_catalog_record(&mut self, key: &crate::catalog::key::CatalogKey) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::{num_records, remove_record, NodeKind};
+        use crate::catalog::lookup::split_record;
+
+        let hit = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let btree_header = *bt.header();
+            let mut node_num = btree_header.first_leaf_node;
+            let mut budget = btree_header.total_nodes;
+            let mut found = None;
+            while budget > 0 && node_num != 0 && found.is_none() {
+                budget -= 1;
+                let bytes = bt.read_node_bytes(node_num)?;
+                let node = bt.parse_node(&bytes)?;
+                if node.kind() != NodeKind::Leaf {
+                    break;
+                }
+                for index in 0..node.num_records() {
+                    let Some((existing, _)) = split_record(node.record(index)?) else {
+                        continue;
+                    };
+                    if existing.parent_id == key.parent_id && existing.name == key.name {
+                        found = Some((node_num, usize::from(index)));
+                        break;
+                    }
+                }
+                if node_num == btree_header.last_leaf_node {
+                    break;
+                }
+                node_num = node.descriptor().f_link;
+                if node_num == 0 || node_num >= btree_header.total_nodes {
+                    break;
+                }
+            }
+            found
+        };
+
+        let Some((node_num, index)) = hit else {
+            return Err(Error::NotFound {
+                what: "catalog record to remove",
+            });
+        };
+
+        let (at, buf, count) = {
+            use crate::btree::io::BTreeFile;
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let mut buf = bt.read_node_bytes(node_num)?;
+            remove_record(&mut buf, index)?;
+            let count = num_records(&buf)?;
+            (bt.node_offset(node_num)?, buf, count)
+        };
+        self.device.write_at(at, &buf)?;
+
+        let leaf_records = self.btree_header_leaf_records()?;
+        let leaf_records = leaf_records.checked_sub(1).ok_or_else(|| {
+            Error::invalid("BTHeaderRec.leafRecords", "a remove took it below zero")
+        })?;
+        self.write_btree_header_u32(crate::btree::header::LEAF_RECORDS_OFFSET, leaf_records)?;
+
+        let _ = count;
+        // A removal can change the leaf's *first* record, which is what the index
+        // separator for it is.
+        self.refresh_index()
     }
 
     /// Read a folder record by CNID.

@@ -688,44 +688,57 @@ fn a_volume_that_cannot_grow_any_further_says_what_ran_out() {
          tree holds, or growth is not being tested; it reached {made}"
     );
 
-    // What is *not* asserted here is that a refused create leaves the volume
-    // consistent. It does not, and that is Milestone 8's remaining open item: a
-    // create writes its CNID, then its file record, then its thread record, so a
-    // failure between the two leaves the first of them behind with nothing pointing
-    // at it. An atomic create needs a rollback or a journal and neither exists yet.
-    // See `docs/mutation-invariants.md`.
+    // A refused create leaves *nothing* behind, and that is the property worth
+    // having: reaching the limit here provokes hundreds of them, and a volume that
+    // accumulates a half-created file per failure is one that fills up with debris
+    // rather than with data.
     //
-    // What is asserted instead is that everything that *did* get created is still
-    // reachable -- the stray records are additional, not misplaced, so every real
-    // file resolves by both routes.
+    // The CNID counter is the one thing a refused create does change, and that is
+    // deliberate: it is written first so a failure cannot hand the same CNID out
+    // twice. A gap in the sequence is harmless.
+    let next_after_limit = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().next_catalog_id
+    };
+    let (next_before_retry, retry) = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        (vol.header().next_catalog_id, {
+            let mut dev = FileDevice::open_writable(&path).expect("open writable");
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let r = writable.create_file(parent, &units("f9999.bin"));
+            dev.sync().expect("flush");
+            r
+        })
+    };
+    let _ = next_after_limit;
     let dev = FileDevice::open(&path).expect("open");
     let vol = Volume::open(&dev).expect("mount");
-    for i in 0..made.min(120) {
-        let name = format!("f{i:04}.bin");
-        let want = units(&name);
-        let object = vol
-            .lookup(vol.root_cnid(), &want)
-            .expect("lookup")
-            .unwrap_or_else(|| panic!("{name} vanished when the volume filled"));
+    if retry.is_err() {
         assert_eq!(
-            vol.lookup_cnid(object.as_file().expect("a file").cnid)
-                .expect("lookup by CNID")
-                .map(|o| o.name().to_vec())
-                .as_deref(),
-            Some(want.as_slice()),
-            "{name} is findable by name but not by CNID"
+            vol.header().next_catalog_id,
+            next_before_retry + 1,
+            "a refused create consumes its CNID, and only that"
+        );
+        assert!(
+            vol.lookup(vol.root_cnid(), &units("f9999.bin"))
+                .expect("lookup")
+                .is_none(),
+            "a refused create must leave no file record behind: the two records \
+             have to go in together or not at all"
         );
     }
-    // Deliberately no `fsck` assertion, and no `check::check` assertion either.
-    // Reaching the limit provokes refused creates, and a refused create leaves a
-    // file record with no thread record behind -- which `fsck.hfsplus` reports and
-    // `check::check` reports as `missing_thread`. Both are right, and this volume
-    // really is inconsistent; it is Milestone 8's remaining open item. Asserting
-    // either would mean asserting that a half-created file is fine.
-    //
-    // Soundness at every size *below* the limit is asserted elsewhere, by
-    // `every_file_is_reachable_by_both_routes_once_the_catalog_has_grown` and by
-    // `growing_the_catalog_keeps_both_volume_headers_in_step`.
+
+    // And the volume is still sound after all of it.
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(
+        report.is_clean(),
+        "a volume filled to its limit must not be left full of half-created files; \
+         {:?}",
+        report.describe()
+    );
+    assert_fsck_clean(&path, "a volume filled until it could not grow further");
 }
 
 #[test]

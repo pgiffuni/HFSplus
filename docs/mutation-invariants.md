@@ -277,30 +277,36 @@ Three lessons, all of which cost more than the bug did:
 `every_file_is_reachable_by_both_routes_once_the_catalog_has_grown` covers 200
 files, past both the growth threshold and the first misplacement.
 
-## The defect Milestone 8 leaves behind: a create is not atomic
+## A create is all-or-nothing
 
 A create writes four things: the CNID counter, the file record, the thread record,
-and the parent folder's child count. A failure between the file record and the
-thread record leaves a file record with **no thread record**, which is exactly what
-`check::check` reports as `missing_thread` and what `fsck.hfsplus` rejects.
+and the parent folder's child count. Only the last two records can fail part-way,
+and they go in together or not at all.
 
-This is not an edge case: it is the normal outcome of a create that fails, and
-failing is normal once a volume is full. The order is a deliberate trade rather
-than an oversight -- the CNID counter goes first precisely so a retry cannot be
-handed a CNID that a half-finished record already claims -- but the trade leaves
-this behind.
+The partial state matters. A file record with **no thread record** is the worst of
+them: the checker reports it as `missing_thread`, `fsck.hfsplus` rejects the volume,
+and the file is unreachable by CNID, because a thread record is what a CNID resolves
+through. An orphan *thread* record is milder -- nothing calls it out directly -- but
+a folder's `valence` is counted *from* thread records, so an orphan makes the
+declared child count disagree with what is there.
 
-Reordering the two inserts trades one inconsistency for another: an orphan thread
-record is not flagged as a missing thread, but the folder's `valence` is counted
-*from* thread records, so an orphan makes the declared child count disagree with
-what is there. Neither order is correct.
+So neither ordering is correct and the fix is a rollback rather than a reorder:
+`remove_catalog_record` is the inverse of `insert_catalog_record` for one key,
+locating the record by key -- `(parent, name)` for the file, `(cnid, "")` for the
+thread -- decrementing `leafRecords`, and refreshing the index separator that a
+removal can move. `src/btree/node.rs`'s `remove_record`, written when node mutation
+landed and unused until now, is what it calls.
 
-What is correct is a rollback -- `src/btree/node.rs` already has `remove_record`
-for exactly this, written when node mutation landed and not yet used -- or a
-journal. Both are real work and neither is done, so this is stated rather than
-worked around: `a_volume_that_cannot_grow_any_further_says_what_ran_out` asserts
-only that the failure is *named*, and says in a comment why it does not assert
-that the volume is afterwards consistent. It is not.
+The CNID counter is deliberately *not* rolled back. It is written first, before
+anything else, precisely so that a failure cannot hand the same CNID out twice, and
+undoing it would reintroduce that. A gap in the sequence is harmless: HFS+ requires
+only that `nextCatalogID` exceed every CNID in use, never that they be contiguous.
+
+This is not an edge case, which is why it was worth fixing rather than recording.
+Reaching a volume's limit provokes hundreds of failed creates, and a volume that
+accumulates a half-created file per failure fills up with debris rather than with
+data. `a_volume_that_cannot_grow_any_further_says_what_ran_out` creates until the
+volume refuses, and then asserts the volume is still clean by both checkers.
 
 What is *not* yet true of any mutation here:
 
