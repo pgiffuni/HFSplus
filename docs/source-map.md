@@ -205,6 +205,31 @@ where classic HFS had no equivalent to move it to. A POSIX extended attribute is
 a fourth thing again — which attributes become `getxattr` is a decision for the
 FUSE adapter, not for this module.
 
+## Writable volume
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_vfsops.c` `hfs_mount_existing`; `core/hfs_vfsutils.c` `hfs_mount_hfsplus` |
+| Structures | none — a capability, not a layout |
+| Invariants | every structural check and the journal replay run before any write is possible; a volume whose journal cannot be replayed does not mount |
+| Rust | `src/volume/mod.rs` `WritableVolume`, and `BlockDeviceMut` in `src/blockdev/mod.rs` |
+| Differences | mutation is not implemented. The type exists so that "this volume is safe to change" is a distinct, checked claim rather than a comment. |
+
+Two separate axes, which the roadmap is right to keep apart:
+
+- **Write capability** is `BlockDeviceMut`, a trait `Volume` is not bounded by. A
+  read-only code path cannot acquire it by accident.
+- **Established currency** is `WritableVolume`. Reading a journaled volume that
+  has not been replayed serves a *stale* filesystem; that is a legitimate choice
+  with a visible cost. Changing it is not, because a write lands on a filesystem
+  the writer never saw.
+
+`WritableVolume::from_validated` takes an already-opened `Volume` rather than a
+device, so validation has one code path and cannot drift between the read and
+write routes. It records whether a journal was replayed, because a writer needs
+that fact told to it rather than inferring it -- and `false` legitimately means
+either "no journal" or "the journal is on another device".
+
 ## Checker
 
 | | |

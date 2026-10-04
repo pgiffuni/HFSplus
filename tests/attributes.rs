@@ -206,3 +206,74 @@ fn digest(bytes: &[u8]) -> u64 {
     }
     h
 }
+
+// --- The writable trust boundary ------------------------------------------
+
+#[test]
+fn a_writable_view_records_whether_a_journal_was_replayed() {
+    // `Volume::open` replays the journal when there is one, and does not when the
+    // journal lives on another device or there is none. A writer needs to know
+    // which, and needs it told rather than inferred -- so the fact is part of the
+    // type rather than something a caller re-derives.
+    use hfsplus::volume::WritableVolume;
+
+    let path = common::image("journal-with-attributes");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
+    let writable = WritableVolume::from_validated(&vol).expect("validate for mutation");
+    assert!(
+        writable.journal_was_replayed(),
+        "this volume is journaled and the journal replays, so a writer must know"
+    );
+    assert_eq!(
+        writable.volume().header().total_blocks,
+        vol.header().total_blocks,
+        "and the writable view must be the same volume, not a second reading of it"
+    );
+}
+
+#[test]
+fn a_volume_with_no_journal_says_so_rather_than_claiming_a_replay() {
+    use hfsplus::volume::WritableVolume;
+
+    let path = common::image("basic-hfsplus");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
+    let writable = WritableVolume::from_validated(&vol).expect("validate");
+    assert!(
+        !writable.journal_was_replayed(),
+        "a volume with no journal has nothing to replay, and saying otherwise \\
+         would tell a writer its view is current for the wrong reason"
+    );
+}
+
+#[test]
+fn opening_for_mutation_does_not_bypass_the_journal_check() {
+    // The point of a separate type. `Volume::open` already refuses a journal it
+    // cannot replay, because the filesystem it would serve is stale -- so the
+    // writable path, which is built on that same open, inherits the refusal rather
+    // than needing to repeat the check. That is why `from_validated` takes an
+    // already-validated volume rather than a device.
+
+    let path = common::image("journal-bad-max-blocks");
+    if !path.exists() {
+        eprintln!("skipping: {} not built", path.display());
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+
+    // Refused at mount, before any question of writing arises.
+    let vol = hfsplus::volume::Volume::open(&dev);
+    assert!(
+        vol.is_err(),
+        "a volume whose journal cannot be replayed must not mount at all"
+    );
+}

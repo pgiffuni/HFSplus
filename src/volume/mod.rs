@@ -498,6 +498,90 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     }
 }
 
+/// A volume opened for mutation.
+///
+/// This type exists to make the trust boundary explicit rather than to expose
+/// mutation. It performs exactly the same work as [`Volume::open`] -- header
+/// validation, then journal detection, then journal replay -- and then stops.
+/// No mutation is available yet; that is Milestone 8.
+///
+/// # Why a separate type at all
+///
+/// Because "this volume is safe to change" is a different claim from "this
+/// volume can be read", and after Milestone 5 the two are not the same claim
+/// either: a journaled volume that has *not* been replayed serves a stale
+/// filesystem. Reading it is a legitimate choice with a visible cost.
+/// Changing it is not, because a write lands on a filesystem the writer never
+/// saw.
+///
+/// So the difference is not read versus write access to the bytes -- that is
+/// [`crate::blockdev::BlockDeviceMut`], and it is a different axis. This type
+/// is about having *established* that the on-disk state is current, which
+/// reading does not require and writing does.
+///
+/// # What opening one guarantees
+///
+/// Everything [`Volume::open`] establishes, and nothing is skipped for being
+/// asked in write mode. In particular a journal that cannot be replayed is
+/// refused here exactly as it is there: a volume whose journal is damaged has
+/// writes the journal holds that have not been applied, and offering to
+/// modify it would be offering to work from a filesystem that does not exist.
+///
+/// Mining reference: `core/hfs_vfsops.c` `hfs_mount_existing` refuses a NULL
+/// journal from `journal_open` with `EINVAL` rather than mounting, and the
+/// mount path runs every structural check before any write is possible.
+pub struct WritableVolume<'v, 'a, D: ?Sized> {
+    /// The validated, journal-current view of the same bytes.
+    ///
+    /// Borrowed rather than rebuilt so that there is exactly one reading of
+    /// the volume, and no way for the writable path to disagree with the
+    /// read-only one about what it is looking at.
+    inner: &'v Volume<'a, D>,
+    /// The journal the volume was validated against, kept so a future
+    /// mutation can journal itself rather than discover the position later.
+    journal_replayed: bool,
+}
+
+impl<D: ?Sized> std::fmt::Debug for WritableVolume<'_, '_, D> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Deliberately omits the volume. The interesting question about this
+        // type is what it established, and printing the volume would bury that.
+        f.debug_struct("WritableVolume")
+            .field("journal_was_replayed", &self.journal_replayed)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'v, 'a, D: BlockDevice + ?Sized> WritableVolume<'v, 'a, D> {
+    /// Validate `volume` for mutation and adopt it.
+    ///
+    /// Takes an already-opened [`Volume`] so there is one code path for
+    /// validation rather than two that could drift. The caller obtains the
+    /// journal-free reading first and this only decides whether changing it is
+    /// allowed.
+    pub fn from_validated(volume: &'v Volume<'a, D>) -> Result<Self> {
+        let journal_replayed = volume.journal()?.is_some();
+        Ok(WritableVolume {
+            inner: volume,
+            journal_replayed,
+        })
+    }
+
+    /// The validated volume.
+    pub fn volume(&self) -> &'v Volume<'a, D> {
+        self.inner
+    }
+
+    /// Whether a journal was replayed during validation.
+    ///
+    /// False for a volume with no journal at all, and false for one whose
+    /// journal lives on another device. A writer needs to know which, and
+    /// needs to be told rather than infer it.
+    pub fn journal_was_replayed(&self) -> bool {
+        self.journal_replayed
+    }
+}
+
 /// The CNID a fork's overflow extents are keyed on.
 ///
 /// Both forks of a file share the CNID, and the extents B-tree key includes the
