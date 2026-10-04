@@ -724,6 +724,34 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
         }
     }
 
+    // --- Blocks held by attribute values --------------------------------
+    //
+    // An attribute whose value is too big for its record lives in allocation
+    // blocks that the catalog never mentions: they are reachable only by walking
+    // the attributes tree. Without this, every such block looks orphaned -- which
+    // means this checker would report a false positive on any real macOS volume
+    // with a large FinderInfo, rather than only on the fixture that has one.
+    //
+    // Mining reference: `core/hfs_format.h` `kHFSPlusAttrForkData` holds a full
+    // `HFSPlusForkData`, and `kHFSPlusAttrExtents` records continue it. The value's
+    // blocks are as real as any file's.
+    if header.attributes_file.logical_size > 0 {
+        if let Ok(tree) = crate::attributes::AttributesFile::open(
+            vol.device(),
+            &header.attributes_file,
+            header.block_size,
+            header.is_hfsx(),
+        ) {
+            if let Ok(blocks) = tree.allocated_blocks() {
+                for block in blocks {
+                    if block < u64::from(header.total_blocks) {
+                        referenced.push(block as u32);
+                    }
+                }
+            }
+        }
+    }
+
     // --- Compare --------------------------------------------------------
     let mut referenced_bitmap = vec![false; header.total_blocks as usize];
     for block in &referenced {

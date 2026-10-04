@@ -222,6 +222,12 @@ if [[ -f tests/images/generated/journal-with-files.img ]]; then
     tests/images/replayed/fork-extent-past-volume.img --fork-extent 2
   python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
     tests/images/replayed/symlink-empty-target.img --break-symlink
+  # Attributes in the attributes B-tree: one inline value and one spread over two
+  # blocks with its continuation extents in a separate record. mkfs.hfsplus makes
+  # no attributes at all, so nothing else in the corpus can exercise the reader.
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/generated/journal-with-attributes.img --add-attributes
+
   # A stale B-tree node map: the tree still reads, but has stopped claiming one of
   # its own nodes. What an edit-in-place writer leaves behind.
   python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \

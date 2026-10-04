@@ -542,6 +542,231 @@ def break_fork_extent(img, args):
         f.write(bytes(img))
 
 
+def add_attributes(img, args):
+    """Put real attribute records into the volume's attributes B-tree.
+
+    `mkfs.hfsplus` allocates the attributes fork and builds an empty tree, so a
+    volume it makes has no attributes at all and nothing in the corpus can exercise
+    the reader. This fills in the leaf node the tree already has room for:
+
+      - an inline attribute, whose value lives in the record
+      - a forked attribute whose value is spread over two blocks
+      - a continuation record, so the second block's extents come from a *separate*
+        record the way a fragmented attribute's do
+
+    The forked pair is the interesting one: it is the same shape as a catalog fork
+    overflowing the shared extents tree, but keyed inside this tree by
+    `startBlock`, and the two are separate mechanisms.
+
+    Mining reference: `core/hfs_format.h` `struct HFSPlusAttrKey` and the
+    `kHFSPlusAttr*` record union; `core/hfs_attrlist.c` scans one `fileID`.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    fork = VOLUME_HEADER_OFFSET + 352
+    logical, _, total_blocks = struct.unpack_from(">QII", img, fork)
+    start = struct.unpack_from(">I", img, fork + 16)[0]
+    if logical == 0:
+        sys.exit("error: the volume has no attributes file")
+
+    base = start * bs
+    node_size = u16_from_be(img, base + 14 + 18)
+    if node_size <= bs:
+        sys.exit("error: this helper expects a node larger than one block")
+    depth = u16_from_be(img, base + 14)
+    total_nodes = u32_from_be(img, base + 14 + 22)
+
+    # Two free blocks for the value, taken from the end of the free list.
+    bitmap_block = u32_from_be(img, VOLUME_HEADER_OFFSET + 112 + 16)
+    spare = [b for b in range(1, u32_from_be(img, VOLUME_HEADER_OFFSET + 44) - 1)
+             if not (img[bitmap_block * bs + b // 8] & (0x80 >> (b % 8)))]
+    if len(spare) < 2:
+        sys.exit("error: not enough free space for a forked attribute")
+    value_blocks = spare[-2:]
+
+    # The first leaf starts one *node* after the header, and this tree's nodes are
+    # `node_size` bytes -- 8192, two blocks -- so node 1 begins at `base +
+    # node_size`, not `base + bs`. Using the block size lands the leaf across the
+    # header node's second block, which is how it first went wrong.
+    node_at = base + node_size
+    node = bytearray(node_size)
+    for i in range(bs, node_size, bs):
+        node[i:i + bs] = img[node_at + i:node_at + i + bs]
+    # Give the value's blocks a recognisable pattern.
+    for offset, block in enumerate(value_blocks):
+        pattern = bytes([0xA0 + offset]) * bs
+        img[block * bs:(block + 1) * bs] = pattern
+        for b in range(bs):
+            img[bitmap_block * bs + block // 8] |= 0x80 >> (block % 8)
+    inline_value = b"inline attribute value"
+    fork_len = 2 * bs
+
+    # Emitted in key order, which is not the order they are easiest to write in.
+    # Apple orders attribute keys by CNID, then by name *comparing length before
+    # content*, and only then by startBlock. So "com.apple.test.forked" precedes
+    # "com.apple.test.inline" -- 'f' is less than 'i' -- and the length rule means
+    # a shorter name always sorts first however its letters fall. fsck.hfsplus
+    # rejected the first version of this with "Keys out of order", correctly.
+    records = []
+
+    # The attributes belong to a real object. CNIDs 0, 1 and 2 are reserved
+    # (kHFSReservedID, kHFSRootParentID, kHFSRootFolderID), so an attribute
+    # keyed on one of those would be naming something that cannot exist.
+    owner = args.attributes_cnid
+
+    # An inline attribute: value inside the record.
+    name = "com.apple.test.inline"
+    k = (owner, name)
+    body = bytes([0, 0, 0, 0x10, 0, 0, 0, 0, 0, 0, 0, 0,
+                  len(inline_value) >> 24 & 0xFF, len(inline_value) >> 16 & 0xFF,
+                  len(inline_value) >> 8 & 0xFF, len(inline_value) & 0xFF]) + inline_value
+    records.append((k, body, 0))
+
+    # A forked attribute: the first eight extents, here one block.
+    name = "com.apple.test.forked"
+    k = (owner, name)
+    body = bytes([0, 0, 0, 0x20, 0, 0, 0, 0])
+    body += struct.pack(">Q", fork_len)          # logicalSize
+    body += struct.pack(">I", 0)                 # clumpSize
+    body += struct.pack(">I", 2)                 # totalBlocks
+    for i in range(8):
+        if i == 0:
+            body += struct.pack(">II", value_blocks[0], 1)
+        else:
+            body += struct.pack(">II", 0, 0)
+    records.append((k, body, 0))
+
+    # Its continuation: the second block's extents, in a record of its own.
+    #
+    # The key's startBlock is the number of blocks already described -- 1, because
+    # the Fork record above declared one extent of one block. It is a running
+    # count, NOT a block number: the same convention the catalog's extents
+    # overflow key uses, and getting it wrong is the classic bug in both places.
+    k = (owner, name)
+    body = bytes([0, 0, 0, 0x30, 0, 0, 0, 0])
+    body += struct.pack(">II", value_blocks[1], 1)
+    body += struct.pack(">II", 0, 0) * 7
+    records.append((k, body, 1))
+
+    # Sorted the way Apple's comparator would: CNID, then name length, then name
+    # content, then startBlock.
+    records.sort(key=lambda r: (r[0][0], len(r[0][1]), r[0][1], r[2]))
+
+    # Pack the node.
+    at = 14
+    offsets = []
+    for (_, body, start_block) in records:
+        units = name_units if False else None
+        offsets.append(at)
+        del units
+    # Rebuild properly: key then body, per record.
+    offsets = []
+    at = 14
+    for (cnid, name), body, start_block in records:
+        key = attr_key_bytes(cnid, name, start_block)
+        offsets.append(at)
+        node[at:at + len(key)] = key
+        at += len(key)
+        node[at:at + len(body)] = body
+        at += len(body)
+
+    node[8] = 0xFF            # kBTLeafNode
+    node[9] = 1               # height
+    struct.pack_into(">H", node, 10, len(records))
+    # NOT at offset 40. `struct BTNodeDescriptor` is 14 bytes, so 40 is inside the
+    # record area -- it is where an *index* node keeps its free-space offset, and a
+    # leaf has no such field. mkfs.hfsplus leaves 1 there. Writing the real free
+    # offset there lands it in the middle of the first record's key, which is
+    # exactly what happened the first time. The free space is recorded only in the
+    # offset array's terminal entry, below.
+    for i, off in enumerate(offsets):
+        struct.pack_into(">H", node, node_size - 2 * (i + 1), off)
+    struct.pack_into(">H", node, node_size - 2 * (len(records) + 1), at)
+
+    # Written as explicit blocks, not one slice: this node is two blocks long, and
+    # assigning an 8192-byte buffer into an 8190-byte slice silently *resizes* the
+    # image rather than failing.
+    blocks_in_node = (node_size + bs - 1) // bs
+    for i in range(blocks_in_node):
+        chunk = node[i * bs:(i + 1) * bs]
+        lo = node_at + i * bs
+        img[lo:lo + len(chunk)] = chunk
+
+    # The tree header: it now has a leaf, and that leaf is in the node map.
+    hr = 14
+    struct.pack_into(">H", img, base + hr + 0, 1)          # treeDepth
+    struct.pack_into(">I", img, base + hr + 2, 1)          # rootNode
+    struct.pack_into(">I", img, base + hr + 6, len(records))
+    struct.pack_into(">I", img, base + hr + 10, 1)         # firstLeafNode
+    struct.pack_into(">I", img, base + hr + 14, 1)         # lastLeafNode
+    struct.pack_into(">I", img, base + hr + 26,
+                     u32_from_be(img, base + hr + 26) - 1)   # freeNodes
+    img[base + 248] |= 0x40                              # map: node 1 is in use
+    print(f"  attributes: {len(records)} records in node 1 of a {node_size}-byte tree")
+    print(f"    owned by CNID {owner}")
+    print(f"    inline 'com.apple.test.inline' = {inline_value!r}")
+    print(f"    forked 'com.apple.test.forked' = blocks {value_blocks[0]} and {value_blocks[1]}")
+    print(f"    the second block's extents are in a continuation record")
+    print(f"  free blocks for the value: {value_blocks} (bitmap updated)")
+
+    # A file with attributes must say so. `kHFSHasAttributesMask` in the catalog
+    # record's flags is the file's claim that the attributes tree holds something
+    # for it, and fsck compares the count the tree finds against the count the
+    # catalog admits to. Giving a file attributes without setting it produces a
+    # volume that reads correctly and fails its own consistency check.
+    K_HFS_HAS_ATTRIBUTES_MASK = 0x0004
+    _set_record_flags(img, FRAGMENTED_CNID, K_HFS_HAS_ATTRIBUTES_MASK)
+
+    # Allocating blocks is not enough: the volume header carries its own free
+    # count, and fsck recomputes it rather than trusting it.
+    before = u32_from_be(img, VOLUME_HEADER_OFFSET + 48)
+    struct.pack_into(">I", img, VOLUME_HEADER_OFFSET + 48, before - len(value_blocks))
+    print(f"  volume header freeBlocks {before} -> {before - len(value_blocks)}")
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+
+def _set_record_flags(img, cnid: int, set_bits: int) -> None:
+    """OR `set_bits` into the flags of `cnid`'s catalog record.
+
+    Inline rather than via the Writer's method, because `add_attributes` works on
+    the image directly and has no Writer -- and a call to a method that does not
+    exist here would have been hidden by the caller discarding stderr.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    cat = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 272 + 16)[0]
+    base = (cat + 1) * bs
+    node_size = u16_from_be(img, cat * bs + 14 + 18)
+    count = u16_from_be(img, base + 10)
+    for i in range(count):
+        off = u16_from_be(img, base + node_size - 2 * (i + 1))
+        key_len = u16_from_be(img, base + off)
+        body = base + off + 2 + key_len
+        record_type = struct.unpack_from(">h", img, body)[0]
+        if record_type != 2:
+            continue
+        if u32_from_be(img, body + 8) != cnid:
+            continue
+        flags = u16_from_be(img, body + 2)
+        struct.pack_into(">H", img, body + 2, flags | set_bits)
+        print(f"  catalog record {cnid}: flags 0x{flags:04x} -> 0x{flags | set_bits:04x}")
+        return
+    sys.exit(f"error: {cnid}: catalog file record not found")
+
+
+def attr_key_bytes(cnid: int, name: str, start_block: int) -> bytes:
+    """An `HFSPlusAttrKey` as it appears at the head of a node record."""
+    units = name.encode("utf-16-be")
+    declared = 2 + 4 + 4 + 2 + len(units)
+    out = struct.pack(">H", declared)
+    out += struct.pack(">H", 0)            # pad
+    out += struct.pack(">I", cnid)
+    out += struct.pack(">I", start_block)
+    out += struct.pack(">H", len(units) // 2)
+    out += units
+    return out
+
+
 def stale_node_map(img, args):
     """Clear a bit in the catalog B-tree's node map.
 
@@ -680,6 +905,10 @@ def main() -> None:
                     help="set a file record's data-fork totalBlocks")
     ap.add_argument("--fork-extent", type=int, default=None, metavar="N",
                     help="point data-fork extent N past the end of the volume")
+    ap.add_argument("--attributes-cnid", type=int, default=18,
+                    help="CNID the generated attributes belong to")
+    ap.add_argument("--add-attributes", dest="add_attributes", action="store_true",
+                    help="fill the attributes B-tree with inline and forked attributes")
     ap.add_argument("--stale-map", dest="stale_map", action="store_true",
                     help="clear a bit in the catalog's B-tree node map")
     ap.add_argument("--break-symlink", dest="break_symlink", action="store_true",
@@ -699,6 +928,8 @@ def main() -> None:
         return break_fork_rule(img, args)
     if args.fork_extent is not None:
         return break_fork_extent(img, args)
+    if args.add_attributes:
+        return add_attributes(img, args)
     if args.stale_map:
         return stale_node_map(img, args)
     if args.break_symlink:

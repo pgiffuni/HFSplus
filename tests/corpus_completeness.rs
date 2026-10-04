@@ -58,6 +58,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ("generated", "journaled-hfsplus-1k"),
     // tools/mkfiles.py
     ("generated", "journal-with-files"),
+    ("generated", "journal-with-attributes"),
     // tools/makejournal.py, journal replay
     ("replayed", "journal-replay-be"),
     ("replayed", "journal-replay-le"),

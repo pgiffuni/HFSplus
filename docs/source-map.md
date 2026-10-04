@@ -150,7 +150,7 @@ Two key layouts were wrong here and are now pinned by tests:
 | Apple | `core/hfs_format.h` `struct HFSPlusAttrKey`, `HFSPlusAttrData`, `HFSPlusAttrForkData`, `HFSPlusAttrExtents`, `union HFSPlusAttrRecord`, and the `kHFSPlusAttr{InlineData,ForkData,Extents}` enum |
 | Structures | `AttrKey`, `AttrRecord` |
 | Invariants | `keyLength` excludes itself but includes the `pad` that follows it, so the body is 266 and the record 268; the type values 0x10/0x20/0x30 are disjoint from the catalog's 1..4 and 1000; a fork attribute's value continues through further records chained by the key's `startBlock` |
-| Rust | `src/attributes/key.rs`, `src/attributes/record.rs` |
+| Rust | `src/attributes/key.rs`, `src/attributes/record.rs`, `src/attributes/mod.rs` |
 | Differences | the `pad` is read and discarded rather than validated — Apple writes zero and reads nothing, so refusing a non-zero value would reject volumes macOS mounts. The obsolete `HFSPlusAttrInlineData` spelling decodes identically, since only the struct name changed and not the type value or the layout. |
 
 Two layout errors here were the same shape as the extent key's, which is now
@@ -164,12 +164,31 @@ worth naming as a habit rather than a coincidence:
 Both were caught by unit tests rather than by the corpus, because no image in it
 carries an attribute — `mkfs.hfsplus` creates no files.
 
-**What is deliberately not built yet.** The Attributes File is a second B-tree
-with its own key layout, and its records chain continuation records for a
-fragmented value. Parsing one record is most of that; *resolving* a value —
-following the chain, distinguishing an inline value from a forked one, and
-mapping an attribute name to a value — is not done. Nothing reads the tree yet,
-because nothing in the corpus contains one.
+Four rules the fixture had to get right, none of them obvious and two of them
+learned by having `fsck.hfsplus` reject the image:
+
+- **Keys order by CNID, then name length, then name content, then startBlock.**
+  Length before content is the surprising part: `"z"` sorts *after* `"abc"` however
+  its letters fall. A tree that compares names as strings is wrong in a way that
+  only shows on names of differing length.
+- **A `Fork` record's key must have `startBlock == 0`**, and a continuation
+  record's key must carry the number of blocks described *so far* — a running
+  count, not a block number. The same convention the catalog's extents overflow
+  key uses, and the same easy mistake in both places.
+- **A file with attributes must say so.** The `kHFSHasAttributesMask` flag in the
+  catalog record is the file's claim that the tree holds something for it, and
+  `fsck` compares that count against what the tree contains. A volume where a file
+  has attributes but does not declare them reads correctly and fails its own
+  consistency check.
+- **Allocating blocks means updating three things**: the bitmap, the volume
+  header's free count, and — for an attribute — the declaring flag.
+
+And one this crate got wrong, which is the kind worth recording: the checker
+walked catalog forks and the allocation bitmap but **not the attributes tree**, so
+every block holding a forked attribute value looked orphaned. That is not a
+hypothetical: a FinderInfo large enough to be forked is unremarkable on a real
+macOS volume, so the checker would have reported a false positive on real media
+rather than only on a fixture.
 
 Three distinctions this module exists to keep straight, since they are routinely
 conflated:
