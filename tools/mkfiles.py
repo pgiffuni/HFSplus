@@ -542,6 +542,47 @@ def break_fork_extent(img, args):
         f.write(bytes(img))
 
 
+def stale_node_map(img, args):
+    """Clear a bit in the catalog B-tree's node map.
+
+    The map is the tree's own claim about which nodes are in use. Adding a leaf to
+    a tree in place changes what is reachable without touching the map, and the
+    result reads correctly while disagreeing with itself -- which is the failure a
+    writer would leave behind and the reason this check exists.
+
+    `mkfs.hfsplus` reports it as "Invalid map node" after comparing the stored map
+    against one computed by walking the tree, so the fixture is verified against
+    the independent checker as well as against ours.
+
+    Mining reference: lib_fsck_hfs/dfalib/SUtils.c AllocBTN writes the map as
+    `BTCBMPtr + nodeNumber / 8` with mask `0x80 >> (nodeNumber % 8)`, the same
+    order as the volume allocation bitmap.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    cat = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 272 + 16)[0]
+    base = cat * bs
+    node_size = u16_from_be(img, base + 14 + 18)
+    num_records = u16_from_be(img, base + 10)
+    if node_size == 0:
+        sys.exit("error: the catalog has no B-tree header to patch")
+
+    # The map lives in the header node at record index 2, whose offset is the
+    # third entry of the offset array.
+    # Relative to the node, which is not the same as relative to the image: the
+    # catalog does not start at byte 0.
+    map_at = u16_from_be(img, base + node_size - 2 * 3)
+    at = base + map_at
+    before = img[at]
+    img[at] = before & 0b0111_1111
+    print(f"  catalog node map at node offset {map_at} (image {at}):")
+    print(f"    0x{before:02x} -> 0x{img[at]:02x}")
+    print("  the leaf at node 1 is still there and still readable; only the map")
+    print("  has stopped claiming it, which is exactly what editing in place does")
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+
 def break_symlink(img, args):
     """Give the symlink an empty data fork.
 
@@ -639,6 +680,8 @@ def main() -> None:
                     help="set a file record's data-fork totalBlocks")
     ap.add_argument("--fork-extent", type=int, default=None, metavar="N",
                     help="point data-fork extent N past the end of the volume")
+    ap.add_argument("--stale-map", dest="stale_map", action="store_true",
+                    help="clear a bit in the catalog's B-tree node map")
     ap.add_argument("--break-symlink", dest="break_symlink", action="store_true",
                     help="empty the symlink's data fork, leaving it with no target")
     ap.add_argument("--unused", type=int, default=19,
@@ -656,6 +699,8 @@ def main() -> None:
         return break_fork_rule(img, args)
     if args.fork_extent is not None:
         return break_fork_extent(img, args)
+    if args.stale_map:
+        return stale_node_map(img, args)
     if args.break_symlink:
         return break_symlink(img, args)
 

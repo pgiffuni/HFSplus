@@ -79,6 +79,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ("replayed", "fork-total-too-large"),
     ("replayed", "fork-extent-past-volume"),
     ("replayed", "symlink-empty-target"),
+    ("replayed", "stale-node-map"),
     // tools/genmalformed.sh
     ("malformed", "bad-signature"),
     ("malformed", "hfsplus-sig-hfsx-version"),

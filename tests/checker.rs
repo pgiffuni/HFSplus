@@ -32,6 +32,14 @@ use hfsplus::blockdev::FileDevice;
 use hfsplus::check::{self, CheckReport};
 use hfsplus::volume::Volume;
 
+/// An image in one of the corpus subdirectories.
+fn fixture(dir: &str, name: &str) -> std::path::PathBuf {
+    common::repo_root()
+        .join("tests/images")
+        .join(dir)
+        .join(format!("{name}.img"))
+}
+
 fn check_image(name: &str) -> Option<(CheckReport, u32)> {
     let path = common::image(name);
     if !path.exists() {
@@ -1289,5 +1297,63 @@ fn the_fork_rules_report_apple_codes() {
             .any(|(_, reason)| reason.contains("E_PEOF")),
         "more blocks than the extents describe must report E_PEOF: {:?}",
         report.fork_rule
+    );
+}
+
+#[test]
+fn a_stale_btree_node_map_is_reported_and_agrees_with_the_independent_checker() {
+    // A B-tree carries a map of which nodes are in use: one bit per node, MSB
+    // first, in the header node's record index 2. Adding a leaf to a tree in
+    // place changes what is reachable without touching the map, so the tree keeps
+    // reading correctly while disagreeing with itself about which nodes it owns.
+    // That is the failure a writer would leave behind, and the reason the check
+    // exists.
+    //
+    // Mining reference: `lib_fsck_hfs/dfalib/SUtils.c` `AllocBTN` sets
+    // `BTCBMPtr + nodeNumber / 8` with mask `0x80 >> (nodeNumber % 8)` -- the
+    // same order as the volume allocation bitmap -- and `SVerify2.c`
+    // `CmpBTreeMap` compares the stored map against one computed by walking the
+    // tree.
+    let Some((report, _)) = check_image("stale-node-map") else {
+        return;
+    };
+    assert_eq!(
+        report.node_map_mismatch.len(),
+        1,
+        "the stale map must be reported once, got {:?}",
+        report.describe()
+    );
+    assert!(
+        report.describe().iter().any(|l| l.contains("node map")),
+        "the finding must name the map: {:?}",
+        report.describe()
+    );
+    assert!(
+        report.orphaned.is_empty() && report.unerased_node.is_empty(),
+        "and nothing else is wrong: the tree is intact, only its map is stale: {:?}",
+        report.describe()
+    );
+
+    // The independent checker must reach the same conclusion. `fsck_hfs` prints
+    // "Invalid map node", which is also what it said while this project was
+    // building its extents tree by hand and forgetting the map.
+    let Some(fsck) = common::fsck_available() else {
+        eprintln!("skipping the comparison: fsck.hfsplus not installed");
+        return;
+    };
+    let path = fixture("replayed", "stale-node-map");
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("stale-map-{}.img", std::process::id()));
+    std::fs::copy(&path, &probe).expect("copy for fsck");
+    let out = common::run_fsck(&fsck, &probe);
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_file(&probe);
+    assert!(
+        text.contains("Invalid map node"),
+        "the independent checker must report the same thing:\n{text}"
     );
 }

@@ -222,6 +222,10 @@ if [[ -f tests/images/generated/journal-with-files.img ]]; then
     tests/images/replayed/fork-extent-past-volume.img --fork-extent 2
   python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
     tests/images/replayed/symlink-empty-target.img --break-symlink
+  # A stale B-tree node map: the tree still reads, but has stopped claiming one of
+  # its own nodes. What an edit-in-place writer leaves behind.
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/replayed/stale-node-map.img --stale-map
 fi
 
 echo "verifying every image with the independent checker"

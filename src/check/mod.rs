@@ -102,6 +102,24 @@ pub struct CheckReport {
     /// truncates the walk. Mining reference: the same function compares each
     /// node's `fLink` against the node the traversal expected to follow.
     pub sibling_link: Vec<(u8, u32)>,
+    /// A B-tree whose stored node map disagrees with what it contains.
+    ///
+    /// `(tree, node the comparison stopped at)`.
+    ///
+    /// The map is the tree's own claim about which nodes are in use, kept in the
+    /// header node's record index 2 and continued through map nodes chained by
+    /// `fLink`. One bit per node, MSB first, exactly like the volume allocation
+    /// bitmap. `fsck.hfsplus` compares it against a map computed by walking the
+    /// tree and reports `E_BadMapN`.
+    ///
+    /// Mining reference: `lib_fsck_hfs/dfalib/SVerify2.c` `CmpBTreeMap`,
+    /// `BTMapChk`, and `SUtils.c` `AllocBTN` for the bit order.
+    pub node_map_mismatch: Vec<(u8, u32)>,
+    /// A node in the map chain that is not a well-formed map node.
+    ///
+    /// `(tree, node)`. After the header, every node must be `kBTMapNode` with
+    /// `numRecords == Num_MRecs` (1) and height 0.
+    pub bad_map_node: Vec<(u8, u32)>,
     /// A node nothing points at that is not erased.
     ///
     /// `(tree, node number)`. Every node the file contains is either reachable
@@ -181,6 +199,8 @@ impl CheckReport {
             && self.child_node.is_empty()
             && self.sibling_link.is_empty()
             && self.unerased_node.is_empty()
+            && self.node_map_mismatch.is_empty()
+            && self.bad_map_node.is_empty()
             && self.key_width.is_empty()
     }
 
@@ -239,6 +259,18 @@ impl CheckReport {
                  kBTBigKeysMask, so this volume was not written by Apple or hfsprogs"
             ));
         }
+        for (tree, node) in &self.node_map_mismatch {
+            out.push(format!(
+                "{tree}: its node map at node {node} disagrees with the nodes it \
+                 contains -- a stale map, which is what editing a tree in place \
+                 leaves behind"
+            ));
+        }
+        for (tree, node) in &self.bad_map_node {
+            out.push(format!(
+                "{tree}: node {node} is in the map chain but is not a map node"
+            ));
+        }
         for (tree, node) in &self.unerased_node {
             out.push(format!(
                 "{tree} node {node}: nothing points at it and it is not erased"
@@ -269,6 +301,213 @@ impl CheckReport {
         }
         out
     }
+}
+
+/// Every node number a tree's root can reach, including the root.
+///
+/// Walks each level as a sibling chain: the root, then every child of every node
+/// on the level above. A node nothing points at is not reached, which is the
+/// point -- the map is a claim about what is *in use*.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/SVerify2.c` `BTCheck` walks the tree
+/// this way, calling `AllocBTN` for each node it lands on.
+fn reachable_nodes<D: crate::blockdev::BlockDevice + ?Sized>(
+    bt: &BTreeFile<'_, D>,
+) -> Result<Vec<u32>> {
+    let header = *bt.header();
+    let mut out = vec![0u32];
+    if header.tree_depth == 0 {
+        return Ok(out);
+    }
+
+    // One level at a time. Each level is a sibling chain, and a level of index
+    // nodes produces the next one; a level of leaves produces nothing.
+    //
+    // The loop runs `depth + 1` times rather than `depth`, because the last level
+    // holds the leaves and they have to be *counted* even though they have
+    // nothing below them. Missing that is not subtle in the map -- a depth-1 tree
+    // has its root as its only leaf, so the expected map comes out with one bit
+    // clear and every freshly formatted volume reports a mismatch.
+    let mut level = vec![header.root_node];
+    for _ in 0..=header.tree_depth {
+        let mut next = Vec::new();
+        let mut any_index = false;
+
+        for node_num in &level {
+            if *node_num == 0 || *node_num >= header.total_nodes {
+                continue;
+            }
+            let bytes = bt.read_node_bytes(*node_num)?;
+            let node = bt.parse_node(&bytes)?;
+
+            // This node, and every right sibling sharing its level, are in use.
+            let mut chain = vec![*node_num];
+            let mut sibling = node.descriptor().f_link;
+            let mut guard = header.total_nodes;
+            while sibling != 0 && sibling < header.total_nodes && guard > 0 {
+                guard -= 1;
+                chain.push(sibling);
+                let bytes = bt.read_node_bytes(sibling)?;
+                sibling = bt.parse_node(&bytes)?.descriptor().f_link;
+            }
+            for member in chain {
+                if !out.contains(&member) {
+                    out.push(member);
+                }
+            }
+
+            if node.kind() == crate::btree::node::NodeKind::Index {
+                any_index = true;
+                for index in 0..node.num_records() {
+                    let child = node.child(index)?;
+                    if child != 0 && child < header.total_nodes && !next.contains(&child) {
+                        next.push(child);
+                    }
+                }
+            }
+        }
+
+        if !any_index {
+            break;
+        }
+        level = next;
+    }
+    Ok(out)
+}
+
+/// The node map a tree's contents imply: one bit per node, MSB first.
+///
+/// Byte `n / 8`, mask `0x80 >> (n % 8)` -- the same order as the volume
+/// allocation bitmap, which is not a coincidence: both are "which block is in
+/// use" bitmaps.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/SUtils.c` `AllocBTN`:
+///
+/// ```c
+/// byteP = BTCBMPtr + (nodeNumber / 8);
+/// bitPos = nodeNumber % 8;
+/// mask = (0x80 >> bitPos);
+/// ```
+fn expected_node_map(reachable: &[u32], total_nodes: u32) -> Vec<u8> {
+    let mut map = vec![0u8; ((total_nodes as usize) + 7) / 8];
+    for node in reachable {
+        let Some(slot) = map.get_mut((*node / 8) as usize) else {
+            continue;
+        };
+        *slot |= 0x80 >> (*node % 8);
+    }
+    map
+}
+
+/// A node's record offsets, read from the end of the node.
+///
+/// `nrec + 1` entries, so entry `nrec` is where the free space begins.
+fn record_offsets(bytes: &[u8], node_size: usize, num_records: u16) -> Result<Vec<usize>> {
+    let mut out = Vec::with_capacity(num_records as usize + 1);
+    for i in 0..=num_records {
+        let at = node_size
+            .checked_sub(2 * (i as usize + 1))
+            .ok_or_else(|| Error::invalid("btree node", "the offset array runs past the node"))?;
+        if at + 2 > bytes.len() {
+            return Err(Error::Truncated {
+                what: "btree offset array",
+                needed: at + 2,
+                available: bytes.len(),
+            });
+        }
+        out.push(usize::from(u16::from_be_bytes([bytes[at], bytes[at + 1]])));
+    }
+    Ok(out)
+}
+
+/// Compare a tree's stored node map against the one its contents imply.
+///
+/// The map is the tree's own claim about which nodes are in use, kept in the
+/// header node's record index 2 and continued through map nodes chained by
+/// `fLink`. `fsck.hfsplus` compares it against a map computed by walking the
+/// tree, and reports `E_BadMapN` on a difference.
+///
+/// This matters most to a writer: adding a leaf to a tree in place changes what
+/// is reachable without touching the map, leaving a tree that reads correctly and
+/// disagrees with itself about which nodes it owns.
+///
+/// Mining reference: `lib_fsck_hfs/dfalib/SVerify2.c` `CmpBTreeMap` and
+/// `BTMapChk`. The walk starts at node 0 with record index 2 and follows `fLink`;
+/// every node after the first must be `kBTMapNode` with `numRecords == 1` and
+/// height 0 (`Num_MRecs`).
+fn check_node_map<D: crate::blockdev::BlockDevice + ?Sized>(
+    device: &D,
+    fork: &crate::format::fork::ForkData,
+    block_size: u32,
+    hfs_plus: bool,
+    tree: &'static str,
+    report: &mut CheckReport,
+) -> Result<()> {
+    use crate::btree::node::NodeKind;
+
+    let bt = BTreeFile::open(device, fork, block_size, hfs_plus)?;
+    let header = *bt.header();
+    if header.total_nodes == 0 || header.node_size == 0 {
+        // An empty tree: `mkfs.hfsplus` leaves the attributes fork's B-tree
+        // entirely zeroed, and there is nothing to compare.
+        return Ok(());
+    }
+
+    let expected = expected_node_map(&reachable_nodes(&bt)?, header.total_nodes);
+    let node_size = bt.node_size();
+    let mut map_size = expected.len();
+    let mut compared = 0usize;
+
+    // The walk starts in the header node at record index 2, then follows fLink
+    // through the map nodes.
+    let mut node_num = 0u32;
+    let mut rec_index = 2u16;
+    let mut guard = 16usize;
+
+    while map_size > 0 && guard > 0 {
+        guard -= 1;
+        let bytes = bt.read_node_bytes(node_num)?;
+        let node = bt.parse_node(&bytes)?;
+
+        if node_num != 0 {
+            // After the header, every node in the chain must be a map node
+            // holding exactly one record at height zero.
+            if node.kind() != NodeKind::Map || node.num_records() != 1 || node.height() != 0 {
+                report.bad_map_node.push((name_u8(tree), node_num));
+                return Ok(());
+            }
+            rec_index = 0;
+        }
+
+        let offsets = record_offsets(&bytes, node_size, node.num_records())?;
+        let Some(&at) = offsets.get(rec_index as usize) else {
+            report.bad_map_node.push((name_u8(tree), node_num));
+            return Ok(());
+        };
+        let end = offsets
+            .get(rec_index as usize + 1)
+            .copied()
+            .unwrap_or(node_size);
+        let size = end.saturating_sub(at).min(map_size);
+        let Some(window) = bytes.get(at..(at + size).min(bytes.len())) else {
+            report.bad_map_node.push((name_u8(tree), node_num));
+            return Ok(());
+        };
+        if window != &expected[compared..compared + size] {
+            report.node_map_mismatch.push((name_u8(tree), node_num));
+            return Ok(());
+        }
+        compared += size;
+        map_size -= size;
+
+        // On to the next map node, if the map continues past this record.
+        node_num = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if node_num == 0 {
+            break;
+        }
+        rec_index = 0;
+    }
+    Ok(())
 }
 
 /// Every allocation block the volume's own metadata occupies.
@@ -521,6 +760,14 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
             continue;
         }
         check_btree(
+            vol.device(),
+            fork,
+            header.block_size,
+            header.is_hfsx(),
+            name,
+            &mut report,
+        )?;
+        check_node_map(
             vol.device(),
             fork,
             header.block_size,
@@ -1003,13 +1250,16 @@ mod tests {
             child_node: vec![(1, 3, 900)],
             sibling_link: vec![(2, 5)],
             unerased_node: vec![(1, 9)],
+            node_map_mismatch: vec![(1, 0)],
+            bad_map_node: vec![(2, 3)],
             key_width: vec!["attributes"],
         };
         assert!(!report.is_clean());
         let lines = report.describe();
+        // Thirteen original findings, plus the fork rule and the two map ones.
         assert_eq!(
             lines.len(),
-            14,
+            16,
             "one line per disagreement:\n{}",
             lines.join("\n")
         );
@@ -1028,6 +1278,8 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("points at node 900")));
         assert!(lines.iter().any(|l| l.contains("forward link disagrees")));
         assert!(lines.iter().any(|l| l.contains("not erased")));
+        assert!(lines.iter().any(|l| l.contains("node map")));
+        assert!(lines.iter().any(|l| l.contains("map chain")));
         assert!(lines.iter().any(|l| l.contains("8-bit length form")));
     }
 }
