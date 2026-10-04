@@ -63,7 +63,11 @@ enum Level {
 fn cases() -> Vec<(&'static str, Level, &'static str)> {
     vec![
         // Signature is not a member of the HFS family at all.
-        ("bad-signature", Level::Header, "unrecognised volume signature"),
+        (
+            "bad-signature",
+            Level::Header,
+            "unrecognised volume signature",
+        ),
         // HFS+ signature carrying the HFSX version number. Apple validates the
         // signature/version pair, so this is a corrupt HFS+ volume, not HFSX.
         ("hfsplus-sig-hfsx-version", Level::Header, "volume version"),
@@ -78,7 +82,11 @@ fn cases() -> Vec<(&'static str, Level, &'static str)> {
         // volume naming one at or past its own end is damaged. The error must name
         // the field: the bytes found there would otherwise be parsed as a journal
         // info block and produce a complaint about *those* instead.
-        ("journal-info-block-out-of-volume", Level::Header, "journalInfoBlock"),
+        (
+            "journal-info-block-out-of-volume",
+            Level::Header,
+            "journalInfoBlock",
+        ),
         // A value large enough that the block offset would overflow, told apart
         // from the range check by the same message -- both are refused, and both
         // for the same reason.
@@ -86,10 +94,13 @@ fn cases() -> Vec<(&'static str, Level, &'static str)> {
         // Offset zero of a journal is its header, so a `start` there would have
         // the walk parse the header as a block list. CHECK_JOURNAL panics on it,
         // so this is a rejection rather than a truncation.
-        ("journal-start-at-header", Level::Mount, "journal_header.start"),
+        (
+            "journal-start-at-header",
+            Level::Mount,
+            "journal_header.start",
+        ),
     ]
 }
-
 
 fn image(name: &str) -> PathBuf {
     malformed_dir().join(format!("{name}.img"))
@@ -103,8 +114,7 @@ fn image(name: &str) -> PathBuf {
 /// fail. That second half matters: a journal fault that were caught by the header
 /// parser would be a different defect wearing the same fixture.
 fn parse_error(path: &Path, level: Level) -> Error {
-    let dev = FileDevice::open(path)
-        .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+    let dev = FileDevice::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
     match level {
         Level::Header => match VolumeHeader::read_from(&dev) {
             Ok(_) => panic!("{} was accepted but must be rejected", path.display()),
@@ -209,11 +219,17 @@ fn reading_offsets_outside_the_image_report_truncation() {
     assert!(dev.read_at(len - 1, &mut one).is_ok());
 
     // One past the end is not.
-    assert!(matches!(dev.read_at(len, &mut one), Err(Error::Truncated { .. })));
+    assert!(matches!(
+        dev.read_at(len, &mut one),
+        Err(Error::Truncated { .. })
+    ));
 
     // A huge read is rejected by the bounds check rather than overflowing.
     let mut big = vec![0u8; 4096];
-    assert!(matches!(dev.read_at(0, &mut big), Err(Error::Truncated { .. })));
+    assert!(matches!(
+        dev.read_at(0, &mut big),
+        Err(Error::Truncated { .. })
+    ));
 
     // An offset near u64::MAX must produce an error, not a wrap-around.
     assert!(dev.read_at(u64::MAX, &mut one).is_err());
@@ -251,7 +267,12 @@ fn corrupted_fork_geometry_is_preserved_for_diagnosis_not_hidden() {
     let dev = FileDevice::open(&path).unwrap();
     let vh = VolumeHeader::read_from(&dev).expect("header itself is well-formed");
 
-    let first = vh.catalog_file.iter_inline().next().copied().expect("one extent");
+    let first = vh
+        .catalog_file
+        .iter_inline()
+        .next()
+        .copied()
+        .expect("one extent");
     assert_eq!(
         first.start_block, 0xFFFF_0000,
         "the corrupt extent must be reported verbatim, not clamped"
@@ -321,7 +342,10 @@ fn a_volume_larger_than_its_device_is_caught_at_the_alternate_header() {
     // The alternate header lies beyond the device, so reading it must fail
     // rather than wrap around or return zeros.
     let alt = vh.alternate_header_offset().unwrap();
-    assert!(alt > actual, "alternate header offset {alt} should exceed device {actual}");
+    assert!(
+        alt > actual,
+        "alternate header offset {alt} should exceed device {actual}"
+    );
     assert!(matches!(
         dev.read_vec(alt, 512),
         Err(Error::Truncated { .. })
@@ -402,5 +426,3 @@ fn the_checker_repairs_rather_than_refuses() {
         "running fsck must not have repaired the canonical fixture"
     );
 }
-
-

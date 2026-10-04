@@ -30,10 +30,10 @@
 use super::cnid::Cnid;
 use super::key::CatalogKey;
 use super::record::{parse_record, CatalogRecord};
+use crate::blockdev::BlockDevice;
 use crate::btree::header::BTreeHeader;
 use crate::btree::io::BTreeFile;
 use crate::btree::node::NodeKind;
-use crate::blockdev::BlockDevice;
 use crate::error::{Error, Result};
 use crate::unicode::{Comparator, Ordering};
 
@@ -255,24 +255,30 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
         // Search every parent for a child record with this name. For a thread
         // record the CNID comes from the key; for a main record it comes from the
         // record body, so both are handled.
-        let Some(bytes) = self.leaf_bytes() else { return Ok(None) };
+        let Some(bytes) = self.leaf_bytes() else {
+            return Ok(None);
+        };
         let node = self.tree.parse_node(&bytes)?;
         for i in 0..node.num_records() {
             let Ok(rec) = node.record(i) else { continue };
-            let Some((key, body)) = split_record(rec) else { continue };
-            let Ok(parsed) = parse_record(body) else { continue };
+            let Some((key, body)) = split_record(rec) else {
+                continue;
+            };
+            let Ok(parsed) = parse_record(body) else {
+                continue;
+            };
             match &parsed {
                 CatalogRecord::Thread(t) => {
                     // Thread key: parentID is the object's CNID, body holds its name.
-                    if key.name.is_empty()
-                        && t.node_name == name
-                    {
+                    if key.name.is_empty() && t.node_name == name {
                         return Ok(Some(key.parent_id));
                     }
                 }
                 _ => {
                     if !key.name.is_empty() && key.name == name {
-                        if let Some(cnid) = parsed.cnid() { return Ok(Some(cnid)); }
+                        if let Some(cnid) = parsed.cnid() {
+                            return Ok(Some(cnid));
+                        }
                     }
                 }
             }
@@ -285,7 +291,9 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
         if self.tree.header().leaf_records == 0 {
             return None;
         }
-        self.tree.read_node_bytes(self.tree.header().first_leaf_node).ok()
+        self.tree
+            .read_node_bytes(self.tree.header().first_leaf_node)
+            .ok()
     }
 
     /// Find the record whose key is exactly `key`.
@@ -316,7 +324,10 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
                 }
             }
         }
-        Err(Error::invalid("catalog tree depth", "descent exceeded the depth limit"))
+        Err(Error::invalid(
+            "catalog tree depth",
+            "descent exceeded the depth limit",
+        ))
     }
 
     /// Binary search one leaf for `key`.
@@ -368,7 +379,10 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
             let mid = lo + (hi - lo) / 2;
             let rec = node.record(mid)?;
             let Some((k, _)) = split_record(rec) else {
-                return Err(Error::invalid("catalog index record", "key could not be decoded"));
+                return Err(Error::invalid(
+                    "catalog index record",
+                    "key could not be decoded",
+                ));
             };
             if self.compare_keys(&k, key) == Ordering::Less {
                 lo = mid + 1;
@@ -431,7 +445,9 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
 
             for i in 0..node.num_records() {
                 let Ok(record) = node.record(i) else { continue };
-                let Some((key, body)) = split_record(record) else { continue };
+                let Some((key, body)) = split_record(record) else {
+                    continue;
+                };
                 if key.parent_id != parent_id {
                     // Keys are sorted by parentID, so once the range has been
                     // left it cannot reappear in this leaf or any later one.
@@ -441,13 +457,19 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
                     continue;
                 }
                 entered = true;
-                let Ok(parsed) = parse_record(body) else { continue };
+                let Ok(parsed) = parse_record(body) else {
+                    continue;
+                };
                 // A thread record's CNID is in its key, not its body; children
                 // of a directory are main records, so anything else is skipped
                 // rather than misattributed.
                 let Some(cnid) = parsed.cnid() else { continue };
                 let is_dir = matches!(parsed, CatalogRecord::Folder(_));
-                let entry = CatalogEntry { name: key.name.clone(), cnid, is_dir };
+                let entry = CatalogEntry {
+                    name: key.name.clone(),
+                    cnid,
+                    is_dir,
+                };
                 let done = stop_after_first(&entry);
                 out.push(entry);
                 if done {
@@ -502,14 +524,22 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
 
             for i in 0..node.num_records() {
                 let Ok(record) = node.record(i) else { continue };
-                let Some((key, body)) = split_record(record) else { continue };
-                let Ok(CatalogRecord::Thread(t)) = parse_record(body) else { continue };
+                let Some((key, body)) = split_record(record) else {
+                    continue;
+                };
+                let Ok(CatalogRecord::Thread(t)) = parse_record(body) else {
+                    continue;
+                };
                 if !key.name.is_empty() {
                     // The other key form is a main record, not a thread record.
                     continue;
                 }
                 let is_dir = t.is_folder();
-                out.push(ThreadEntry { cnid: key.parent_id, name: t.node_name, is_dir });
+                out.push(ThreadEntry {
+                    cnid: key.parent_id,
+                    name: t.node_name,
+                    is_dir,
+                });
             }
 
             if node_num == header.last_leaf_node {
@@ -519,7 +549,6 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
         }
         Ok(out)
     }
-
 }
 
 /// One entry from a whole-volume enumeration.
@@ -560,8 +589,8 @@ fn record_key_len(record: &[u8], max_key_length: usize) -> Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::record::K_HFS_PLUS_FOLDER_THREAD_RECORD;
+    use super::*;
     use crate::btree::key::CATALOG_KEY_MAX_LENGTH;
     use crate::catalog::cnid::ROOT_FOLDER_ID;
 
@@ -669,7 +698,10 @@ mod tests {
             Ordering::Equal,
             "folding makes these the same name"
         );
-        assert_ne!(Comparator::Binary.compare(&a.name, &b.name), Ordering::Equal);
+        assert_ne!(
+            Comparator::Binary.compare(&a.name, &b.name),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -695,6 +727,9 @@ mod tests {
 
     #[test]
     fn catalog_key_max_length_is_the_format_maximum() {
-        assert_eq!(crate::btree::key::CATALOG_KEY_MAX_LENGTH, CATALOG_KEY_MAX_LENGTH);
+        assert_eq!(
+            crate::btree::key::CATALOG_KEY_MAX_LENGTH,
+            CATALOG_KEY_MAX_LENGTH
+        );
     }
 }

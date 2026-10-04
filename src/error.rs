@@ -129,7 +129,10 @@ pub enum Error {
 impl Error {
     /// Convenience constructor for [`Error::InvalidField`].
     pub fn invalid(field: &'static str, expected: impl Into<String>) -> Self {
-        Error::InvalidField { field, expected: expected.into() }
+        Error::InvalidField {
+            field,
+            expected: expected.into(),
+        }
     }
 
     /// Convenience constructor for [`Error::Overflow`].
@@ -144,12 +147,17 @@ impl Error {
 
     /// Map an underlying [`std::io::Error`] into [`Error::Io`].
     pub fn io(err: &std::io::Error) -> Self {
-        Error::Io { message: err.to_string() }
+        Error::Io {
+            message: err.to_string(),
+        }
     }
 
     /// Convenience constructor for [`Error::NoSpace`].
     pub fn no_space(requested: u32, available: u64) -> Self {
-        Error::NoSpace { requested, available }
+        Error::NoSpace {
+            requested,
+            available,
+        }
     }
 }
 
@@ -159,15 +167,25 @@ impl fmt::Display for Error {
             Error::InvalidField { field, expected } => {
                 write!(f, "invalid field {field}: {expected}")
             }
-            Error::Truncated { what, needed, available } => {
+            Error::Truncated {
+                what,
+                needed,
+                available,
+            } => {
                 write!(f, "truncated {what}: need {needed} bytes, have {available}")
             }
             Error::Overflow { what } => write!(f, "arithmetic overflow computing {what}"),
             Error::OutOfRange { what, value, limit } => {
                 write!(f, "{what} {value} exceeds limit {limit}")
             }
-            Error::BadBlockNumber { block, total_blocks } => {
-                write!(f, "allocation block {block} outside volume of {total_blocks} blocks")
+            Error::BadBlockNumber {
+                block,
+                total_blocks,
+            } => {
+                write!(
+                    f,
+                    "allocation block {block} outside volume of {total_blocks} blocks"
+                )
             }
             Error::BadSignature { found } => {
                 write!(f, "unrecognised volume signature 0x{found:04x}")
@@ -178,7 +196,10 @@ impl fmt::Display for Error {
             Error::NotFound { what } => write!(f, "{what} not present on this volume"),
             Error::NotFoundKey { key } => write!(f, "no such entry: {key}"),
             Error::Io { message } => write!(f, "i/o error: {message}"),
-            Error::NoSpace { requested, available } => write!(
+            Error::NoSpace {
+                requested,
+                available,
+            } => write!(
                 f,
                 "no space: {requested} blocks requested, {available} free"
             ),

@@ -57,7 +57,10 @@ impl Rng {
 /// an offset array that says nothing in particular. Any of it can be made to
 /// disagree with anything else.
 fn adversarial_node(node_size: usize, num_records: u16, rng: &mut Rng) -> Node<'static> {
-    assert!(node_size >= 64, "a node smaller than this cannot hold an offset array");
+    assert!(
+        node_size >= 64,
+        "a node smaller than this cannot hold an offset array"
+    );
     // Leaked so the node can borrow it for 'static, which keeps the test free of
     // lifetime plumbing. One node per case and the cases are bounded, so this is
     // a few megabytes rather than a habit.
@@ -246,7 +249,9 @@ fn a_fork_with_no_blocks_must_claim_no_bytes() {
     assert!(fork.validate(0, 4096).is_ok());
 
     fork.logical_size = 1;
-    let err = fork.validate(0, 4096).expect_err("one byte in an empty fork");
+    let err = fork
+        .validate(0, 4096)
+        .expect_err("one byte in an empty fork");
     assert!(
         err.to_string().contains("logicalSize"),
         "the error must name the field, got {err}"

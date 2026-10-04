@@ -35,7 +35,9 @@ impl<D: BlockDevice> ViewDevice<D> {
     /// as a confusing short read much later.
     pub fn new(inner: D, base: u64, len: u64) -> Result<Self> {
         let inner_len = inner.len()?;
-        let end = base.checked_add(len).ok_or(Error::overflow("device view range"))?;
+        let end = base
+            .checked_add(len)
+            .ok_or(Error::overflow("device view range"))?;
         if end > inner_len {
             return Err(Error::OutOfRange {
                 what: "device view",
@@ -56,7 +58,11 @@ impl<D: BlockDevice> ViewDevice<D> {
                 limit: inner_len,
             });
         }
-        Ok(ViewDevice { inner, base, len: inner_len - base })
+        Ok(ViewDevice {
+            inner,
+            base,
+            len: inner_len - base,
+        })
     }
 
     /// Byte offset of the window within the inner device.
@@ -80,7 +86,9 @@ impl<D: BlockDevice> BlockDevice for ViewDevice<D> {
         if buf.is_empty() {
             return Ok(());
         }
-        let end = offset.checked_add(buf.len() as u64).ok_or(Error::overflow("view read"))?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::overflow("view read"))?;
         if end > self.len {
             return Err(Error::Truncated {
                 what: "view read",
@@ -88,7 +96,10 @@ impl<D: BlockDevice> BlockDevice for ViewDevice<D> {
                 available: self.len as usize,
             });
         }
-        let abs = self.base.checked_add(offset).ok_or(Error::overflow("view read"))?;
+        let abs = self
+            .base
+            .checked_add(offset)
+            .ok_or(Error::overflow("view read"))?;
         self.inner.read_at(abs, buf)
     }
 
@@ -99,7 +110,9 @@ impl<D: BlockDevice> BlockDevice for ViewDevice<D> {
 
 impl<D: BlockDeviceMut> BlockDeviceMut for ViewDevice<D> {
     fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
-        let end = offset.checked_add(buf.len() as u64).ok_or(Error::overflow("view write"))?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::overflow("view write"))?;
         if end > self.len {
             return Err(Error::Truncated {
                 what: "view write",
@@ -107,7 +120,10 @@ impl<D: BlockDeviceMut> BlockDeviceMut for ViewDevice<D> {
                 available: self.len as usize,
             });
         }
-        let abs = self.base.checked_add(offset).ok_or(Error::overflow("view write"))?;
+        let abs = self
+            .base
+            .checked_add(offset)
+            .ok_or(Error::overflow("view write"))?;
         self.inner.write_at(abs, buf)
     }
 

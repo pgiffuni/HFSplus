@@ -86,10 +86,20 @@ impl<'a, D: BlockDevice + ?Sized> BTreeFile<'a, D> {
             // Drop the provisional parse and redo it properly.
             let header = read_header(device, &mapper, header.node_size)?;
             header.validate(fork, hfs_plus)?;
-            return Ok(BTreeFile { device, fork: *fork, mapper, header });
+            return Ok(BTreeFile {
+                device,
+                fork: *fork,
+                mapper,
+                header,
+            });
         }
 
-        Ok(BTreeFile { device, fork: *fork, mapper, header })
+        Ok(BTreeFile {
+            device,
+            fork: *fork,
+            mapper,
+            header,
+        })
     }
 
     /// The tree's header record.
@@ -125,7 +135,10 @@ impl<'a, D: BlockDevice + ?Sized> BTreeFile<'a, D> {
         if node_num >= self.header.total_nodes {
             return Err(Error::invalid(
                 "btree node number",
-                format!("{node_num} is not below totalNodes {}", self.header.total_nodes),
+                format!(
+                    "{node_num} is not below totalNodes {}",
+                    self.header.total_nodes
+                ),
             ));
         }
         let size = self.node_size();
@@ -143,7 +156,7 @@ impl<'a, D: BlockDevice + ?Sized> BTreeFile<'a, D> {
         self.device.read_at(device_offset, buf)
     }
 
-        /// Read node `node_num` and return its raw bytes, so that the caller can own
+    /// Read node `node_num` and return its raw bytes, so that the caller can own
     /// the buffer and hand it to [`BTreeFile::parse_node`].
     ///
     /// Mining reference: Apple `core/BTreeNodeOps.c` `GetNode` bounds-checks
@@ -179,7 +192,10 @@ impl<'a, D: BlockDevice + ?Sized> BTreeFile<'a, D> {
         if node_num >= self.header.total_nodes {
             return Err(Error::invalid(
                 "btree node number",
-                format!("{node_num} is not below totalNodes {}", self.header.total_nodes),
+                format!(
+                    "{node_num} is not below totalNodes {}",
+                    self.header.total_nodes
+                ),
             ));
         }
         // Node numbers are contiguous and a fixed size apart, so the byte
@@ -256,7 +272,11 @@ mod tests {
     const HR: usize = 14 + 106;
 
     /// Build a minimal one-node B-tree at allocation block 10.
-    fn build_tree(node_size: u16, total_nodes: u32, root_kind: i8) -> (MemoryDevice, ForkData, u32) {
+    fn build_tree(
+        node_size: u16,
+        total_nodes: u32,
+        root_kind: i8,
+    ) -> (MemoryDevice, ForkData, u32) {
         let block_size = 4096u32;
         let mut dev = MemoryDevice::zeroed(64 * 1024);
         let mut node = vec![0u8; usize::from(node_size)];
@@ -283,9 +303,9 @@ mod tests {
         // offset, descending addresses.
         // Records grow upward from offset 14; slot values ascend with the index
         // and slot addresses descend from the end of the node.
-        let rec0 = 14u16;              // the BTHeaderRec
-        let rec1 = (HR) as u16;        // the 128-byte user area
-        let rec2 = (HR + 128) as u16;  // the node map bitmap
+        let rec0 = 14u16; // the BTHeaderRec
+        let rec1 = (HR) as u16; // the 128-byte user area
+        let rec2 = (HR + 128) as u16; // the node map bitmap
         let set_slot = |n: &mut Vec<u8>, i: usize, v: u16| {
             let at = usize::from(node_size) - 2 * i - 2;
             n[at..at + 2].copy_from_slice(&v.to_be_bytes());
@@ -306,7 +326,10 @@ mod tests {
             total_blocks: 8,
             extents: {
                 let mut r = crate::format::extents::ExtentRecord::EMPTY;
-                r.raw[0] = ExtentDescriptor { start_block: 2, block_count: 8 };
+                r.raw[0] = ExtentDescriptor {
+                    start_block: 2,
+                    block_count: 8,
+                };
                 r
             },
         };
@@ -369,7 +392,10 @@ mod tests {
     #[test]
     fn rejects_a_fork_too_small_to_hold_a_node() {
         let (dev, fork, _) = build_tree(4096, 8, 1);
-        let tiny = ForkData { logical_size: 100, ..fork };
+        let tiny = ForkData {
+            logical_size: 100,
+            ..fork
+        };
         assert!(BTreeFile::open(&dev, &tiny, 4096, true).is_err());
     }
 

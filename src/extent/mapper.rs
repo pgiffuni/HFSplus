@@ -248,7 +248,10 @@ mod tests {
         f.logical_size = u64::from(total_blocks) * 4096;
         f.total_blocks = total_blocks;
         for (i, (start, count)) in extents.iter().enumerate() {
-            f.extents.raw[i] = ExtentDescriptor { start_block: *start, block_count: *count };
+            f.extents.raw[i] = ExtentDescriptor {
+                start_block: *start,
+                block_count: *count,
+            };
         }
         f
     }
@@ -275,7 +278,10 @@ mod tests {
         let f = fork_with(&[(100, 4)], 4);
         let m = ExtentMapper::new(&f, 4096);
         assert!(matches!(m.map_block(4), Err(Error::OutOfRange { .. })));
-        assert!(matches!(m.map_block(u32::MAX), Err(Error::OutOfRange { .. })));
+        assert!(matches!(
+            m.map_block(u32::MAX),
+            Err(Error::OutOfRange { .. })
+        ));
     }
 
     #[test]
@@ -322,7 +328,10 @@ mod tests {
         assert!(ExtentMapper::new(&f, 4096).needs_overflow());
 
         let mut group = ExtentRecord::EMPTY;
-        group.raw[0] = ExtentDescriptor { start_block: 300, block_count: 8 };
+        group.raw[0] = ExtentDescriptor {
+            start_block: 300,
+            block_count: 8,
+        };
 
         let m = ExtentMapper::new(&f, 4096).with_overflow(Box::new(Fixed(group)));
         assert_eq!(m.map_block(0).unwrap(), 100);

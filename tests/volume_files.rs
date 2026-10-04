@@ -233,9 +233,22 @@ fn the_tail_of_a_fragmented_file_is_bounded() {
         let size = frag.data_size() as usize;
         assert_eq!(size, 32768);
 
-        assert_eq!(vol.read(&frag, (size - 4) as u64, 4).expect("to the end").len(), 4);
-        assert_eq!(vol.read(&frag, (size - 4) as u64, 999).expect("past the end").len(), 4);
-        assert!(vol.read(&frag, size as u64, 10).expect("at the end").is_empty());
+        assert_eq!(
+            vol.read(&frag, (size - 4) as u64, 4)
+                .expect("to the end")
+                .len(),
+            4
+        );
+        assert_eq!(
+            vol.read(&frag, (size - 4) as u64, 999)
+                .expect("past the end")
+                .len(),
+            4
+        );
+        assert!(vol
+            .read(&frag, size as u64, 10)
+            .expect("at the end")
+            .is_empty());
     });
 }
 
@@ -327,7 +340,10 @@ fn reading_these_files_does_not_modify_the_image() {
         }
         let link = entry(&vol, LINK);
         assert_eq!(vol.read_link(&link).expect("read_link"), LINK_TARGET);
-        assert_eq!(vol.statfs().expect("statfs").total_blocks, vol.header().total_blocks);
+        assert_eq!(
+            vol.statfs().expect("statfs").total_blocks,
+            vol.header().total_blocks
+        );
     }
 
     let after = std::fs::read(&path).expect("read after");
@@ -344,12 +360,14 @@ fn the_two_appearances_of_the_volume_agree() {
     let first = {
         let dev = FileDevice::open(image_path(WITH_FILES)).expect("open");
         let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
-        vol.read_file(&entry(&vol, FRAGMENTED), 1 << 20).expect("read")
+        vol.read_file(&entry(&vol, FRAGMENTED), 1 << 20)
+            .expect("read")
     };
     let second = {
         let dev = FileDevice::open(image_path(WITH_FILES)).expect("open");
         let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
-        vol.read_file(&entry(&vol, FRAGMENTED), 1 << 20).expect("read")
+        vol.read_file(&entry(&vol, FRAGMENTED), 1 << 20)
+            .expect("read")
     };
     assert_eq!(digest(&first), digest(&second));
 }
@@ -372,7 +390,11 @@ fn fsck_accepts_the_image_and_leaves_it_alone() {
         return;
     }
     let mut probe = std::env::temp_dir();
-    probe.push(format!("hfsplus-with-files-{}-{}.img", WITH_FILES, std::process::id()));
+    probe.push(format!(
+        "hfsplus-with-files-{}-{}.img",
+        WITH_FILES,
+        std::process::id()
+    ));
     std::fs::copy(&path, &probe).expect("copy for fsck");
 
     let out = common::run_fsck(&fsck, &probe);
@@ -431,11 +453,7 @@ fn the_manifests_file_entries_describe_what_the_volume_actually_has() {
                 .array_item("files", index, "mode")
                 .unwrap_or_else(|| panic!("{name}: no mode"));
             let want = u32::from_str_radix(mode.trim_start_matches("0o"), 8).expect("mode parses");
-            assert_eq!(
-                u32::from(mode_bits),
-                want,
-                "{name}: mode from the manifest"
-            );
+            assert_eq!(u32::from(mode_bits), want, "{name}: mode from the manifest");
 
             let cnid: u32 = manifest
                 .array_item("files", index, "cnid")
@@ -485,7 +503,11 @@ fn a_file_whose_extents_overflow_is_read_through_the_extents_tree() {
     }
     with_volume(WITH_FILES, |vol| {
         let file = entry(vol, OVERFLOW);
-        assert_eq!(file.data_size(), 10 * 4096, "ten blocks, eight of them inline");
+        assert_eq!(
+            file.data_size(),
+            10 * 4096,
+            "ten blocks, eight of them inline"
+        );
 
         let data = vol.read_file(&file, 1 << 20).expect("read");
         assert_eq!(data.len(), 10 * 4096);
@@ -586,8 +608,7 @@ fn a_fork_extent_past_the_volume_is_refused_when_a_read_reaches_it() {
     // logical size read as zeros -- so the damage is silent until a read reaches
     // it. The checker refuses the whole volume instead, which is where the
     // complaint belongs.
-    let path = common::repo_root()
-        .join("tests/images/replayed/fork-extent-past-volume.img");
+    let path = common::repo_root().join("tests/images/replayed/fork-extent-past-volume.img");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
@@ -617,7 +638,9 @@ fn a_fork_extent_past_the_volume_is_refused_when_a_read_reaches_it() {
     // And the earlier extents still read, which is the tolerance being described
     // rather than a second bug.
     assert_eq!(
-        vol.read(&object, 0, 64).expect("a read inside the valid extents").len(),
+        vol.read(&object, 0, 64)
+            .expect("a read inside the valid extents")
+            .len(),
         64
     );
 
@@ -644,8 +667,7 @@ fn a_symlink_whose_target_is_empty_is_refused() {
     //
     // Mining reference: `core/hfs_xattr.c` reads a link target out of the file's
     // data fork for HFSPlus, so the fork and the target cannot disagree.
-    let path = common::repo_root()
-        .join("tests/images/replayed/symlink-empty-target.img");
+    let path = common::repo_root().join("tests/images/replayed/symlink-empty-target.img");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;

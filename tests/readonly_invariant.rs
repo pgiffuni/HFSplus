@@ -45,7 +45,10 @@ struct CountingDevice<'a> {
 
 impl<'a> CountingDevice<'a> {
     fn new(inner: &'a MemoryDevice) -> Self {
-        CountingDevice { inner, writes: RefCell::new(Vec::new()) }
+        CountingDevice {
+            inner,
+            writes: RefCell::new(Vec::new()),
+        }
     }
 
     fn writes(&self) -> usize {
@@ -202,9 +205,15 @@ fn no_shipped_code_path_names_a_writable_constructor() {
     let root = common::repo_root().join("src");
     let mut offenders = Vec::new();
     for path in walk(&root) {
-        let Ok(text) = std::fs::read_to_string(&path) else { continue };
-        let Ok(rel) = path.strip_prefix(&root) else { continue };
-        let Some(production) = production_part(&text) else { continue };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(rel) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let Some(production) = production_part(&text) else {
+            continue;
+        };
 
         for needle in ["open_writable", "new_writable"] {
             // The definition itself is not a call. Everything else mentioning the
@@ -218,9 +227,8 @@ fn no_shipped_code_path_names_a_writable_constructor() {
                 // did, until the check was narrowed from the whole prefix to the
                 // last few characters of it.
                 let tail = production[..start].trim_end();
-                let preceded_by_fn = tail.ends_with("fn ")
-                    || tail.ends_with("fn")
-                    || tail.ends_with('(');
+                let preceded_by_fn =
+                    tail.ends_with("fn ") || tail.ends_with("fn") || tail.ends_with('(');
                 if !preceded_by_fn {
                     let line = production[..start].lines().count();
                     offenders.push(format!("{}:{} mentions {needle}", rel.display(), line));
@@ -238,7 +246,9 @@ fn no_shipped_code_path_names_a_writable_constructor() {
 /// Every `.rs` under `dir`.
 fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {

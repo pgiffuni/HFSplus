@@ -218,7 +218,9 @@ impl CheckReport {
             ));
         }
         for (tree, node) in &self.node_height {
-            out.push(format!("{tree} node {node}: its height contradicts the tree depth"));
+            out.push(format!(
+                "{tree} node {node}: its height contradicts the tree depth"
+            ));
         }
         for (tree, node, child) in &self.child_node {
             out.push(format!(
@@ -344,14 +346,12 @@ pub fn fork_blocks<D: crate::blockdev::BlockDevice + ?Sized>(
     // Walk the overflow groups, if this fork spills past the inline density.
     if fork.needs_overflow() {
         let header = vol.header();
-        let tree = crate::file::TreeOverflow::new(
-            BTreeFile::open(
-                vol.device(),
-                &header.extents_file,
-                header.block_size,
-                header.is_hfsx(),
-            )?,
-        );
+        let tree = crate::file::TreeOverflow::new(BTreeFile::open(
+            vol.device(),
+            &header.extents_file,
+            header.block_size,
+            header.is_hfsx(),
+        )?);
         let mut seen = total;
         // Bounded by the fork's own block count, so a corrupt tree cannot make
         // this loop forever.
@@ -361,9 +361,9 @@ pub fn fork_blocks<D: crate::blockdev::BlockDevice + ?Sized>(
             if guard > 64 {
                 return Err(Error::overflow("overflow extent groups"));
             }
-            let Some(group) =
-                tree.find_group(ExtentKey::DATA_FORK, cnid, seen)
-                    .map_err(|e| Error::invalid("extents overflow tree", e.to_string()))?
+            let Some(group) = tree
+                .find_group(ExtentKey::DATA_FORK, cnid, seen)
+                .map_err(|e| Error::invalid("extents overflow tree", e.to_string()))?
             else {
                 break;
             };
@@ -497,9 +497,8 @@ pub fn check<D: crate::blockdev::BlockDevice + ?Sized>(
         referenced_bitmap[*block as usize] = true;
     }
 
-    let is_referenced = |b: u32| -> bool {
-        referenced_bitmap.get(b as usize).copied().unwrap_or(false)
-    };
+    let is_referenced =
+        |b: u32| -> bool { referenced_bitmap.get(b as usize).copied().unwrap_or(false) };
     report.orphaned = map.orphaned(&is_referenced);
     report.missing = map.missing(&is_referenced);
 
@@ -634,12 +633,7 @@ fn check_catalog_structure<D: crate::blockdev::BlockDevice + ?Sized>(
         if node_num == last_leaf {
             break;
         }
-        let next = u32::from_be_bytes([
-            node.raw()[4],
-            node.raw()[5],
-            node.raw()[6],
-            node.raw()[7],
-        ]);
+        let next = u32::from_be_bytes([node.raw()[4], node.raw()[5], node.raw()[6], node.raw()[7]]);
         if next == 0 {
             break;
         }
@@ -729,7 +723,6 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
         return Ok(());
     }
     {
-
         let bytes = bt.read_node_bytes(node_num)?;
         let node = bt.parse_node(&bytes)?;
 
@@ -776,9 +769,7 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
                     expected = next;
                     cursor = next;
                 }
-                reached.extend(reached_from_index_children(
-                    &bt, node_num, total_nodes,
-                )?);
+                reached.extend(reached_from_index_children(&bt, node_num, total_nodes)?);
                 check_unused_nodes(&bt, &reached, tree, report);
             }
             crate::btree::node::NodeKind::Index => {
@@ -791,9 +782,7 @@ fn check_btree<D: crate::blockdev::BlockDevice + ?Sized>(
                     } else {
                         // The child must itself be structurally sound, so walk
                         // into it rather than only recording it.
-                        check_child(
-                            &bt, child, level, tree_depth, tree, total_nodes, report,
-                        )?;
+                        check_child(&bt, child, level, tree_depth, tree, total_nodes, report)?;
                     }
                 }
             }
@@ -980,7 +969,10 @@ mod tests {
     fn a_volume_too_small_for_a_backup_header_is_refused() {
         // The backup header sits 1024 bytes before the end, so a volume smaller
         // than that has nowhere to put it and the subtraction would wrap.
-        assert!(metadata_blocks(512, 1, 1).is_err(), "512 bytes is less than 1024");
+        assert!(
+            metadata_blocks(512, 1, 1).is_err(),
+            "512 bytes is less than 1024"
+        );
         assert!(metadata_blocks(4096, 0, 1).is_err(), "an empty volume");
         assert!(
             metadata_blocks(1024, 1, 1).is_ok(),
@@ -1015,11 +1007,18 @@ mod tests {
         };
         assert!(!report.is_clean());
         let lines = report.describe();
-        assert_eq!(lines.len(), 14, "one line per disagreement:\n{}", lines.join("\n"));
+        assert_eq!(
+            lines.len(),
+            14,
+            "one line per disagreement:\n{}",
+            lines.join("\n")
+        );
         assert!(lines[0].contains('7') && lines[0].contains("no file references"));
         assert!(lines[1].contains('9') && lines[1].contains("not marked"));
         assert!(lines[2].contains("nextCatalogID"));
-        assert!(lines.iter().any(|l| l.contains("19") && l.contains("declares 10")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("19") && l.contains("declares 10")));
         assert!(lines.iter().any(|l| l.contains("does not follow")));
         assert!(lines.iter().any(|l| l.contains("maxKeyLength")));
         assert!(lines.iter().any(|l| l.contains("no thread record")));

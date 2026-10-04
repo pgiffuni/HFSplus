@@ -206,7 +206,10 @@ impl BTreeHeader {
         if !is_legal_node_size(self.node_size) {
             return Err(Error::invalid(
                 "BTHeaderRec.nodeSize",
-                format!("{} is not one of 512..32768 by powers of two", self.node_size),
+                format!(
+                    "{} is not one of 512..32768 by powers of two",
+                    self.node_size
+                ),
             ));
         }
         if hfs_plus && self.node_size == 512 {
@@ -245,7 +248,10 @@ impl BTreeHeader {
         if self.tree_depth > K_MAX_TREE_DEPTH {
             return Err(Error::invalid(
                 "BTHeaderRec.treeDepth",
-                format!("{} exceeds kMaxTreeDepth {K_MAX_TREE_DEPTH}", self.tree_depth),
+                format!(
+                    "{} exceeds kMaxTreeDepth {K_MAX_TREE_DEPTH}",
+                    self.tree_depth
+                ),
             ));
         }
 
@@ -284,7 +290,10 @@ mod tests {
     }
 
     fn fork(size: u64) -> ForkData {
-        ForkData { logical_size: size, ..ForkData::EMPTY }
+        ForkData {
+            logical_size: size,
+            ..ForkData::EMPTY
+        }
     }
 
     #[test]
@@ -314,7 +323,10 @@ mod tests {
         for size in [0u16, 1, 256, 511, 513, 3000, 65535] {
             let h = header(size, 16);
             assert!(
-                matches!(h.validate(&fork(1 << 20), true), Err(Error::InvalidField { .. })),
+                matches!(
+                    h.validate(&fork(1 << 20), true),
+                    Err(Error::InvalidField { .. })
+                ),
                 "node size {size} should be rejected"
             );
         }
@@ -397,14 +409,14 @@ mod tests {
     #[test]
     fn parses_a_synthetic_header_record() {
         let mut raw = vec![0u8; HEADER_RECORD_SIZE];
-        raw[0..2].copy_from_slice(&1u16.to_be_bytes());  // treeDepth
-        raw[2..6].copy_from_slice(&3u32.to_be_bytes());  // rootNode
+        raw[0..2].copy_from_slice(&1u16.to_be_bytes()); // treeDepth
+        raw[2..6].copy_from_slice(&3u32.to_be_bytes()); // rootNode
         raw[6..10].copy_from_slice(&7u32.to_be_bytes()); // leafRecords
         raw[18..20].copy_from_slice(&4096u16.to_be_bytes()); // nodeSize
-        raw[20..22].copy_from_slice(&516u16.to_be_bytes());  // maxKeyLength
-        raw[22..26].copy_from_slice(&16u32.to_be_bytes());  // totalNodes
-        raw[26..30].copy_from_slice(&4u32.to_be_bytes());   // freeNodes
-        raw[37] = 0xBC;                                    // keyCompareType
+        raw[20..22].copy_from_slice(&516u16.to_be_bytes()); // maxKeyLength
+        raw[22..26].copy_from_slice(&16u32.to_be_bytes()); // totalNodes
+        raw[26..30].copy_from_slice(&4u32.to_be_bytes()); // freeNodes
+        raw[37] = 0xBC; // keyCompareType
 
         let h = BTreeHeader::parse(&raw).unwrap();
         assert_eq!(h.tree_depth, 1);

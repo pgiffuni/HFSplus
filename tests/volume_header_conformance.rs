@@ -13,11 +13,11 @@ mod common;
 
 use common::manifest::Manifest;
 use hfsplus::blockdev::{BlockDevice, FileDevice, VOLUME_HEADER_OFFSET};
+use hfsplus::error::Error;
 use hfsplus::format::fork::FORK_DATA_SIZE;
 use hfsplus::format::volume_header::{
-    FileSystemKind, VolumeHeader, FORK_OFFSETS, K_HFS_PLUS_SIG_WORD, K_HFSX_SIG_WORD,
+    FileSystemKind, VolumeHeader, FORK_OFFSETS, K_HFSX_SIG_WORD, K_HFS_PLUS_SIG_WORD,
 };
-use hfsplus::error::Error;
 
 /// Every corpus image that our parser must accept, with the kind it must report.
 fn accepted_images() -> Vec<(String, FileSystemKind)> {
@@ -43,7 +43,11 @@ fn corpus_is_present_and_manifested() {
     );
     for name in &names {
         let mpath = common::manifest(name);
-        assert!(mpath.exists(), "missing manifest for {name} at {}", mpath.display());
+        assert!(
+            mpath.exists(),
+            "missing manifest for {name} at {}",
+            mpath.display()
+        );
     }
 }
 
@@ -56,7 +60,11 @@ fn every_image_matches_its_manifest() {
         let text = std::fs::read_to_string(common::manifest(name))
             .unwrap_or_else(|e| panic!("read manifest {name}: {e}"));
         let m = Manifest::parse(&text);
-        assert_eq!(m.name(), name.as_str(), "manifest name must match file stem");
+        assert_eq!(
+            m.name(),
+            name.as_str(),
+            "manifest name must match file stem"
+        );
 
         let dev = FileDevice::open(common::image(name)).unwrap();
         let vh = match VolumeHeader::read_from(&dev) {
@@ -85,16 +93,56 @@ fn every_image_matches_its_manifest() {
             "{name}: filesystem kind"
         );
 
-        assert_eq!(vh.block_size as i64, m.int("volume.block_size"), "{name}: block size");
-        assert_eq!(vh.total_blocks as i64, m.int("volume.total_blocks"), "{name}: total blocks");
-        assert_eq!(vh.free_blocks as i64, m.int("volume.free_blocks"), "{name}: free blocks");
-        assert_eq!(vh.volume_bytes().unwrap() as i64, m.int("volume.volume_bytes"), "{name}: volume bytes");
-        assert_eq!(vh.next_catalog_id as i64, m.int("volume.next_catalog_id"), "{name}: next CNID");
-        assert_eq!(vh.file_count as i64, m.int("volume.file_count"), "{name}: file count");
-        assert_eq!(vh.folder_count as i64, m.int("volume.folder_count"), "{name}: folder count");
-        assert_eq!(vh.attributes as i64, m.hex("volume.attributes"), "{name}: attributes");
-        assert_eq!(vh.is_clean(), m.bool("volume.unmounted"), "{name}: clean flag");
-        assert_eq!(vh.is_journaled(), m.bool("journaled"), "{name}: journaled flag");
+        assert_eq!(
+            vh.block_size as i64,
+            m.int("volume.block_size"),
+            "{name}: block size"
+        );
+        assert_eq!(
+            vh.total_blocks as i64,
+            m.int("volume.total_blocks"),
+            "{name}: total blocks"
+        );
+        assert_eq!(
+            vh.free_blocks as i64,
+            m.int("volume.free_blocks"),
+            "{name}: free blocks"
+        );
+        assert_eq!(
+            vh.volume_bytes().unwrap() as i64,
+            m.int("volume.volume_bytes"),
+            "{name}: volume bytes"
+        );
+        assert_eq!(
+            vh.next_catalog_id as i64,
+            m.int("volume.next_catalog_id"),
+            "{name}: next CNID"
+        );
+        assert_eq!(
+            vh.file_count as i64,
+            m.int("volume.file_count"),
+            "{name}: file count"
+        );
+        assert_eq!(
+            vh.folder_count as i64,
+            m.int("volume.folder_count"),
+            "{name}: folder count"
+        );
+        assert_eq!(
+            vh.attributes as i64,
+            m.hex("volume.attributes"),
+            "{name}: attributes"
+        );
+        assert_eq!(
+            vh.is_clean(),
+            m.bool("volume.unmounted"),
+            "{name}: clean flag"
+        );
+        assert_eq!(
+            vh.is_journaled(),
+            m.bool("journaled"),
+            "{name}: journaled flag"
+        );
         assert_eq!(
             vh.has_expanded_times(),
             m.bool("volume.expanded_times"),
@@ -158,7 +206,10 @@ fn block_sizes_across_the_corpus_are_all_valid() {
         let dev = FileDevice::open(common::image(&name)).unwrap();
         let vh = VolumeHeader::read_from(&dev).unwrap();
         assert!(vh.block_size >= 512, "{name}: block size below minimum");
-        assert!(vh.block_size.is_power_of_two(), "{name}: block size not a power of two");
+        assert!(
+            vh.block_size.is_power_of_two(),
+            "{name}: block size not a power of two"
+        );
         assert!(vh.validate().is_ok(), "{name}: header must validate");
         seen.insert(vh.block_size);
     }
@@ -221,7 +272,10 @@ fn fork_geometry_is_internally_consistent() {
                 fork.total_blocks
             );
             for d in fork.iter_inline() {
-                assert_ne!(d.block_count, 0, "{name}/{field}: iteration must skip terminators");
+                assert_ne!(
+                    d.block_count, 0,
+                    "{name}/{field}: iteration must skip terminators"
+                );
                 let end = u64::from(d.start_block) + u64::from(d.block_count);
                 assert!(
                     end <= total,
@@ -250,7 +304,11 @@ fn header_is_exactly_one_sector_and_forks_do_not_overlap_it() {
         let raw = dev.read_vec(VOLUME_HEADER_OFFSET, 512).unwrap();
 
         assert_eq!(FORK_OFFSETS[0].1, 112, "{name}: first fork offset");
-        assert_eq!(FORK_OFFSETS[4].1 + FORK_DATA_SIZE, 512, "{name}: last fork must end at 512");
+        assert_eq!(
+            FORK_OFFSETS[4].1 + FORK_DATA_SIZE,
+            512,
+            "{name}: last fork must end at 512"
+        );
 
         let vh = VolumeHeader::from_bytes(&raw).unwrap();
         let re_encoded = vh.to_bytes();
@@ -292,9 +350,18 @@ fn alternate_header_agrees_with_the_primary() {
         // The two copies must describe the same volume.
         assert_eq!(alt.signature, vh.signature, "{name}: alternate signature");
         assert_eq!(alt.version, vh.version, "{name}: alternate version");
-        assert_eq!(alt.block_size, vh.block_size, "{name}: alternate block size");
-        assert_eq!(alt.total_blocks, vh.total_blocks, "{name}: alternate total blocks");
-        assert_eq!(alt.free_blocks, vh.free_blocks, "{name}: alternate free blocks");
+        assert_eq!(
+            alt.block_size, vh.block_size,
+            "{name}: alternate block size"
+        );
+        assert_eq!(
+            alt.total_blocks, vh.total_blocks,
+            "{name}: alternate total blocks"
+        );
+        assert_eq!(
+            alt.free_blocks, vh.free_blocks,
+            "{name}: alternate free blocks"
+        );
         assert_eq!(
             alt.next_catalog_id, vh.next_catalog_id,
             "{name}: alternate next CNID"
@@ -311,7 +378,10 @@ fn alternate_header_agrees_with_the_primary() {
 
         // Dates legitimately differ: the backup is a snapshot taken at a
         // different moment, and fsck updates one without the other.
-        assert_eq!(alt.create_date, vh.create_date, "{name}: create date is immutable");
+        assert_eq!(
+            alt.create_date, vh.create_date,
+            "{name}: create date is immutable"
+        );
     }
 }
 
@@ -353,7 +423,10 @@ fn all_images_pass_the_independent_apple_checker() {
     for name in common::generated_names() {
         let original = common::image(&name);
         let mut probe = std::env::temp_dir();
-        probe.push(format!("hfsplus-conformance-{name}-{}.img", std::process::id()));
+        probe.push(format!(
+            "hfsplus-conformance-{name}-{}.img",
+            std::process::id()
+        ));
         std::fs::copy(&original, &probe)
             .unwrap_or_else(|e| panic!("copy {} for fsck: {e}", original.display()));
 
@@ -401,7 +474,6 @@ fn the_checker_does_not_mutate_its_input() {
     // whole file, so the assertion is about geometry and not about timestamps.
     let _ = (before, after);
 }
-
 
 #[test]
 fn manifest_checker_verdicts_are_all_ok() {

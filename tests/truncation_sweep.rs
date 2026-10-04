@@ -146,7 +146,9 @@ fn no_image_truncates_into_a_panic() {
         let block = block_size_of(bytes).max(1);
 
         for cut in 0..bytes.len().min(DENSE) {
-            let device = Prefix { bytes: &bytes[..cut] };
+            let device = Prefix {
+                bytes: &bytes[..cut],
+            };
             // A volume header needs only its own 512 bytes, so a longer prefix
             // decoding is correct and anything shorter is a finding.
             if VolumeHeader::read_from(&device).is_ok() {
@@ -158,7 +160,9 @@ fn no_image_truncates_into_a_panic() {
             header_tried += 1;
         }
         for cut in (DENSE..bytes.len()).step_by(block) {
-            let device = Prefix { bytes: &bytes[..cut] };
+            let device = Prefix {
+                bytes: &bytes[..cut],
+            };
             let _ = VolumeHeader::read_from(&device);
             header_tried += 1;
         }
@@ -169,7 +173,9 @@ fn no_image_truncates_into_a_panic() {
         cuts.sort_unstable();
         cuts.dedup();
         for cut in cuts {
-            let device = Prefix { bytes: &bytes[..cut] };
+            let device = Prefix {
+                bytes: &bytes[..cut],
+            };
             let _ = Volume::open(&device);
             mount_tried += 1;
         }
@@ -194,7 +200,9 @@ fn a_one_byte_shorter_image_still_does_not_panic() {
         let mut len = bytes.len();
         let mut tried = 0usize;
         while len > 0 && tried < span {
-            let device = Prefix { bytes: &bytes[..len] };
+            let device = Prefix {
+                bytes: &bytes[..len],
+            };
             let _ = VolumeHeader::read_from(&device);
             let _ = Volume::open(&device);
             tried += 1;
@@ -229,7 +237,9 @@ fn structures_parsed_from_a_prefix_do_not_panic() {
             "{name}: an offset near u64::MAX must be refused, not wrapped"
         );
         assert!(
-            device.read_at(u64::MAX - 4096, &mut vec![0u8; 8192]).is_err(),
+            device
+                .read_at(u64::MAX - 4096, &mut vec![0u8; 8192])
+                .is_err(),
             "{name}: a read whose end would wrap must be refused"
         );
     }
@@ -258,7 +268,9 @@ fn a_journal_read_from_a_truncated_image_does_not_panic() {
 
     for (_name, bytes) in source_bytes() {
         let full = MemoryDevice::new(bytes.clone());
-        let Ok(vh) = VolumeHeader::read_from(&full) else { continue };
+        let Ok(vh) = VolumeHeader::read_from(&full) else {
+            continue;
+        };
         if !vh.is_journaled() {
             continue;
         }
@@ -267,9 +279,13 @@ fn a_journal_read_from_a_truncated_image_does_not_panic() {
         // where the journal header and the info block live.
         let bs = u64::from(vh.block_size) as usize;
         for cut in (0..bytes.len().min(bs * 200)).step_by(bs.max(1)) {
-            let device = Prefix { bytes: &bytes[..cut] };
+            let device = Prefix {
+                bytes: &bytes[..cut],
+            };
             let _ = Journal::open(&device, vh.journal_info_block, vh.block_size);
-            let device = Prefix { bytes: &bytes[..cut] };
+            let device = Prefix {
+                bytes: &bytes[..cut],
+            };
             let _ = Volume::open(&device);
         }
     }

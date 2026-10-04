@@ -51,7 +51,11 @@ fn every_corpus_image_mounts() {
         with_volume(name, |vol| {
             assert_eq!(
                 vol.kind(),
-                if is_hfsx { FileSystemKind::HfsX } else { FileSystemKind::HfsPlus },
+                if is_hfsx {
+                    FileSystemKind::HfsX
+                } else {
+                    FileSystemKind::HfsPlus
+                },
                 "{name}: filesystem kind"
             );
             assert!(vol.is_clean(), "{name}: generated volumes are clean");
@@ -102,7 +106,10 @@ fn the_root_folder_resolves_by_cnid_and_by_name() {
             assert_eq!(by_name.name_string(), volume_name, "{name}");
 
             // And a non-existent name is absent rather than an error.
-            assert!(vol.lookup(ROOT_PARENT_ID, &units("nope")).unwrap().is_none());
+            assert!(vol
+                .lookup(ROOT_PARENT_ID, &units("nope"))
+                .unwrap()
+                .is_none());
         });
     }
 }
@@ -147,13 +154,23 @@ fn the_allocation_bitmap_is_readable_and_self_consistent() {
             // rather than erroring, which is what allocation code needs.
             for block in [0u32, 1, total / 2, total - 1] {
                 let allocated = bm.is_allocated(block).expect("is_allocated");
-                assert_eq!(bm.is_free(block).unwrap(), !allocated, "{name}: block {block}");
+                assert_eq!(
+                    bm.is_free(block).unwrap(),
+                    !allocated,
+                    "{name}: block {block}"
+                );
             }
             assert!(!bm.is_allocated(total).unwrap(), "{name}: past the volume");
-            assert!(!bm.is_allocated(u32::MAX).unwrap(), "{name}: past the volume");
+            assert!(
+                !bm.is_allocated(u32::MAX).unwrap(),
+                "{name}: past the volume"
+            );
 
             // Block 0 holds the volume header and must be allocated.
-            assert!(bm.is_allocated(0).unwrap(), "{name}: block 0 is the volume header");
+            assert!(
+                bm.is_allocated(0).unwrap(),
+                "{name}: block 0 is the volume header"
+            );
 
             // The bitmap must agree with the volume header exactly, not merely
             // approximately. This is the strongest cross-check available without
@@ -206,7 +223,10 @@ fn journaled_volumes_report_their_journal() {
                     );
                 }
             } else {
-                assert!(entries.is_empty(), "{name}: unexpected root contents {names:?}");
+                assert!(
+                    entries.is_empty(),
+                    "{name}: unexpected root contents {names:?}"
+                );
             }
         });
     }
@@ -220,7 +240,10 @@ fn directory_listing_returns_objects_not_thread_records() {
             for e in &entries {
                 // A thread record has an empty key name; surfacing one would put a
                 // nameless entry in the listing.
-                assert!(!e.name().is_empty(), "{name}: listing produced an empty name");
+                assert!(
+                    !e.name().is_empty(),
+                    "{name}: listing produced an empty name"
+                );
                 assert!(!e.is_dir() || !e.name_string().is_empty(), "{name}");
             }
         });
@@ -251,7 +274,10 @@ fn object_metadata_is_complete_and_consistent() {
             // All five timestamps are present on every record.
             let t = dir.times;
             assert!(t.created.raw > 0, "{name}: the volume has a creation time");
-            assert!(t.modified.raw > 0, "{name}: the volume has a modification time");
+            assert!(
+                t.modified.raw > 0,
+                "{name}: the volume has a modification time"
+            );
 
             // A directory has no forks.
             assert_eq!(root.data_size(), 0, "{name}");
@@ -288,7 +314,10 @@ fn a_case_sensitive_volume_resolves_only_the_exact_spelling() {
         // The name reported is the one stored on disk, not the one that was asked
         // for. On a folding volume both spellings reach the same record, and
         // echoing the request would report a file that does not exist.
-        assert_eq!(exact.as_ref().map(|o| o.name_string()), Some("BasicVolume".into()));
+        assert_eq!(
+            exact.as_ref().map(|o| o.name_string()),
+            Some("BasicVolume".into())
+        );
         assert_eq!(
             folded.as_ref().map(|o| o.name_string()),
             Some("BasicVolume".into()),
@@ -297,9 +326,18 @@ fn a_case_sensitive_volume_resolves_only_the_exact_spelling() {
     });
 
     with_volume("hfsx-case-sensitive", |vol| {
-        assert!(vol.is_case_sensitive(), "HFSX with kHFSBinaryCompare is case sensitive");
-        assert!(vol.lookup(ROOT_PARENT_ID, &units("CaseSensitive")).unwrap().is_some());
-        assert!(vol.lookup(ROOT_PARENT_ID, &units("casesensitive")).unwrap().is_none());
+        assert!(
+            vol.is_case_sensitive(),
+            "HFSX with kHFSBinaryCompare is case sensitive"
+        );
+        assert!(vol
+            .lookup(ROOT_PARENT_ID, &units("CaseSensitive"))
+            .unwrap()
+            .is_some());
+        assert!(vol
+            .lookup(ROOT_PARENT_ID, &units("casesensitive"))
+            .unwrap()
+            .is_none());
     });
 }
 
@@ -309,7 +347,10 @@ fn absent_objects_are_absent_not_errors() {
         with_volume(name, |vol| {
             // Not-found is the normal result of a lookup, so it must not be an
             // error; only genuine structural problems are.
-            assert!(vol.lookup(ROOT_PARENT_ID, &units("nope")).unwrap().is_none());
+            assert!(vol
+                .lookup(ROOT_PARENT_ID, &units("nope"))
+                .unwrap()
+                .is_none());
             assert!(vol.lookup_cnid(999_999.into()).unwrap().is_none());
             assert!(vol.read_dir(999_999.into()).unwrap().is_empty());
         });

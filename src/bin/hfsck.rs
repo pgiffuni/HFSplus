@@ -52,7 +52,10 @@ fn usage() {
 }
 
 fn main() -> ExitCode {
-    let mut opts = Options { json: false, quiet: false };
+    let mut opts = Options {
+        json: false,
+        quiet: false,
+    };
     let mut paths: Vec<String> = Vec::new();
     let mut explicit_help = false;
 
@@ -175,7 +178,11 @@ fn report_unreadable(path: &str, message: &str, opts: &Options) -> u8 {
 }
 
 fn join_numbers(values: &[u32]) -> String {
-    values.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+    values
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 /// Quote a string as JSON, escaping what has to be escaped.

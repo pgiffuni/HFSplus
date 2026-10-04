@@ -128,9 +128,15 @@ impl<'a> KeyRef<'a> {
     /// `record` is the whole record, key plus data. The key ends at the
     /// declared length; anything after it belongs to the record payload.
     pub fn from_record(record: &'a [u8], big_keys: bool) -> Result<Self> {
-        let prefix = if big_keys { BIG_KEY_PREFIX } else { SMALL_KEY_PREFIX };
+        let prefix = if big_keys {
+            BIG_KEY_PREFIX
+        } else {
+            SMALL_KEY_PREFIX
+        };
         let body_len = Be::new(record).u16(0)? as usize;
-        let declared = body_len.checked_add(prefix).ok_or(Error::overflow("key length"))?;
+        let declared = body_len
+            .checked_add(prefix)
+            .ok_or(Error::overflow("key length"))?;
         let bytes = record.get(..declared).ok_or(Error::Truncated {
             what: "btree key",
             needed: declared,
@@ -141,7 +147,11 @@ impl<'a> KeyRef<'a> {
 
     /// The key body, excluding the length prefix.
     pub fn body(&self) -> &'a [u8] {
-        let prefix = if self.big_keys { BIG_KEY_PREFIX } else { SMALL_KEY_PREFIX };
+        let prefix = if self.big_keys {
+            BIG_KEY_PREFIX
+        } else {
+            SMALL_KEY_PREFIX
+        };
         &self.bytes[prefix..]
     }
 
@@ -228,7 +238,11 @@ impl<'a> CatalogKey<'a> {
             available: record.len(),
         })?;
 
-        Ok(CatalogKey { parent_id, name, case_sensitive })
+        Ok(CatalogKey {
+            parent_id,
+            name,
+            case_sensitive,
+        })
     }
 
     /// The name as UTF-16 code units.
@@ -296,12 +310,20 @@ impl ExtentKey {
 
     /// A key for a fork's data extents.
     pub fn for_data_fork(file_id: u32, start_block: u32) -> Self {
-        ExtentKey { fork_type: Self::DATA_FORK, file_id, start_block }
+        ExtentKey {
+            fork_type: Self::DATA_FORK,
+            file_id,
+            start_block,
+        }
     }
 
     /// A key for a fork's resource extents.
     pub fn for_resource_fork(file_id: u32, start_block: u32) -> Self {
-        ExtentKey { fork_type: Self::RESOURCE_FORK, file_id, start_block }
+        ExtentKey {
+            fork_type: Self::RESOURCE_FORK,
+            file_id,
+            start_block,
+        }
     }
 
     /// Encode this key into a node record.
@@ -545,7 +567,10 @@ mod tests {
     fn short_records_are_refused_not_panicked_on() {
         for len in [0usize, 1, 2, 5, 7, 8] {
             let rec = vec![0u8; len];
-            assert!(CatalogKey::from_record(&rec, false).is_err(), "catalog len {len}");
+            assert!(
+                CatalogKey::from_record(&rec, false).is_err(),
+                "catalog len {len}"
+            );
             assert!(ExtentKey::from_record(&rec).is_err(), "extent len {len}");
         }
     }

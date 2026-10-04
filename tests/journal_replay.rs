@@ -44,7 +44,11 @@ fn replayed() -> Vec<(&'static str, u64, &'static str)> {
     vec![
         ("journal-replay-be", 200, "journal replayed block 200"),
         ("journal-replay-le", 201, "journal replayed block 201"),
-        ("journal-replay-1k", 300, "journal replayed block 300 on a 1k volume"),
+        (
+            "journal-replay-1k",
+            300,
+            "journal replayed block 300 on a 1k volume",
+        ),
     ]
 }
 
@@ -52,7 +56,9 @@ fn replayed() -> Vec<(&'static str, u64, &'static str)> {
 const MULTI: &str = "journal-replay-multi";
 
 fn image_path(name: &str) -> std::path::PathBuf {
-    common::repo_root().join("tests/images/replayed").join(format!("{name}.img"))
+    common::repo_root()
+        .join("tests/images/replayed")
+        .join(format!("{name}.img"))
 }
 
 fn open(name: &str) -> Option<(FileDevice, VolumeHeader)> {
@@ -72,7 +78,9 @@ fn open(name: &str) -> Option<(FileDevice, VolumeHeader)> {
 /// Run `f` with the image's journal. The journal borrows the device, so the
 /// device is owned here and handed to the closure rather than returned.
 fn with_journal(name: &str, f: impl FnOnce(&Journal<'_, FileDevice>)) -> bool {
-    let Some((dev, vh)) = open(name) else { return false };
+    let Some((dev, vh)) = open(name) else {
+        return false;
+    };
     let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
         .unwrap_or_else(|e| panic!("{name}: journal open: {e}"))
         .unwrap_or_else(|| panic!("{name}: expected a journal"));
@@ -84,13 +92,22 @@ fn with_journal(name: &str, f: impl FnOnce(&Journal<'_, FileDevice>)) -> bool {
 fn a_journal_with_a_transaction_is_detected_and_replayed() {
     for (name, block, marker) in replayed() {
         let ran = with_journal(name, |journal| {
-            assert!(!journal.is_uninitialized(), "{name}: the journal has a transaction");
-            assert!(journal.header().is_some(), "{name}: a written journal has a header");
+            assert!(
+                !journal.is_uninitialized(),
+                "{name}: the journal has a transaction"
+            );
+            assert!(
+                journal.header().is_some(),
+                "{name}: a written journal has a header"
+            );
             assert_eq!(journal.transactions().len(), 1, "{name}: one transaction");
             assert_eq!(journal.replayed_blocks().len(), 1, "{name}: one block");
 
             let replayed = &journal.replayed_blocks()[0];
-            assert_eq!(replayed.device_block, block, "{name}: recorded block number");
+            assert_eq!(
+                replayed.device_block, block,
+                "{name}: recorded block number"
+            );
             assert!(
                 String::from_utf8_lossy(&replayed.data).starts_with(marker),
                 "{name}: replayed data must start with {marker:?}"
@@ -103,7 +120,9 @@ fn a_journal_with_a_transaction_is_detected_and_replayed() {
 #[test]
 fn the_overlay_wins_over_the_device_and_the_rest_is_untouched() {
     for (name, block, marker) in replayed() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
         let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
             .unwrap()
             .unwrap();
@@ -125,7 +144,10 @@ fn the_overlay_wins_over_the_device_and_the_rest_is_untouched() {
         // what makes the test meaningful rather than circular.
         let mut direct = vec![0u8; vh.block_size as usize];
         dev.read_at(block * bs, &mut direct).unwrap();
-        assert_ne!(&direct, &buf, "{name}: the overlay must actually override the device");
+        assert_ne!(
+            &direct, &buf,
+            "{name}: the overlay must actually override the device"
+        );
 
         // A block the journal does not touch still comes from the device.
         let untouched = block + 1;
@@ -133,7 +155,10 @@ fn the_overlay_wins_over_the_device_and_the_rest_is_untouched() {
         let mut b = vec![0u8; vh.block_size as usize];
         overlaid.read_at(untouched * bs, &mut a).unwrap();
         dev.read_at(untouched * bs, &mut b).unwrap();
-        assert_eq!(a, b, "{name}: block {untouched} must be unaffected by replay");
+        assert_eq!(
+            a, b,
+            "{name}: block {untouched} must be unaffected by replay"
+        );
     }
 }
 
@@ -142,7 +167,9 @@ fn a_read_spanning_the_overlay_boundary_is_continuous() {
     // A read that starts inside a replayed block and ends past it must be
     // stitched from both sources rather than truncated or misaligned.
     for (name, block, marker) in replayed() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
         let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
             .unwrap()
             .unwrap();
@@ -170,7 +197,9 @@ fn the_volume_still_mounts_through_the_overlaid_device() {
     // filesystem unreadable, because the overlay is consulted per byte offset and
     // everything the journal does not replace still comes from the device.
     for (name, _, _) in replayed() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
         let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
             .unwrap()
             .unwrap();
@@ -182,8 +211,7 @@ fn the_volume_still_mounts_through_the_overlaid_device() {
         assert_eq!(through_overlay.signature, vh.signature, "{name}");
         assert_eq!(through_overlay.total_blocks, vh.total_blocks, "{name}");
         assert_eq!(
-            through_overlay.catalog_file.logical_size,
-            vh.catalog_file.logical_size,
+            through_overlay.catalog_file.logical_size, vh.catalog_file.logical_size,
             "{name}"
         );
     }
@@ -438,7 +466,9 @@ fn a_damaged_journal_truncates_rather_than_being_abandoned() {
     let mut broken = std::fs::read(&path).unwrap();
 
     let vh_off = VOLUME_HEADER_OFFSET as usize;
-    let be32 = |buf: &[u8], at: usize| u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]]);
+    let be32 = |buf: &[u8], at: usize| {
+        u32::from_be_bytes([buf[at], buf[at + 1], buf[at + 2], buf[at + 3]])
+    };
     let bs = be32(&broken, vh_off + 40);
     let jib_block = be32(&broken, vh_off + 12);
     let jib_off = jib_block as usize * bs as usize;
@@ -473,7 +503,11 @@ fn a_damaged_journal_truncates_rather_than_being_abandoned() {
         1,
         "replay must stop at the damaged block list"
     );
-    assert_eq!(journal.replayed_blocks().len(), 1, "the first block survives");
+    assert_eq!(
+        journal.replayed_blocks().len(),
+        1,
+        "the first block survives"
+    );
     let (at, why) = journal
         .truncation()
         .expect("truncation must be reported, not silent");
@@ -501,7 +535,6 @@ fn a_damaged_journal_truncates_rather_than_being_abandoned() {
         &text[..26.min(text.len())]
     );
 }
-
 
 #[test]
 fn a_read_running_past_the_end_of_the_device_short_reads() {
@@ -550,7 +583,10 @@ fn a_read_running_past_the_end_of_the_device_short_reads() {
     // Everything up to the end of the device must be filled: one block from the
     // journal, the remainder from the device.
     let block = bs as usize;
-    assert!(block < want, "the request must reach past the overlay block");
+    assert!(
+        block < want,
+        "the request must reach past the overlay block"
+    );
     assert_eq!(buf[block..].iter().take(64).len(), 64);
 }
 
@@ -612,7 +648,11 @@ fn a_negative_block_number_is_refused() {
     // binfo[1] begins at offset 32, which is outside the 32 bytes the header
     // checksum covers, so the checksum itself is untouched by this edit. That is
     // deliberate: it isolates the block-number check from the header check.
-    assert_eq!(bnum_at - blhdr, 32, "binfo[1] must start just past the checksummed range");
+    assert_eq!(
+        bnum_at - blhdr,
+        32,
+        "binfo[1] must start just past the checksummed range"
+    );
 
     let mut probe = std::env::temp_dir();
     probe.push(format!("hfsplus-negbnum-{}.img", std::process::id()));
@@ -640,8 +680,6 @@ fn a_negative_block_number_is_refused() {
         }
     }
 }
-
-
 
 #[test]
 fn a_stale_header_checksum_is_reported_but_not_fatal() {
@@ -676,8 +714,7 @@ fn a_stale_header_checksum_is_reported_but_not_fatal() {
     // journal, so geometry validation passes and only the checksum notices --
     // which is precisely the case Apple decided not to treat as fatal.
     let current = be32(&stale, journal_offset + 40);
-    stale[journal_offset + 40..journal_offset + 44]
-        .copy_from_slice(&(current * 2).to_be_bytes());
+    stale[journal_offset + 40..journal_offset + 44].copy_from_slice(&(current * 2).to_be_bytes());
 
     let mut probe = std::env::temp_dir();
     probe.push(format!("hfsplus-stale-hdr-{}.img", std::process::id()));
@@ -776,10 +813,7 @@ fn a_journal_smaller_than_the_probe_is_still_read_without_overrunning_the_image(
 /// The journal borrows the device and the overlay borrows the journal, so
 /// neither can outlive this function -- which is why the caller gets a closure
 /// rather than a `Journal` back.
-fn with_fixture(
-    name: &str,
-    f: impl FnOnce(&Journal<'_, FileDevice>),
-) -> bool {
+fn with_fixture(name: &str, f: impl FnOnce(&Journal<'_, FileDevice>)) -> bool {
     let path = common::repo_root()
         .join("tests/images/replayed")
         .join(format!("{name}.img"));
@@ -808,21 +842,21 @@ fn a_transaction_sequence_number_that_jumps_truncates_the_replay() {
     // `txn_start_offset = jnl->jhdr->end = blhdr_offset` when it is neither that
     // value nor one more.
     let ran = with_fixture("journal-bad-sequence", |journal| {
-    // The first transaction survives; the jump is not.
-    assert_eq!(
-        journal.transactions().len(),
-        1,
-        "only the transaction before the jump may be replayed"
-    );
-    assert_eq!(journal.replayed_blocks().len(), 1);
-    let (offset, reason) = journal
-        .truncation()
-        .expect("a sequence jump must truncate, not be ignored");
-    assert_eq!(offset, 12288, "the truncation is at the second block list");
-    assert!(
-        reason.contains("sequence"),
-        "the reason must name the sequence rule, got {reason:?}"
-    );
+        // The first transaction survives; the jump is not.
+        assert_eq!(
+            journal.transactions().len(),
+            1,
+            "only the transaction before the jump may be replayed"
+        );
+        assert_eq!(journal.replayed_blocks().len(), 1);
+        let (offset, reason) = journal
+            .truncation()
+            .expect("a sequence jump must truncate, not be ignored");
+        assert_eq!(offset, 12288, "the truncation is at the second block list");
+        assert!(
+            reason.contains("sequence"),
+            "the reason must name the sequence rule, got {reason:?}"
+        );
     });
     assert!(ran, "journal-bad-sequence: the image must be built");
 }
@@ -833,8 +867,7 @@ fn consecutive_sequence_numbers_are_accepted_in_full() {
     // when either side is zero. So +1 replays in full -- and a test that only
     // covered the jump would pass against an implementation that truncated on
     // every list.
-    let path = common::repo_root()
-        .join("tests/images/replayed/journal-replay-multi.img");
+    let path = common::repo_root().join("tests/images/replayed/journal-replay-multi.img");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
@@ -845,7 +878,11 @@ fn consecutive_sequence_numbers_are_accepted_in_full() {
         .expect("journal open")
         .expect("a journal");
 
-    let numbers: Vec<u32> = journal.transactions().iter().map(|t| t.sequence_num).collect();
+    let numbers: Vec<u32> = journal
+        .transactions()
+        .iter()
+        .map(|t| t.sequence_num)
+        .collect();
     assert_eq!(numbers, vec![1, 2, 3], "the generator writes +1 each time");
     assert!(
         journal.truncation().is_none(),
@@ -881,8 +918,7 @@ fn a_block_list_claiming_more_blocks_than_the_journal_holds_is_refused() {
     // The bound is found in the walk, before any transaction start is recorded,
     // so it is a refusal rather than a truncation -- see the next test for the
     // distinction and why it lands where it does.
-    let path = common::repo_root()
-        .join("tests/images/replayed/journal-bad-max-blocks.img");
+    let path = common::repo_root().join("tests/images/replayed/journal-bad-max-blocks.img");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
@@ -904,7 +940,9 @@ fn every_replay_fixture_opens_without_panicking_and_without_writing() {
     // it must produce a result rather than a panic -- and reading must leave the
     // image alone, which is the guarantee the whole milestone rests on.
     let dir = common::repo_root().join("tests/images/replayed");
-    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
     let mut checked = 0;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -920,9 +958,7 @@ fn every_replay_fixture_opens_without_panicking_and_without_writing() {
         {
             let dev = FileDevice::open(&path).expect("open");
             let vh = VolumeHeader::read_from(&dev).expect("header");
-            if let Ok(Some(journal)) =
-                Journal::open(&dev, vh.journal_info_block, vh.block_size)
-            {
+            if let Ok(Some(journal)) = Journal::open(&dev, vh.journal_info_block, vh.block_size) {
                 let _ = journal.transactions();
                 let _ = journal.replayed_blocks();
                 let _ = journal.truncation();
@@ -1025,7 +1061,11 @@ fn transactions_past_a_stale_journal_header_end_are_still_recovered() {
             3,
             "every journalled transaction must be recovered"
         );
-        assert_eq!(journal.replayed_blocks().len(), 2, "over two distinct blocks");
+        assert_eq!(
+            journal.replayed_blocks().len(),
+            2,
+            "over two distinct blocks"
+        );
         assert!(
             journal.truncation().is_none(),
             "the journal is sound; walking past a stale end is not damage, got {:?}",
@@ -1036,8 +1076,7 @@ fn transactions_past_a_stale_journal_header_end_are_still_recovered() {
 
     // And the same image with its header intact must give the identical answer,
     // which is what makes the walk past `end` a recovery rather than a guess.
-    let path = common::repo_root()
-        .join("tests/images/replayed/journal-replay-multi.img");
+    let path = common::repo_root().join("tests/images/replayed/journal-replay-multi.img");
     if !path.exists() {
         eprintln!("skipping the comparison: {} not built", path.display());
         return;
@@ -1100,8 +1139,7 @@ fn damage_before_any_good_transaction_refuses_the_volume() {
     // Mining reference: `core/hfs_journal.c` `replay_journal` prints "no known
     // good txn start offset! aborting journal replay"; `core/hfs_vfsops.c` turns
     // a NULL journal into EINVAL.
-    let path = common::repo_root()
-        .join("tests/images/replayed/journal-bad-max-blocks.img");
+    let path = common::repo_root().join("tests/images/replayed/journal-bad-max-blocks.img");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
@@ -1150,7 +1188,6 @@ fn damage_after_a_good_transaction_truncates_rather_than_aborting() {
     assert!(ran, "journal-bad-bsize: the image must be built");
 }
 
-
 #[test]
 fn a_read_from_the_journal_wraps_at_its_end() {
     // The journal is a **ring**: the writer reaches the end and starts again just
@@ -1177,7 +1214,9 @@ fn a_read_from_the_journal_wraps_at_its_end() {
     assert!(jhdr < size, "the ring needs room to wrap into");
 
     // A read wholly inside the ring.
-    let inside = journal.read_bytes(2048, 2048).expect("a read inside the ring");
+    let inside = journal
+        .read_bytes(2048, 2048)
+        .expect("a read inside the ring");
     assert_eq!(inside.len(), 2048);
 
     // A read that starts near the end and runs over it. The first half comes

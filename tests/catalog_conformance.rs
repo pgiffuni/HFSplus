@@ -36,8 +36,8 @@ mod common;
 
 use hfsplus::blockdev::FileDevice;
 use hfsplus::catalog::cnid::{ROOT_FOLDER_ID, ROOT_PARENT_ID};
-use hfsplus::catalog::record::{CatalogRecord, FILE_RECORD_SIZE, FOLDER_RECORD_SIZE};
 use hfsplus::catalog::key::{K_HFS_BINARY_COMPARE, K_HFS_CASE_FOLDING};
+use hfsplus::catalog::record::{CatalogRecord, FILE_RECORD_SIZE, FOLDER_RECORD_SIZE};
 use hfsplus::catalog::{Catalog, CatalogKey, Cnid};
 use hfsplus::format::volume_header::VolumeHeader;
 use hfsplus::unicode::{Comparator, Ordering};
@@ -134,7 +134,6 @@ fn case_sensitivity_needs_the_signature_and_the_byte_to_agree() {
         "expected at least one case-folding catalog, got {observed:?}"
     );
 
-
     // The four combinations. Only HFSX *with* the binary byte is sensitive.
     for is_hfsx in [false, true] {
         for byte in [K_HFS_CASE_FOLDING, K_HFS_BINARY_COMPARE] {
@@ -177,7 +176,10 @@ fn the_volume_name_is_the_root_folder_catalog_record() {
                 CatalogRecord::Folder(f) => *f,
                 other => panic!("{name}: expected a folder record, got {other:?}"),
             };
-            assert_eq!(folder.folder_id, ROOT_FOLDER_ID, "{name}: must be the root folder");
+            assert_eq!(
+                folder.folder_id, ROOT_FOLDER_ID,
+                "{name}: must be the root folder"
+            );
             // hfsprogs leaves `fileMode` zero on the root folder record rather
             // than writing a directory mode with 0755. Verified byte-wise: the
             // bsdInfo at body offset 32 is all zeros on every corpus image. The
@@ -218,7 +220,9 @@ fn the_volume_name_is_the_root_folder_catalog_record() {
 
             // And the CNID is recoverable from the name alone.
             assert_eq!(
-                catalog.lookup_thread(&units(volume_name)).expect("thread by name"),
+                catalog
+                    .lookup_thread(&units(volume_name))
+                    .expect("thread by name"),
                 Some(ROOT_FOLDER_ID),
                 "{name}"
             );
@@ -263,7 +267,10 @@ fn a_fresh_volume_contains_no_user_files() {
             // Every child must be findable by CNID as well as by listing.
             for child in &children {
                 assert!(
-                    catalog.lookup_child(ROOT_FOLDER_ID, child.cnid).unwrap().is_some(),
+                    catalog
+                        .lookup_child(ROOT_FOLDER_ID, child.cnid)
+                        .unwrap()
+                        .is_some(),
                     "{name}: listed child {} must also be findable by CNID",
                     child.cnid
                 );
@@ -284,12 +291,21 @@ fn lookups_report_absence_cleanly() {
         with_catalog(name, |_vh, catalog| {
             // An unknown CNID must be None, not the first child visited.
             assert!(
-                catalog.lookup_child(ROOT_FOLDER_ID, Cnid(999_999)).unwrap().is_none(),
+                catalog
+                    .lookup_child(ROOT_FOLDER_ID, Cnid(999_999))
+                    .unwrap()
+                    .is_none(),
                 "{name}: an unknown CNID must be None"
             );
-            assert!(catalog.lookup(ROOT_FOLDER_ID, &units("nope")).unwrap().is_none());
+            assert!(catalog
+                .lookup(ROOT_FOLDER_ID, &units("nope"))
+                .unwrap()
+                .is_none());
             assert!(catalog.lookup_thread(&units("nope")).unwrap().is_none());
-            assert!(catalog.read_dir(Cnid(4_294_967_000)).unwrap().is_empty(), "{name}");
+            assert!(
+                catalog.read_dir(Cnid(4_294_967_000)).unwrap().is_empty(),
+                "{name}"
+            );
         });
     }
 }
@@ -301,13 +317,19 @@ fn case_sensitivity_manifests_in_lookup_behaviour() {
     // getting it backwards would make half of every HFS+ volume unreachable.
     with_catalog("basic-hfsplus", |_vh, catalog| {
         assert_eq!(
-            catalog.comparator().compare(&units("BasicVolume"), &units("basicvolume")),
+            catalog
+                .comparator()
+                .compare(&units("BasicVolume"), &units("basicvolume")),
             Ordering::Equal,
             "a folding volume treats these as the same name"
         );
 
-        let exact = catalog.lookup(ROOT_PARENT_ID, &units("BasicVolume")).unwrap();
-        let folded = catalog.lookup(ROOT_PARENT_ID, &units("basicvolume")).unwrap();
+        let exact = catalog
+            .lookup(ROOT_PARENT_ID, &units("BasicVolume"))
+            .unwrap();
+        let folded = catalog
+            .lookup(ROOT_PARENT_ID, &units("basicvolume"))
+            .unwrap();
         assert!(exact.is_some(), "the stored spelling must resolve");
         assert_eq!(
             exact.map(|r| r.cnid()),
@@ -331,11 +353,17 @@ fn case_sensitivity_manifests_in_lookup_behaviour() {
             "an HFSX volume with kHFSBinaryCompare must not fold case"
         );
         assert!(
-            catalog.lookup(ROOT_PARENT_ID, &units("CaseSensitive")).unwrap().is_some(),
+            catalog
+                .lookup(ROOT_PARENT_ID, &units("CaseSensitive"))
+                .unwrap()
+                .is_some(),
             "the stored spelling must resolve on a case-sensitive volume"
         );
         assert!(
-            catalog.lookup(ROOT_PARENT_ID, &units("casesensitive")).unwrap().is_none(),
+            catalog
+                .lookup(ROOT_PARENT_ID, &units("casesensitive"))
+                .unwrap()
+                .is_none(),
             "the other spelling must not resolve on a case-sensitive volume"
         );
     });
@@ -348,11 +376,18 @@ fn the_whole_volume_enumerates_to_one_entry_per_object() {
     for (name, volume_name, _) in corpus() {
         with_catalog(name, |_vh, catalog| {
             let all = catalog.all_objects().expect("object scan");
-            assert!(!all.is_empty(), "{name}: the scan must find the root at least");
+            assert!(
+                !all.is_empty(),
+                "{name}: the scan must find the root at least"
+            );
 
             let mut seen = std::collections::BTreeSet::new();
             for entry in &all {
-                assert!(seen.insert(entry.cnid), "{name}: CNID {} appeared twice", entry.cnid);
+                assert!(
+                    seen.insert(entry.cnid),
+                    "{name}: CNID {} appeared twice",
+                    entry.cnid
+                );
             }
 
             let root = all
@@ -394,7 +429,10 @@ fn main_records_carry_the_cnid_and_thread_records_do_not() {
                 "{name}: a folder record carries its CNID in the body"
             );
 
-            let thread = catalog.lookup(ROOT_FOLDER_ID, &[]).unwrap().expect("thread record");
+            let thread = catalog
+                .lookup(ROOT_FOLDER_ID, &[])
+                .unwrap()
+                .expect("thread record");
             assert!(thread.is_thread(), "{name}: expected a thread record");
             assert_eq!(
                 thread.cnid(),
@@ -434,7 +472,11 @@ fn catalog_keys_round_trip_through_the_on_disk_encoding() {
         let encoded = key.to_record();
         let decoded = CatalogKey::from_record(&encoded, 516).expect("decode");
         assert_eq!(decoded, key, "name {name:?}");
-        assert_eq!(encoded.len() % 2, 0, "name {name:?}: encoded length must be even");
+        assert_eq!(
+            encoded.len() % 2,
+            0,
+            "name {name:?}: encoded length must be even"
+        );
     }
 }
 

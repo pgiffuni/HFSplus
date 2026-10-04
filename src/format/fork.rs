@@ -200,7 +200,6 @@ impl ForkData {
         u64::from(self.total_blocks).saturating_sub(self.inline_blocks())
     }
 
-
     /// Check this fork against the blocks its extents actually describe.
     ///
     /// `described_blocks` is the total from the inline extents *plus* any overflow
@@ -301,7 +300,10 @@ mod tests {
         fork.logical_size = 0x1234_5678_9abc;
         fork.clump_size = 65_536;
         fork.total_blocks = 4;
-        fork.extents.raw[0] = ExtentDescriptor { start_block: 10, block_count: 4 };
+        fork.extents.raw[0] = ExtentDescriptor {
+            start_block: 10,
+            block_count: 4,
+        };
         let bytes = fork.to_bytes();
         assert_eq!(ForkData::from_bytes(&bytes).unwrap(), fork);
     }
@@ -316,7 +318,10 @@ mod tests {
     fn inline_total_comparison_detects_overflow() {
         let mut fork = ForkData::default();
         fork.logical_size = 0;
-        fork.extents.raw[0] = ExtentDescriptor { start_block: 0, block_count: 2 };
+        fork.extents.raw[0] = ExtentDescriptor {
+            start_block: 0,
+            block_count: 2,
+        };
         // Inline describes 2 blocks but the fork claims 6: three overflow records.
         fork.total_blocks = 6;
         assert!(!fork.inline_matches_total());
@@ -331,7 +336,10 @@ mod tests {
         // allocated blocks only.
         let mut fork = ForkData::default();
         fork.logical_size = 10 * 4096;
-        fork.extents.raw[0] = ExtentDescriptor { start_block: 100, block_count: 1 };
+        fork.extents.raw[0] = ExtentDescriptor {
+            start_block: 100,
+            block_count: 1,
+        };
         fork.total_blocks = 1;
         assert!(!fork.needs_overflow());
         assert_eq!(fork.overflow_block_count(), 0);
@@ -344,8 +352,10 @@ mod tests {
         let mut fork = ForkData::default();
         fork.logical_size = 0;
         for i in 0..INLINE_EXTENT_COUNT {
-            fork.extents.raw[i] =
-                ExtentDescriptor { start_block: i as u32 * 2, block_count: 2 };
+            fork.extents.raw[i] = ExtentDescriptor {
+                start_block: i as u32 * 2,
+                block_count: 2,
+            };
         }
         // 8 inline extents * 2 blocks = 16 allocated; the fork claims 24.
         fork.total_blocks = 24;
@@ -357,14 +367,15 @@ mod tests {
     fn eight_exact_extents_do_not_need_overflow() {
         let mut fork = ForkData::default();
         for i in 0..INLINE_EXTENT_COUNT {
-            fork.extents.raw[i] =
-                ExtentDescriptor { start_block: i as u32 * 2, block_count: 2 };
+            fork.extents.raw[i] = ExtentDescriptor {
+                start_block: i as u32 * 2,
+                block_count: 2,
+            };
         }
         fork.total_blocks = 16;
         assert!(!fork.needs_overflow());
         assert!(fork.inline_matches_total());
     }
-
 
     #[test]
     fn fork_type_classification() {

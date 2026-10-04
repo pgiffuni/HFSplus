@@ -234,11 +234,7 @@ impl BlockListHeader {
     pub fn checksum_matches(&self, raw: &[u8]) -> bool {
         // Same zeroing convention as the journal header: the checksum field lies
         // inside the 32-byte range, so it is zeroed before hashing.
-        match crate::journal::checksum::checksum_with_zeroed_field(
-            raw,
-            8,
-            BLHDR_CHECKSUM_SIZE,
-        ) {
+        match crate::journal::checksum::checksum_with_zeroed_field(raw, 8, BLHDR_CHECKSUM_SIZE) {
             Some(c) => c == self.checksum,
             None => false,
         }
@@ -560,10 +556,7 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                 && blhdr.sequence_num != last_sequence_num
                 && blhdr.sequence_num != last_sequence_num.wrapping_add(1)
             {
-                self.truncate_at(
-                    offset,
-                    "block list sequence number is out of order",
-                )?;
+                self.truncate_at(offset, "block list sequence number is out of order")?;
                 break;
             }
             last_sequence_num = blhdr.sequence_num;
@@ -578,7 +571,10 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
             let jhdr_size = u64::from(header.jhdr_size);
             let capacity = header.size / jhdr_size;
             if u64::from(blhdr.max_blocks) > capacity {
-                self.truncate_at(offset, "block list claims more blocks than the journal holds")?;
+                self.truncate_at(
+                    offset,
+                    "block list claims more blocks than the journal holds",
+                )?;
                 break;
             }
 
@@ -880,21 +876,17 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
                     .data_offset
                     .checked_add(data_cursor)
                     .ok_or_else(|| ApplyFailure::Fatal(Error::overflow("replayed block data")))?;
-                let data = self.read_journal(start, size).map_err(ApplyFailure::Fatal)?;
+                let data = self
+                    .read_journal(start, size)
+                    .map_err(ApplyFailure::Fatal)?;
                 data_cursor += size as u64;
 
                 // A zero recorded checksum means "do not verify", which Apple
                 // checks for explicitly before comparing.
-                if list.checks_blocks()
-                    && block.cksum != 0
-                    && calc_checksum(&data) != block.cksum
-                {
+                if list.checks_blocks() && block.cksum != 0 && calc_checksum(&data) != block.cksum {
                     return Err(ApplyFailure::Truncate {
                         at: transaction.offset,
-                        reason: format!(
-                            "block {} failed its recorded checksum",
-                            block.bnum
-                        ),
+                        reason: format!("block {} failed its recorded checksum", block.bnum),
                     });
                 }
 
@@ -934,8 +926,6 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
         }
         Ok(())
     }
-
-
 
     /// The volume's `JournalInfoBlock`.
     pub fn info(&self) -> &JournalInfoBlock {
@@ -1038,7 +1028,10 @@ impl<'a, D: BlockDevice + ?Sized> Journal<'a, D> {
     /// The returned value borrows both, so neither can be dropped while the
     /// replayed view is in use.
     pub fn into_device(&'a self) -> OverlaidDevice<'a, 'a, D> {
-        OverlaidDevice { inner: self.device, overlay: &self.overlay }
+        OverlaidDevice {
+            inner: self.device,
+            overlay: &self.overlay,
+        }
     }
 }
 
@@ -1109,7 +1102,8 @@ impl<D: BlockDevice + ?Sized> BlockDevice for OverlaidDevice<'_, '_, D> {
         while written < buf.len() {
             let at = offset + written as u64;
             match self.overlay.iter().find_map(|b| {
-                b.slice_from(at, buf.len() - written).map(|slice| (b, slice))
+                b.slice_from(at, buf.len() - written)
+                    .map(|slice| (b, slice))
             }) {
                 Some((_, slice)) => {
                     buf[written..written + slice.len()].copy_from_slice(slice);
@@ -1174,8 +1168,9 @@ mod tests {
             raw[off + 8..off + 12].copy_from_slice(&bsize.to_be_bytes());
             raw[off + 12..off + 16].copy_from_slice(&cksum.to_be_bytes());
         }
-        let cksum = super::super::checksum::checksum_with_zeroed_field(&raw, 8, BLHDR_CHECKSUM_SIZE)
-            .expect("long enough");
+        let cksum =
+            super::super::checksum::checksum_with_zeroed_field(&raw, 8, BLHDR_CHECKSUM_SIZE)
+                .expect("long enough");
         raw[8..12].copy_from_slice(&cksum.to_be_bytes());
         raw
     }
@@ -1225,7 +1220,10 @@ mod tests {
             assert!(
                 matches!(
                     BlockListHeader::parse(&raw),
-                    Err(Error::InvalidField { field: "block_list_header.num_blocks", .. })
+                    Err(Error::InvalidField {
+                        field: "block_list_header.num_blocks",
+                        ..
+                    })
                 ),
                 "num_blocks {n} should be rejected"
             );
@@ -1234,9 +1232,17 @@ mod tests {
 
     #[test]
     fn a_killed_block_is_recognised() {
-        let killed = RecordedBlock { bnum: END_BLK_NUM, bsize: 4096, cksum: 0 };
+        let killed = RecordedBlock {
+            bnum: END_BLK_NUM,
+            bsize: 4096,
+            cksum: 0,
+        };
         assert!(killed.is_killed());
-        let normal = RecordedBlock { bnum: 200, bsize: 4096, cksum: 0 };
+        let normal = RecordedBlock {
+            bnum: 200,
+            bsize: 4096,
+            cksum: 0,
+        };
         assert!(!normal.is_killed());
     }
 
@@ -1271,6 +1277,9 @@ mod tests {
         assert!(h.checksum_matches(&raw));
         let mut corrupt = raw.clone();
         corrupt[BLHDR_PREFIX_SIZE] ^= 0xFF;
-        assert!(!h.checksum_matches(&corrupt), "a corrupted field must fail the checksum");
+        assert!(
+            !h.checksum_matches(&corrupt),
+            "a corrupted field must fail the checksum"
+        );
     }
 }

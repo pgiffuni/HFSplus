@@ -41,7 +41,9 @@ const TORN_NAME: &str = "torn.txt";
 const TORN_CNID: u32 = 18;
 
 fn image_path(name: &str) -> std::path::PathBuf {
-    common::repo_root().join("tests/images/replayed").join(format!("{name}.img"))
+    common::repo_root()
+        .join("tests/images/replayed")
+        .join(format!("{name}.img"))
 }
 
 /// Names in the root folder, sorted, so an assertion does not depend on the
@@ -84,7 +86,10 @@ fn with_replay<D: hfsplus::blockdev::BlockDevice + ?Sized>(
 fn torn_device() -> Option<FileDevice> {
     let path = image_path(TORN);
     if !path.exists() {
-        eprintln!("skipping: {} not built; run tools/mktorn.py", path.display());
+        eprintln!(
+            "skipping: {} not built; run tools/mktorn.py",
+            path.display()
+        );
         return None;
     }
     Some(FileDevice::open(&path).expect("open image"))
@@ -111,7 +116,8 @@ fn without_replay_the_filesystem_is_sound_but_stale() {
     // The rest of the volume is perfectly readable, which is the point: a stale
     // filesystem is not a broken one.
     assert!(
-        names.contains(&".journal".to_string()) && names.contains(&".journal_info_block".to_string()),
+        names.contains(&".journal".to_string())
+            && names.contains(&".journal_info_block".to_string()),
         "the existing entries must still be listed, got {names:?}"
     );
     let units: Vec<u16> = TORN_NAME.encode_utf16().collect();
@@ -149,9 +155,17 @@ fn the_recovered_file_is_reachable_by_name_and_by_cnid() {
             .unwrap_or_else(|| panic!("{TORN_NAME} must be found by name after replay"));
 
         assert_eq!(object.name_string(), TORN_NAME);
-        assert_eq!(object.cnid().0, TORN_CNID, "the journalled CNID must be preserved");
+        assert_eq!(
+            object.cnid().0,
+            TORN_CNID,
+            "the journalled CNID must be preserved"
+        );
         assert!(!object.is_dir(), "{TORN_NAME} was journalled as a file");
-        assert_eq!(object.data_size(), 0, "the journalled file record has an empty data fork");
+        assert_eq!(
+            object.data_size(),
+            0,
+            "the journalled file record has an empty data fork"
+        );
 
         // Resolving by CNID goes through the thread record, which the journal
         // also rewrote. A missing or mis-keyed thread record would leave the file
@@ -208,7 +222,10 @@ fn a_recovered_volume_lists_every_object_exactly_once() {
         let mut unique = cnids.clone();
         unique.sort_unstable();
         unique.dedup();
-        assert_eq!(cnids, unique, "every object must appear exactly once, got {all:?}");
+        assert_eq!(
+            cnids, unique,
+            "every object must appear exactly once, got {all:?}"
+        );
 
         assert!(
             all.iter().any(|(c, n)| *c == TORN_CNID && n == TORN_NAME),

@@ -28,7 +28,7 @@ pub mod lookup;
 pub mod record;
 
 pub use cnid::{
-    BAD_DIR_FILE_ID, CATALOG_FILE_ID, Cnid, EXTENTS_FILE_ID, FIRST_USER_CATALOG_NODE_ID,
+    Cnid, BAD_DIR_FILE_ID, CATALOG_FILE_ID, EXTENTS_FILE_ID, FIRST_USER_CATALOG_NODE_ID,
     ROOT_FOLDER_ID, ROOT_PARENT_ID,
 };
 pub use key::{CatalogKey, NameComparison};

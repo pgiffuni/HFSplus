@@ -566,14 +566,20 @@ impl FileRecord {
     /// The `fdType` four-character code, as stored big-endian.
     pub fn fd_type(&self) -> u32 {
         u32::from_be_bytes([
-            self.user_info[0], self.user_info[1], self.user_info[2], self.user_info[3],
+            self.user_info[0],
+            self.user_info[1],
+            self.user_info[2],
+            self.user_info[3],
         ])
     }
 
     /// The `fdCreator` four-character code, as stored big-endian.
     pub fn fd_creator(&self) -> u32 {
         u32::from_be_bytes([
-            self.user_info[4], self.user_info[5], self.user_info[6], self.user_info[7],
+            self.user_info[4],
+            self.user_info[5],
+            self.user_info[6],
+            self.user_info[7],
         ])
     }
 
@@ -688,7 +694,12 @@ impl ThreadRecord {
             node_name.push(be.u16(THREAD_RECORD_NAME_OFFSET + i * 2)?);
         }
 
-        Ok(ThreadRecord { record_type, reserved, parent_id, node_name })
+        Ok(ThreadRecord {
+            record_type,
+            reserved,
+            parent_id,
+            node_name,
+        })
     }
 
     /// The object's name as a `String`, for diagnostics only.
@@ -720,12 +731,8 @@ pub fn parse_record(body: &[u8]) -> Result<CatalogRecord> {
     }
     let record_type = Be::new(body).i16(0)?;
     match record_type {
-        K_HFS_PLUS_FOLDER_RECORD => {
-            Ok(CatalogRecord::Folder(FolderRecord::parse(body)?))
-        }
-        K_HFS_PLUS_FILE_RECORD => {
-            Ok(CatalogRecord::File(Box::new(FileRecord::parse(body)?)))
-        }
+        K_HFS_PLUS_FOLDER_RECORD => Ok(CatalogRecord::Folder(FolderRecord::parse(body)?)),
+        K_HFS_PLUS_FILE_RECORD => Ok(CatalogRecord::File(Box::new(FileRecord::parse(body)?))),
         K_HFS_PLUS_FOLDER_THREAD_RECORD | K_HFS_PLUS_FILE_THREAD_RECORD => {
             Ok(CatalogRecord::Thread(ThreadRecord::parse(body)?))
         }
@@ -764,7 +771,7 @@ mod tests {
         b[96..100].copy_from_slice(&4096u32.to_be_bytes()); // clumpSize
         b[100..104].copy_from_slice(&1u32.to_be_bytes()); // totalBlocks
         b[104..108].copy_from_slice(&100u32.to_be_bytes()); // extents[0].startBlock
-        b[108..112].copy_from_slice(&1u32.to_be_bytes());   // extents[0].blockCount
+        b[108..112].copy_from_slice(&1u32.to_be_bytes()); // extents[0].blockCount
         b
     }
 
@@ -822,7 +829,10 @@ mod tests {
         assert_eq!(f.data_fork.total_blocks, 1);
         assert_eq!(
             f.data_fork.extents.raw[0],
-            ExtentDescriptor { start_block: 100, block_count: 1 }
+            ExtentDescriptor {
+                start_block: 100,
+                block_count: 1
+            }
         );
         assert_eq!(f.resource_fork.logical_size, 0);
         assert!(f.bsd_info.is_regular());
@@ -879,20 +889,29 @@ mod tests {
         b[0..2].copy_from_slice(&99i16.to_be_bytes());
         assert!(matches!(
             parse_record(&b),
-            Err(Error::InvalidField { field: "catalog record type", .. })
+            Err(Error::InvalidField {
+                field: "catalog record type",
+                ..
+            })
         ));
     }
 
     #[test]
     fn short_records_are_truncated_not_panicked_on() {
         for len in [0usize, 1, 2, 4, 87] {
-            assert!(FolderRecord::parse(&vec![0u8; len]).is_err(), "folder {len}");
+            assert!(
+                FolderRecord::parse(&vec![0u8; len]).is_err(),
+                "folder {len}"
+            );
         }
         for len in [0usize, 1, 2, 7, 87, 247] {
             assert!(FileRecord::parse(&vec![0u8; len]).is_err(), "file {len}");
         }
         for len in [0usize, 1, 8, 9] {
-            assert!(ThreadRecord::parse(&vec![0u8; len]).is_err(), "thread {len}");
+            assert!(
+                ThreadRecord::parse(&vec![0u8; len]).is_err(),
+                "thread {len}"
+            );
         }
         assert!(ThreadRecord::parse(&[0u8; THREAD_RECORD_NAME_OFFSET]).is_ok());
     }
@@ -903,7 +922,10 @@ mod tests {
         // Claim more units than the record holds.
         b[THREAD_RECORD_NAME_LEN_OFFSET..THREAD_RECORD_NAME_OFFSET]
             .copy_from_slice(&100u16.to_be_bytes());
-        assert!(matches!(ThreadRecord::parse(&b), Err(Error::Truncated { .. })));
+        assert!(matches!(
+            ThreadRecord::parse(&b),
+            Err(Error::Truncated { .. })
+        ));
     }
 
     #[test]

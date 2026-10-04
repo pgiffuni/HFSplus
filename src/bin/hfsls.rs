@@ -174,7 +174,10 @@ fn walk(
         if !all && name.starts_with('.') {
             continue;
         }
-        out.push_str(&format!("{inner}{name}{}\n", if entry.is_dir() { "/" } else { "" }));
+        out.push_str(&format!(
+            "{inner}{name}{}\n",
+            if entry.is_dir() { "/" } else { "" }
+        ));
         if long {
             out.push_str(&format!("{inner}  {}", long_line(&entry)));
         }
@@ -195,28 +198,33 @@ fn resolve(vol: &Volume<'_, FileDevice>, path: &str) -> Result<Object> {
     let mut current = vol.lookup_cnid(vol.root_cnid())?;
     for part in path.split('/').filter(|s| !s.is_empty() && *s != ".") {
         let Some(object) = current else {
-            return Err(Error::NotFoundKey { key: part.to_string() });
+            return Err(Error::NotFoundKey {
+                key: part.to_string(),
+            });
         };
         if !object.is_dir() {
-            return Err(Error::NotFoundKey { key: part.to_string() });
+            return Err(Error::NotFoundKey {
+                key: part.to_string(),
+            });
         }
         let units: Vec<u16> = part.encode_utf16().collect();
         current = vol.lookup(object.cnid(), &units)?;
         if current.is_none() {
-            return Err(Error::NotFoundKey { key: part.to_string() });
+            return Err(Error::NotFoundKey {
+                key: part.to_string(),
+            });
         }
     }
-    current.ok_or(Error::NotFound { what: "root folder" })
+    current.ok_or(Error::NotFound {
+        what: "root folder",
+    })
 }
 
 fn long_line(object: &Object) -> String {
     let mode = object.bsd_info().permissions() & 0o7777;
     let kind = if object.is_dir() { 'd' } else { '-' };
     let t = object.times();
-    let modified = t
-        .modified
-        .to_rfc3339()
-        .unwrap_or_else(|| "-".to_string());
+    let modified = t.modified.to_rfc3339().unwrap_or_else(|| "-".to_string());
     format!(
         "{kind}0{mode:o} {:>3} {:>3} {modified} {:>10} CNID {} {}\n",
         object.bsd_info().owner_id,
@@ -246,7 +254,10 @@ fn render_stat(vol: &Volume<'_, FileDevice>) -> Result<String> {
         st.free_bytes,
         st.free_bytes as f64 / (1024.0 * 1024.0)
     ));
-    s.push_str(&format!("files/folders:   {} / {}\n", st.file_count, st.folder_count));
+    s.push_str(&format!(
+        "files/folders:   {} / {}\n",
+        st.file_count, st.folder_count
+    ));
     s.push_str(&format!("journaled:       {}\n", st.journaled));
     s.push_str(&format!("case sensitive:  {}\n", vol.is_case_sensitive()));
     s.push_str(&format!("clean:           {}\n", vol.is_clean()));
@@ -267,10 +278,7 @@ fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
         // that cannot tell them apart is not much use.
         if let Some(info) = vol.external_journal()? {
             s.push_str("journal:         on another device\n");
-            s.push_str(&format!(
-                "journal size:    {}\n",
-                info.size
-            ));
+            s.push_str(&format!("journal size:    {}\n", info.size));
             s.push_str(&format!("journal flags:   0x{:08x}\n", info.flags));
             s.push_str("  this image has no journal to replay; the journal is named\n");
             s.push_str("  by ext_jnl_uuid on a partition this reader cannot locate\n");
@@ -287,9 +295,21 @@ fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
     s.push_str(&format!(
         "journal flags:   0x{:08x}{}{}{}\n",
         info.flags,
-        if flags.in_filesystem() { " in-filesystem" } else { "" },
-        if flags.on_other_device() { " other-device" } else { "" },
-        if flags.needs_init() { " needs-init" } else { "" },
+        if flags.in_filesystem() {
+            " in-filesystem"
+        } else {
+            ""
+        },
+        if flags.on_other_device() {
+            " other-device"
+        } else {
+            ""
+        },
+        if flags.needs_init() {
+            " needs-init"
+        } else {
+            ""
+        },
     ));
     s.push_str(&format!("uninitialised:   {}\n", j.is_uninitialized()));
     // Apple's own predicate for a read-only mount, which refuses rather than
@@ -316,9 +336,7 @@ fn render_journal(vol: &Volume<'_, FileDevice>) -> Result<String> {
         }
     }
     if let Some((at, why)) = j.truncation() {
-        s.push_str(&format!(
-            "replay truncated at journal offset {at}: {why}\n"
-        ));
+        s.push_str(&format!("replay truncated at journal offset {at}: {why}\n"));
     }
     s.push_str(&format!("transactions:    {}\n", j.transactions().len()));
     s.push_str(&format!("replayed blocks: {}\n", j.replayed_blocks().len()));

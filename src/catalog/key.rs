@@ -155,7 +155,11 @@ impl CatalogKey {
             name.push(be.u16(CATALOG_KEY_NAME_OFFSET + i * 2)?);
         }
 
-        Ok(CatalogKey { parent_id, name, key_length })
+        Ok(CatalogKey {
+            parent_id,
+            name,
+            key_length,
+        })
     }
 
     /// Build a key for looking a name up inside `parent_id`.
@@ -233,7 +237,10 @@ mod tests {
         assert_eq!(CATALOG_KEY_PARENT_OFFSET, 2);
         assert_eq!(CATALOG_KEY_NAME_LEN_OFFSET, 6);
         assert_eq!(CATALOG_KEY_NAME_OFFSET, 8);
-        assert_eq!(CATALOG_KEY_PARENT_SIZE + CATALOG_KEY_NAME_LEN_SIZE + 255 * 2, 516);
+        assert_eq!(
+            CATALOG_KEY_PARENT_SIZE + CATALOG_KEY_NAME_LEN_SIZE + 255 * 2,
+            516
+        );
     }
 
     #[test]
@@ -290,7 +297,10 @@ mod tests {
         // maxKeyLength too small must be refused, not trusted away.
         assert!(matches!(
             CatalogKey::from_record(&rec, 4),
-            Err(Error::InvalidField { field: "HFSPlusCatalogKey.keyLength", .. })
+            Err(Error::InvalidField {
+                field: "HFSPlusCatalogKey.keyLength",
+                ..
+            })
         ));
         assert!(CatalogKey::from_record(&rec, 516).is_ok());
     }

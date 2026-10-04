@@ -156,11 +156,7 @@ impl<'a, D: BlockDevice + ?Sized> ForkReader<'a, D> {
     pub fn read_all(&self, limit: usize) -> Result<Vec<u8>> {
         let size = self.fork.logical_size;
         if size > limit as u64 {
-            return Err(Error::out_of_range(
-                "fork logical size",
-                size,
-                limit as u64,
-            ));
+            return Err(Error::out_of_range("fork logical size", size, limit as u64));
         }
         self.read(0, size as usize)
     }
@@ -220,7 +216,9 @@ impl<'a, D: BlockDevice + ?Sized> TreeOverflow<'a, D> {
 
             for i in 0..node.num_records() {
                 let Ok(record) = node.record(i) else { continue };
-                let Some((key, body)) = split_extent_record(record) else { continue };
+                let Some((key, body)) = split_extent_record(record) else {
+                    continue;
+                };
                 if key.file_id != file_id {
                     // Keys sort by CNID first, so once past it we are done.
                     if key.file_id > file_id {
@@ -276,7 +274,11 @@ impl<'a, 'r, D: BlockDevice + ?Sized> std::fmt::Debug for ForkOverflow<'a, 'r, D
 impl<'a, 'r, D: BlockDevice + ?Sized> ForkOverflow<'a, 'r, D> {
     /// Bind a resolver to one fork.
     pub fn for_fork(tree: &'r TreeOverflow<'a, D>, fork_type: u8, file_id: u32) -> Self {
-        ForkOverflow { tree, fork_type, file_id }
+        ForkOverflow {
+            tree,
+            fork_type,
+            file_id,
+        }
     }
 }
 
@@ -285,7 +287,8 @@ impl<'a, 'r, D: BlockDevice + ?Sized> OverflowResolver for ForkOverflow<'a, 'r, 
         &self,
         start_block: u32,
     ) -> Result<Option<crate::format::extents::ExtentRecord>> {
-        self.tree.find_group(self.fork_type, self.file_id, start_block)
+        self.tree
+            .find_group(self.fork_type, self.file_id, start_block)
     }
 }
 
@@ -303,8 +306,7 @@ mod tests {
         let mut dev = MemoryDevice::zeroed((blocks * u64::from(block_size)) as usize);
         for b in 0..blocks {
             let off = (b * u64::from(block_size)) as usize;
-            dev.as_mut_slice()[off..off + 4]
-                .copy_from_slice(&(b as u32).to_be_bytes());
+            dev.as_mut_slice()[off..off + 4].copy_from_slice(&(b as u32).to_be_bytes());
         }
         dev
     }
@@ -315,7 +317,10 @@ mod tests {
         f.logical_size = logical_size;
         f.total_blocks = total_blocks;
         for (i, (start, count)) in extents.iter().enumerate() {
-            f.extents.raw[i] = ExtentDescriptor { start_block: *start, block_count: *count };
+            f.extents.raw[i] = ExtentDescriptor {
+                start_block: *start,
+                block_count: *count,
+            };
         }
         f
     }
@@ -359,7 +364,10 @@ mod tests {
         let dev = patterned_device(32, 4096);
         let f = fork(&[(4, 1)], 1, 4 * 4096);
         let r = ForkReader::new(&dev, &f, 4096);
-        assert!(!r.needs_overflow(), "a sparse file needs no overflow records");
+        assert!(
+            !r.needs_overflow(),
+            "a sparse file needs no overflow records"
+        );
 
         // The allocated part is real.
         assert_eq!(&r.read(0, 4).unwrap(), &4u32.to_be_bytes());
@@ -426,7 +434,10 @@ mod tests {
         let f = fork(&[(4, 2)], 2, 8192);
         let r = ForkReader::new(&dev, &f, 4096);
         assert!(matches!(r.read(u64::MAX, 16), Err(Error::Overflow { .. })));
-        assert!(matches!(r.read(u64::MAX - 1, 16), Err(Error::Overflow { .. })));
+        assert!(matches!(
+            r.read(u64::MAX - 1, 16),
+            Err(Error::Overflow { .. })
+        ));
         // One below the wrap point is merely past the end.
         assert!(r.read(u64::MAX - 8191, 4096).unwrap().is_empty());
     }

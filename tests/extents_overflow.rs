@@ -84,7 +84,10 @@ fn fragmented_fork(total_extents: u32) -> (ForkData, Vec<ExtentDescriptor>) {
     // Every extent, in logical order: the first eight go inline, the rest are
     // what the overflow tree has to supply.
     for _ in 0..total_extents {
-        layout.push(ExtentDescriptor { start_block: block, block_count: 1 });
+        layout.push(ExtentDescriptor {
+            start_block: block,
+            block_count: 1,
+        });
         block += stride;
     }
     fork.extents.raw[..(total_extents as usize).min(DENSITY)]
@@ -125,7 +128,10 @@ fn a_fork_past_eight_extents_reports_needing_overflow() {
     // The premise of the whole suite: if this does not hold, nothing below is
     // testing what it claims to.
     let (nine, _) = fragmented_fork(9);
-    assert!(nine.needs_overflow(), "9 single-block extents exceed the density");
+    assert!(
+        nine.needs_overflow(),
+        "9 single-block extents exceed the density"
+    );
     assert_eq!(nine.overflow_block_count(), 1);
 
     let (eight, _) = fragmented_fork(8);
@@ -155,11 +161,11 @@ fn the_overflow_count_is_what_the_inline_record_does_not_cover() {
 /// The corpus cannot supply a real extents tree for a synthetic fork, so the
 /// tree is assembled by hand: one header node whose `leafRecords` is 1, whose
 /// first leaf is node 1, and whose leaf node holds a single key-and-record pair.
-fn synthetic_extents_tree(
-    node_size: usize,
-    records: &[(u32, u32, ExtentRecord)],
-) -> Vec<u8> {
-    assert!(node_size >= EXTENT_RECORD_SIZE + 64, "node too small for this test");
+fn synthetic_extents_tree(node_size: usize, records: &[(u32, u32, ExtentRecord)]) -> Vec<u8> {
+    assert!(
+        node_size >= EXTENT_RECORD_SIZE + 64,
+        "node too small for this test"
+    );
     let mut image = vec![0u8; node_size * 2];
 
     // Node 0: the header. `struct BTNodeDescriptor` is 14 bytes; the header
@@ -175,11 +181,15 @@ fn synthetic_extents_tree(
     put_u32(&mut image, hdr_rec + 6, records.len() as u32); // leafRecords
     put_u32(&mut image, hdr_rec + 10, 1); // firstLeafNode
     put_u32(&mut image, hdr_rec + 14, 1); // lastLeafNode
-    // Offset array: 3 records + the free-space slot.
+                                          // Offset array: 3 records + the free-space slot.
     put_u16(&mut image, node_size - 2, (h + 14) as u16);
     put_u16(&mut image, node_size - 4, (h + 14 + 106) as u16);
     put_u16(&mut image, node_size - 6, (h + 14 + 106 + 8) as u16);
-    put_u16(&mut image, node_size - 8, (h + 14 + 106 + 8 + EXTENT_RECORD_SIZE) as u16);
+    put_u16(
+        &mut image,
+        node_size - 8,
+        (h + 14 + 106 + 8 + EXTENT_RECORD_SIZE) as u16,
+    );
 
     // Node 1: the leaf, holding every record.
     let l = node_size;
@@ -212,7 +222,11 @@ fn synthetic_extents_tree(
     for (i, off) in offsets.iter().enumerate() {
         put_u16(&mut image, node_size * 2 - 2 * (i + 1), (*off - l) as u16);
     }
-    put_u16(&mut image, node_size * 2 - 2 * (records.len() + 1), (at - l) as u16);
+    put_u16(
+        &mut image,
+        node_size * 2 - 2 * (records.len() + 1),
+        (at - l) as u16,
+    );
     image
 }
 
@@ -226,7 +240,10 @@ fn put_u32(buf: &mut [u8], at: usize, v: u32) {
 
 fn one_extent(start: u32, count: u32) -> ExtentRecord {
     let mut e = ExtentRecord::default();
-    e.raw[0] = ExtentDescriptor { start_block: start, block_count: count };
+    e.raw[0] = ExtentDescriptor {
+        start_block: start,
+        block_count: count,
+    };
     e
 }
 
@@ -260,7 +277,11 @@ fn reading_past_the_inline_extents_requires_the_overflow_tree() {
 
     // With a resolver over the tree holding the overflow group.
     let records = overflow_groups_for(&layout);
-    assert_eq!(records.len(), 1, "10 extents need exactly one overflow group");
+    assert_eq!(
+        records.len(),
+        1,
+        "10 extents need exactly one overflow group"
+    );
 
     let tree_bytes = synthetic_extents_tree(BLOCK as usize, &records);
     let tree_len = tree_bytes.len() as u64;
@@ -281,7 +302,11 @@ fn reading_past_the_inline_extents_requires_the_overflow_tree() {
     let whole = reader
         .read(0, 10 * BLOCK as usize)
         .expect("read the whole fork");
-    assert_eq!(whole.len(), 10 * BLOCK as usize, "the whole fork must be readable");
+    assert_eq!(
+        whole.len(),
+        10 * BLOCK as usize,
+        "the whole fork must be readable"
+    );
 
     // And the content must be right, not merely present: each block must carry
     // its own pattern, in the order the extents give.
@@ -291,7 +316,8 @@ fn reading_past_the_inline_extents_requires_the_overflow_tree() {
             assert_eq!(
                 whole[base + within],
                 expected_byte(extent.start_block, within),
-                "block {i} (physical {}) wrong at +{within}", extent.start_block
+                "block {i} (physical {}) wrong at +{within}",
+                extent.start_block
             );
         }
         assert_eq!(
@@ -309,7 +335,10 @@ fn a_resolver_for_an_unknown_cnid_finds_nothing() {
     // A tree that has no record for this CNID must end the walk rather than
     // return another file's extents. Getting this wrong would splice two files
     // together.
-    let image = synthetic_extents_tree(BLOCK as usize, &[(FORK_CNID, DENSITY as u32, one_extent(40, 1))]);
+    let image = synthetic_extents_tree(
+        BLOCK as usize,
+        &[(FORK_CNID, DENSITY as u32, one_extent(40, 1))],
+    );
     let image_len = image.len() as u64;
     let dev = MemoryDevice::new(image);
     let fork = ForkData {
@@ -322,15 +351,24 @@ fn a_resolver_for_an_unknown_cnid_finds_nothing() {
     let overflow = TreeOverflow::new(tree);
 
     assert!(
-        overflow.find_group(ExtentKey::DATA_FORK, FORK_CNID, DENSITY as u32).unwrap().is_some(),
+        overflow
+            .find_group(ExtentKey::DATA_FORK, FORK_CNID, DENSITY as u32)
+            .unwrap()
+            .is_some(),
         "the record for our CNID must be found"
     );
     assert!(
-        overflow.find_group(ExtentKey::DATA_FORK, FORK_CNID + 1, DENSITY as u32).unwrap().is_none(),
+        overflow
+            .find_group(ExtentKey::DATA_FORK, FORK_CNID + 1, DENSITY as u32)
+            .unwrap()
+            .is_none(),
         "another file's CNID must find nothing"
     );
     assert!(
-        overflow.find_group(ExtentKey::DATA_FORK, FORK_CNID, DENSITY as u32 + 1).unwrap().is_none(),
+        overflow
+            .find_group(ExtentKey::DATA_FORK, FORK_CNID, DENSITY as u32 + 1)
+            .unwrap()
+            .is_none(),
         "a start block with no record must find nothing"
     );
 }
@@ -349,7 +387,11 @@ fn the_key_is_the_running_total_of_blocks_already_described() {
     let image_records = overflow_groups_for(&layout);
     // Keys are 8, 16 and 24: each group is 8 single-block extents.
     let keys: Vec<u32> = image_records.iter().map(|(_, k, _)| *k).collect();
-    assert_eq!(keys, vec![8, 16], "20 extents is 8 inline plus two groups of 6");
+    assert_eq!(
+        keys,
+        vec![8, 16],
+        "20 extents is 8 inline plus two groups of 6"
+    );
 
     let image = synthetic_extents_tree(BLOCK as usize, &image_records);
     let image_len = image.len() as u64;
@@ -370,7 +412,10 @@ fn the_key_is_the_running_total_of_blocks_already_described() {
         assert!(found.is_some(), "group {i} at key {key} must be found");
     }
     assert!(
-        overflow.find_group(ExtentKey::DATA_FORK, FORK_CNID, 32).unwrap().is_none(),
+        overflow
+            .find_group(ExtentKey::DATA_FORK, FORK_CNID, 32)
+            .unwrap()
+            .is_none(),
         "a key past the last group must find nothing"
     );
 }
@@ -390,7 +435,12 @@ fn an_empty_extents_tree_resolves_to_nothing_rather_than_failing() {
     };
     let tree = hfsplus::btree::io::BTreeFile::open(&dev, &fork, BLOCK, true).expect("open");
     let overflow = TreeOverflow::new(tree);
-    assert_eq!(overflow.find_group(ExtentKey::DATA_FORK, FORK_CNID, 8).unwrap(), None);
+    assert_eq!(
+        overflow
+            .find_group(ExtentKey::DATA_FORK, FORK_CNID, 8)
+            .unwrap(),
+        None
+    );
 }
 
 #[test]
@@ -453,5 +503,11 @@ fn cnids_order_numerically_in_the_extents_tree() {
             "CNID {cnid} must resolve to its own record"
         );
     }
-    assert!(overflow.find_group(ExtentKey::DATA_FORK, 43, 0).unwrap().is_none(), "an absent CNID finds nothing");
+    assert!(
+        overflow
+            .find_group(ExtentKey::DATA_FORK, 43, 0)
+            .unwrap()
+            .is_none(),
+        "an absent CNID finds nothing"
+    );
 }

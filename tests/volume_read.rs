@@ -59,7 +59,8 @@ fn image(name: &str) -> std::path::PathBuf {
 /// Look up a hidden entry by name, which is how these two are reached.
 fn hidden_entry(vol: &Volume<'_, FileDevice>, name: &str) -> Option<Object> {
     let units: Vec<u16> = name.encode_utf16().collect();
-    vol.lookup(vol.root_cnid(), &units).unwrap_or_else(|e| panic!("{name}: {e}"))
+    vol.lookup(vol.root_cnid(), &units)
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
 }
 
 /// Skip with a reason rather than fail when the image is absent.
@@ -67,7 +68,10 @@ fn require(name: &str) -> bool {
     if image(name).exists() {
         true
     } else {
-        eprintln!("skipping: {} not built; run tools/genimages.sh", image(name).display());
+        eprintln!(
+            "skipping: {} not built; run tools/genimages.sh",
+            image(name).display()
+        );
         false
     }
 }
@@ -93,7 +97,11 @@ fn a_file_with_a_data_fork_reads_its_declared_length() {
     }
     with_journaled(|vol| {
         let file = hidden_entry(vol, JOURNAL).expect("the journal file must be listed");
-        assert_eq!(file.data_size(), 524288, "the journalled fork's logical size");
+        assert_eq!(
+            file.data_size(),
+            524288,
+            "the journalled fork's logical size"
+        );
 
         let data = vol.read_file(&file, 1 << 20).expect("read the whole fork");
         assert_eq!(
@@ -136,8 +144,7 @@ fn the_journal_info_block_file_contains_a_journal_info_block() {
         let dev = FileDevice::open(image(JOURNALED)).expect("open");
         let vh = VolumeHeader::read_from(&dev).expect("header");
         assert_eq!(
-            vh.journal_info_block,
-            2,
+            vh.journal_info_block, 2,
             "the header points at the block this file occupies"
         );
         // Past the struct the block is not padding, and the reason is worth
@@ -153,7 +160,9 @@ fn the_journal_info_block_file_contains_a_journal_info_block() {
         // the filler would be fabricating, and one that rejected the block as
         // malformed would be refusing a valid one.
         assert!(
-            raw[JOURNAL_INFO_BLOCK_SIZE..FILLER_END].iter().all(|b| *b == 0xdb),
+            raw[JOURNAL_INFO_BLOCK_SIZE..FILLER_END]
+                .iter()
+                .all(|b| *b == 0xdb),
             "bytes {JOURNAL_INFO_BLOCK_SIZE}..{FILLER_END} are 0xdb drive filler, got {:?}",
             &raw[JOURNAL_INFO_BLOCK_SIZE..JOURNAL_INFO_BLOCK_SIZE + 8]
         );
@@ -182,10 +191,13 @@ fn the_journal_info_block_file_contains_a_journal_info_block() {
         // geometry to the length being read, which is the thing a mis-mapped
         // extent would get wrong.
         let file = hidden_entry(vol, JOURNAL_INFO).expect("listed");
-        let extents = file.as_file().expect("a file record").record.data_fork.extents;
-        let extent_total: u64 = (0..8)
-            .map(|i| u64::from(extents.raw[i].block_count))
-            .sum();
+        let extents = file
+            .as_file()
+            .expect("a file record")
+            .record
+            .data_fork
+            .extents;
+        let extent_total: u64 = (0..8).map(|i| u64::from(extents.raw[i].block_count)).sum();
         assert_eq!(
             extent_total * 4096,
             4096,
@@ -233,7 +245,15 @@ fn reads_at_arbitrary_offsets_agree_with_a_whole_file_read() {
 
         // Straddle the 4096-byte block boundary, and the last block.
         let block = 4096usize;
-        for offset in [0, 1, block - 1, block, block + 1, 2 * block - 1, whole.len() - 1] {
+        for offset in [
+            0,
+            1,
+            block - 1,
+            block,
+            block + 1,
+            2 * block - 1,
+            whole.len() - 1,
+        ] {
             for len in [1, 7, block - 1, block, block + 1] {
                 let window = vol
                     .read(&file, offset as u64, len)
@@ -261,16 +281,31 @@ fn a_read_past_the_end_of_the_file_is_bounded_not_an_error() {
         let file = hidden_entry(vol, JOURNAL).expect("listed");
         let size = file.data_size() as usize;
 
-        let tail = vol.read(&file, size as u64 - 10, 10).expect("exactly to the end");
-        assert_eq!(tail.len(), 10, "a read ending exactly at the size is complete");
+        let tail = vol
+            .read(&file, size as u64 - 10, 10)
+            .expect("exactly to the end");
+        assert_eq!(
+            tail.len(),
+            10,
+            "a read ending exactly at the size is complete"
+        );
 
-        let over = vol.read(&file, size as u64 - 10, 1000).expect("past the end");
+        let over = vol
+            .read(&file, size as u64 - 10, 1000)
+            .expect("past the end");
         assert_eq!(over.len(), 10, "a read past the end returns what there is");
 
-        let past = vol.read(&file, size as u64, 10).expect("entirely past the end");
-        assert!(past.is_empty(), "a read starting at the end returns nothing");
+        let past = vol
+            .read(&file, size as u64, 10)
+            .expect("entirely past the end");
+        assert!(
+            past.is_empty(),
+            "a read starting at the end returns nothing"
+        );
 
-        let beyond = vol.read(&file, size as u64 * 2, 10).expect("far past the end");
+        let beyond = vol
+            .read(&file, size as u64 * 2, 10)
+            .expect("far past the end");
         assert!(beyond.is_empty(), "a read beyond the end returns nothing");
     });
 }
@@ -283,7 +318,10 @@ fn a_zero_length_read_returns_nothing_rather_than_failing() {
     with_journaled(|vol| {
         let file = hidden_entry(vol, JOURNAL).expect("listed");
         assert!(vol.read(&file, 0, 0).expect("zero length at 0").is_empty());
-        assert!(vol.read(&file, 100, 0).expect("zero length mid-file").is_empty());
+        assert!(vol
+            .read(&file, 100, 0)
+            .expect("zero length mid-file")
+            .is_empty());
     });
 }
 
@@ -305,11 +343,15 @@ fn a_file_with_no_resource_fork_reads_empty_rather_than_failing() {
             "the journal file has no resource fork"
         );
         assert!(
-            vol.read_resource(&file, 0, 64).expect("read_resource").is_empty(),
+            vol.read_resource(&file, 0, 64)
+                .expect("read_resource")
+                .is_empty(),
             "reading an absent resource fork yields nothing"
         );
         assert!(
-            vol.read_resource(&file, 1000, 64).expect("offset read").is_empty(),
+            vol.read_resource(&file, 1000, 64)
+                .expect("offset read")
+                .is_empty(),
             "and the same at any offset"
         );
     });
@@ -328,7 +370,10 @@ fn reading_a_directory_is_an_error_on_every_fork() {
             .expect("resolve the root")
             .expect("the root folder must exist");
         assert!(root.is_dir());
-        assert!(vol.read(&root, 0, 10).is_err(), "a directory has no data fork");
+        assert!(
+            vol.read(&root, 0, 10).is_err(),
+            "a directory has no data fork"
+        );
         assert!(vol.read_resource(&root, 0, 10).is_err());
         assert!(vol.read_link(&root).is_err(), "the root is not a symlink");
     });

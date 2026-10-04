@@ -24,20 +24,20 @@
 //! that makes a FUSE mount usable.
 
 use crate::blockdev::BlockDevice;
+use crate::btree::ExtentKey;
 use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID};
 use crate::catalog::lookup::Catalog;
 use crate::catalog::record::{BsdInfo, CatalogRecord, FileRecord, FolderRecord};
 use crate::error::{Error, Result};
 use crate::extent::OverflowResolver;
-use crate::btree::ExtentKey;
 use crate::file::{ForkOverflow, ForkReader, TreeOverflow};
 use crate::format::fork::ForkData;
 use crate::format::volume_header::{FileSystemKind, VolumeHeader};
 
 mod bitmap;
 
-pub use bitmap::{bytes_for_blocks, AllocationBitmap};
 use crate::timestamp::HfsTimestamp;
+pub use bitmap::{bytes_for_blocks, AllocationBitmap};
 
 /// A mounted, read-only HFS+ or HFSX volume.
 pub struct Volume<'a, D: ?Sized> {
@@ -111,11 +111,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         // itself, and such a volume is perfectly sound -- its journal is simply on
         // a partition this reader was not given.
         if header.is_journaled() {
-            crate::journal::Journal::open(
-                device,
-                header.journal_info_block,
-                header.block_size,
-            )?;
+            crate::journal::Journal::open(device, header.journal_info_block, header.block_size)?;
         }
 
         Ok(Volume {
@@ -194,13 +190,16 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Mining reference: `hfs_MountHFSPlusVolume` reads the name with
     /// `cat_idlookup(kHFSRootFolderID)` and copies `cd_nameptr` into `vcbVN`.
     pub fn name(&self) -> Result<String> {
-        let Some(CatalogRecord::Thread(thread)) =
-            self.catalog.lookup(self.root_cnid(), &[])?
+        let Some(CatalogRecord::Thread(thread)) = self.catalog.lookup(self.root_cnid(), &[])?
         else {
-            return Err(Error::NotFound { what: "root folder thread record" });
+            return Err(Error::NotFound {
+                what: "root folder thread record",
+            });
         };
         if thread.node_name.is_empty() {
-            return Err(Error::NotFound { what: "root folder name" });
+            return Err(Error::NotFound {
+                what: "root folder name",
+            });
         }
         Ok(String::from_utf16_lossy(&thread.node_name))
     }
@@ -221,7 +220,11 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         if record.is_thread() {
             return Ok(None);
         }
-        Ok(Object::from_record(stored, record, self.header.has_expanded_times()))
+        Ok(Object::from_record(
+            stored,
+            record,
+            self.header.has_expanded_times(),
+        ))
     }
 
     /// List a directory's entries.
@@ -281,13 +284,15 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Read `len` bytes from a file's data fork at `offset`.
     pub fn read(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>> {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f)).read(offset, len)
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+            .read(offset, len)
     }
 
     /// Read the whole data fork, bounded by `limit` bytes.
     pub fn read_file(&self, file: &Object, limit: usize) -> Result<Vec<u8>> {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f)).read_all(limit)
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+            .read_all(limit)
     }
 
     /// Read `len` bytes from a file's resource fork.
@@ -299,7 +304,12 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         if f.record.resource_fork.logical_size == 0 {
             return Ok(Vec::new());
         }
-        self.fork_reader(&f.record.resource_fork, ExtentKey::RESOURCE_FORK, file_id(f)).read(offset, len)
+        self.fork_reader(
+            &f.record.resource_fork,
+            ExtentKey::RESOURCE_FORK,
+            file_id(f),
+        )
+        .read(offset, len)
     }
 
     /// The target of a symbolic link.
@@ -353,9 +363,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             total_blocks: self.header.total_blocks,
             free_blocks: self.header.free_blocks,
             total_bytes: self.header.volume_bytes()?,
-            free_bytes: u64::from(self.header.free_blocks).checked_mul(u64::from(bs)).ok_or(
-                Error::overflow("statfs free bytes"),
-            )?,
+            free_bytes: u64::from(self.header.free_blocks)
+                .checked_mul(u64::from(bs))
+                .ok_or(Error::overflow("statfs free bytes"))?,
             file_count: self.header.file_count,
             folder_count: self.header.folder_count,
             // An HFS+ volume has no sub-directory limit to report.
@@ -411,7 +421,11 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         let at = u64::from(self.header.journal_info_block) * bs;
         self.device.read_at(at, &mut buf)?;
         let info = crate::journal::info::JournalInfoBlock::parse(&buf)?;
-        Ok(if info.flag_set().in_filesystem() { None } else { Some(info) })
+        Ok(if info.flag_set().in_filesystem() {
+            None
+        } else {
+            Some(info)
+        })
     }
 
     /// The volume's allocation bitmap.
@@ -438,12 +452,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// extents up in the extents B-tree by CNID. `core/hfs_vfsops.c` reads
     /// through that mapping, so a file that overflows is a normal file, not a
     /// special case.
-    fn fork_reader(
-        &self,
-        fork: &ForkData,
-        fork_type: u8,
-        file_id: u32,
-    ) -> ForkReader<'_, D> {
+    fn fork_reader(&self, fork: &ForkData, fork_type: u8, file_id: u32) -> ForkReader<'_, D> {
         if !fork.needs_overflow() {
             return ForkReader::new(self.device, fork, self.header.block_size);
         }
@@ -478,12 +487,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         // intended sense: two threads may each open the tree, and both results
         // are equivalent, so the second `set` is simply ignored.
         if self.extents.get().is_none() {
-            if let Ok(tree) = crate::btree::io::BTreeFile::open(
-                self.device,
-                fork,
-                self.header.block_size,
-                true,
-            ) {
+            if let Ok(tree) =
+                crate::btree::io::BTreeFile::open(self.device, fork, self.header.block_size, true)
+            {
                 let _ = self.extents.set(TreeOverflow::new(tree));
             }
         }
@@ -492,7 +498,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     }
 }
 
-    /// The CNID a fork's overflow extents are keyed on.
+/// The CNID a fork's overflow extents are keyed on.
 ///
 /// Both forks of a file share the CNID, and the extents B-tree key includes the
 /// fork type so they cannot collide. Mining reference: `core/hfs_extents.c` keys
@@ -605,11 +611,7 @@ impl Object {
     /// Returns `None` for a thread record. A thread record is not an object, and
     /// turning one into a zeroed file would make a directory listing report
     /// phantom entries rather than dropping them.
-    fn from_record(
-        name: Vec<u16>,
-        record: CatalogRecord,
-        volume_expanded: bool,
-    ) -> Option<Self> {
+    fn from_record(name: Vec<u16>, record: CatalogRecord, volume_expanded: bool) -> Option<Self> {
         Some(match record {
             CatalogRecord::Thread(_) => return None,
             other => Self::from_main_record(name, other, volume_expanded),
@@ -617,11 +619,7 @@ impl Object {
     }
 
     /// Build from a folder or file record.
-    fn from_main_record(
-        name: Vec<u16>,
-        record: CatalogRecord,
-        volume_expanded: bool,
-    ) -> Self {
+    fn from_main_record(name: Vec<u16>, record: CatalogRecord, volume_expanded: bool) -> Self {
         match record {
             CatalogRecord::Folder(f) => Object::Directory(DirAttrs {
                 cnid: f.folder_id,
@@ -841,12 +839,8 @@ mod tests {
             text_encoding: 0,
             folder_count: 0,
         };
-        let obj = Object::from_record(
-            "TestVol".encode_utf16().collect(),
-            R::Folder(folder),
-            false,
-        )
-        .expect("a folder record becomes an object");
+        let obj = Object::from_record("TestVol".encode_utf16().collect(), R::Folder(folder), false)
+            .expect("a folder record becomes an object");
         assert!(obj.is_dir());
         assert!(!obj.is_symlink());
         assert_eq!(obj.cnid(), ROOT_FOLDER_ID);

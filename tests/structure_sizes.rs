@@ -33,13 +33,10 @@
 
 use hfsplus::btree::header::HEADER_RECORD_SIZE;
 use hfsplus::btree::key::{
-    ATTR_KEY_MAX_LENGTH, BIG_KEY_PREFIX, CATALOG_KEY_MAX_LENGTH, EXTENT_KEY_MAX_LENGTH,
-    ExtentKey,
+    ExtentKey, ATTR_KEY_MAX_LENGTH, BIG_KEY_PREFIX, CATALOG_KEY_MAX_LENGTH, EXTENT_KEY_MAX_LENGTH,
 };
 use hfsplus::btree::node::NODE_DESCRIPTOR_SIZE;
-use hfsplus::catalog::record::{
-    FILE_RECORD_SIZE, FOLDER_RECORD_SIZE, THREAD_RECORD_FIXED_SIZE,
-};
+use hfsplus::catalog::record::{FILE_RECORD_SIZE, FOLDER_RECORD_SIZE, THREAD_RECORD_FIXED_SIZE};
 use hfsplus::format::extents::EXTENT_RECORD_SIZE;
 use hfsplus::format::fork::FORK_DATA_SIZE;
 use hfsplus::format::volume_header::VOLUME_HEADER_SIZE;
@@ -70,7 +67,10 @@ fn the_extents_key_is_10_bytes_and_12_on_disk() {
     let body = 1 + 1 + 4 + 4;
     assert_eq!(EXTENT_KEY_MAX_LENGTH, body, "forkType and pad are fields");
     assert_eq!(EXTENT_KEY_MAX_LENGTH, 10);
-    assert_eq!(ExtentKey::ON_DISK_SIZE, EXTENT_KEY_MAX_LENGTH + BIG_KEY_PREFIX);
+    assert_eq!(
+        ExtentKey::ON_DISK_SIZE,
+        EXTENT_KEY_MAX_LENGTH + BIG_KEY_PREFIX
+    );
     assert_eq!(ExtentKey::ON_DISK_SIZE, 12);
 }
 
@@ -173,7 +173,7 @@ fn the_btree_header_record_is_106_bytes() {
         + 1            // btreeType
         + 1            // keyCompareType
         + 4            // attributes
-        + 16 * 4;      // reserved3
+        + 16 * 4; // reserved3
     assert_eq!(size, 106);
     assert_eq!(HEADER_RECORD_SIZE, size);
 }
@@ -202,7 +202,10 @@ fn the_journal_info_block_is_180_bytes_with_the_reserved_field_shrunk() {
     const RESERVED: usize = 32 * 4 - UUID_STRING - 48;
 
     let size = 4 + 8 * 4 + 8 + 8 + UUID_STRING + 48 + RESERVED;
-    assert_eq!(RESERVED, 64, "128 less the UUID and the 48-byte serial number");
+    assert_eq!(
+        RESERVED, 64,
+        "128 less the UUID and the 48-byte serial number"
+    );
     assert_eq!(size, 180);
     assert_eq!(JOURNAL_INFO_BLOCK_SIZE, size);
 

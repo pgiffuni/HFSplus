@@ -187,17 +187,19 @@ impl AllocationMap {
     /// for anything above it, because a bit read from past the end would be
     /// read from a block that belongs to something else.
     pub fn is_allocated(&self, block: u32) -> Result<bool> {
-        let (byte, shift) = self
-            .bit(block)
-            .ok_or(Error::BadBlockNumber { block, total_blocks: self.total_blocks })?;
+        let (byte, shift) = self.bit(block).ok_or(Error::BadBlockNumber {
+            block,
+            total_blocks: self.total_blocks,
+        })?;
         Ok(self.bytes[byte] & (0x80 >> shift) != 0)
     }
 
     /// Set or clear one block's bit.
     fn put(&mut self, block: u32, allocated: bool) -> Result<()> {
-        let (byte, shift) = self
-            .bit(block)
-            .ok_or(Error::BadBlockNumber { block, total_blocks: self.total_blocks })?;
+        let (byte, shift) = self.bit(block).ok_or(Error::BadBlockNumber {
+            block,
+            total_blocks: self.total_blocks,
+        })?;
         let mask = 0x80u8 >> shift;
         if allocated {
             self.bytes[byte] |= mask;
@@ -346,7 +348,9 @@ impl AllocationMap {
     /// is genuinely allocated, and a checker comparing this against
     /// `totalBlocks - freeBlocks` needs them both.
     pub fn count_allocated(&self) -> u64 {
-        (0..self.total_blocks).filter(|b| self.is_allocated(*b) == Ok(true)).count() as u64
+        (0..self.total_blocks)
+            .filter(|b| self.is_allocated(*b) == Ok(true))
+            .count() as u64
     }
 
     /// Blocks free below the allocation limit.
@@ -404,7 +408,10 @@ mod tests {
     fn a_block_past_the_end_is_refused_not_read() {
         let map = free_map(16);
         let err = map.is_allocated(16).expect_err("block 16 does not exist");
-        assert!(matches!(err, Error::BadBlockNumber { block: 16, .. }), "{err:?}");
+        assert!(
+            matches!(err, Error::BadBlockNumber { block: 16, .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -457,10 +464,16 @@ mod tests {
         // Block 0 is still marked free but is not allocatable, so `available`
         // must not count it -- otherwise a full volume reports one free block
         // and the caller retries for ever.
-        assert!(!map.is_allocated(0).unwrap(), "block 0 reads free on a fresh map");
+        assert!(
+            !map.is_allocated(0).unwrap(),
+            "block 0 reads free on a fresh map"
+        );
         assert_eq!(map.free_below_limit(), 0);
         match map.reserve(1, 1) {
-            Err(Error::NoSpace { requested, available }) => {
+            Err(Error::NoSpace {
+                requested,
+                available,
+            }) => {
                 assert_eq!(requested, 1);
                 assert_eq!(available, 0);
             }
@@ -471,7 +484,10 @@ mod tests {
     #[test]
     fn a_zero_block_extent_is_an_error_not_a_free_allocation() {
         let mut map = free_map(16);
-        assert!(map.reserve(1, 0).is_err(), "reserving nothing is a caller bug");
+        assert!(
+            map.reserve(1, 0).is_err(),
+            "reserving nothing is a caller bug"
+        );
     }
 
     #[test]
@@ -492,14 +508,20 @@ mod tests {
         map.claim(1, 57).unwrap();
         assert_eq!(map.free_below_limit(), 0);
         match map.reserve(1, 1) {
-            Err(Error::NoSpace { requested, available }) => {
+            Err(Error::NoSpace {
+                requested,
+                available,
+            }) => {
                 assert_eq!(requested, 1);
                 assert_eq!(available, 0, "the tail is free but not allocatable");
             }
             other => panic!("expected NoSpace, got {other:?}"),
         }
         for block in 60..64 {
-            assert!(!map.is_allocated(block).unwrap(), "block {block} stays free");
+            assert!(
+                !map.is_allocated(block).unwrap(),
+                "block {block} stays free"
+            );
         }
     }
 
@@ -509,13 +531,19 @@ mod tests {
         map.claim(10, 4).unwrap();
         map.release(10, 4).unwrap();
         for block in 10..14 {
-            assert!(!map.is_allocated(block).unwrap(), "block {block} should be free");
+            assert!(
+                !map.is_allocated(block).unwrap(),
+                "block {block} should be free"
+            );
         }
         assert!(
             map.release(58, 4).is_err(),
             "releasing across the limit would free the backup volume header"
         );
-        assert!(map.release(62, 4).is_err(), "and past the end is out of range");
+        assert!(
+            map.release(62, 4).is_err(),
+            "and past the end is out of range"
+        );
     }
 
     #[test]
@@ -557,7 +585,11 @@ mod tests {
     fn a_short_bitmap_is_refused() {
         let err = AllocationMap::from_bytes(&[0u8; 3], 64).expect_err("64 blocks need 8 bytes");
         match err {
-            Error::Truncated { what, needed, available } => {
+            Error::Truncated {
+                what,
+                needed,
+                available,
+            } => {
                 assert_eq!(what, "allocation bitmap");
                 assert_eq!(needed, 8);
                 assert_eq!(available, 3);

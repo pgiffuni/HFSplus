@@ -168,7 +168,9 @@ fn no_image_is_empty_and_every_volume_header_is_present_or_absent_deliberately()
     let mut checked = 0usize;
     for (dir, name) in FIXTURES {
         let path = fixture_path(dir, name);
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         checked += 1;
 
         if deliberately_unsigned.contains(name) {

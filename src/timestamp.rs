@@ -263,7 +263,9 @@ mod tests {
     #[test]
     fn formats_known_dates() {
         assert_eq!(
-            HfsTimestamp::new(MAC_GMT_FACTOR + 1, false).to_rfc3339().as_deref(),
+            HfsTimestamp::new(MAC_GMT_FACTOR + 1, false)
+                .to_rfc3339()
+                .as_deref(),
             Some("1970-01-01T00:00:01Z")
         );
         assert_eq!(
@@ -273,9 +275,6 @@ mod tests {
             Some("2023-11-14T22:13:20Z")
         );
         // 1904-01-01, which clamps to the epoch under Apple's rule.
-        assert_eq!(
-            HfsTimestamp::new(0, false).to_rfc3339(),
-            None
-        );
+        assert_eq!(HfsTimestamp::new(0, false).to_rfc3339(), None);
     }
 }

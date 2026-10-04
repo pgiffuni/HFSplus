@@ -41,7 +41,12 @@ impl FileDevice {
             message: format!("{}: {}", path.display(), e),
         })?;
         let len = file.metadata().map_err(|e| Error::io(&e))?.len();
-        Ok(FileDevice { file, path: path.to_path_buf(), writable: false, len })
+        Ok(FileDevice {
+            file,
+            path: path.to_path_buf(),
+            writable: false,
+            len,
+        })
     }
 
     /// Open an existing image read-write.
@@ -55,9 +60,16 @@ impl FileDevice {
             .read(true)
             .write(true)
             .open(path)
-            .map_err(|e| Error::Io { message: format!("{}: {}", path.display(), e) })?;
+            .map_err(|e| Error::Io {
+                message: format!("{}: {}", path.display(), e),
+            })?;
         let len = file.metadata().map_err(|e| Error::io(&e))?.len();
-        Ok(FileDevice { file, path: path.to_path_buf(), writable: true, len })
+        Ok(FileDevice {
+            file,
+            path: path.to_path_buf(),
+            writable: true,
+            len,
+        })
     }
 
     /// Create `path` with `len` bytes of length and open it read-write.
@@ -74,9 +86,16 @@ impl FileDevice {
             .create(true)
             .truncate(true)
             .open(path)
-            .map_err(|e| Error::Io { message: format!("{}: {}", path.display(), e) })?;
+            .map_err(|e| Error::Io {
+                message: format!("{}: {}", path.display(), e),
+            })?;
         file.set_len(len).map_err(|e| Error::io(&e))?;
-        Ok(FileDevice { file, path: path.to_path_buf(), writable: true, len })
+        Ok(FileDevice {
+            file,
+            path: path.to_path_buf(),
+            writable: true,
+            len,
+        })
     }
 
     /// Path this device was opened from.
@@ -104,7 +123,9 @@ impl BlockDevice for FileDevice {
         if buf.is_empty() {
             return Ok(());
         }
-        let end = offset.checked_add(buf.len() as u64).ok_or(Error::overflow("file read"))?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::overflow("file read"))?;
         if end > self.len {
             return Err(Error::Truncated {
                 what: "file read",
@@ -134,7 +155,9 @@ impl BlockDeviceMut for FileDevice {
         if buf.is_empty() {
             return Ok(());
         }
-        let end = offset.checked_add(buf.len() as u64).ok_or(Error::overflow("file write"))?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::overflow("file write"))?;
         if end > self.len {
             return Err(Error::Truncated {
                 what: "file write",
@@ -142,7 +165,9 @@ impl BlockDeviceMut for FileDevice {
                 available: self.len as usize,
             });
         }
-        self.file.seek(SeekFrom::Start(offset)).map_err(|e| Error::io(&e))?;
+        self.file
+            .seek(SeekFrom::Start(offset))
+            .map_err(|e| Error::io(&e))?;
         self.file.write_all(buf).map_err(|e| Error::Io {
             message: format!("{}: write at {}: {}", self.path.display(), offset, e),
         })

@@ -50,7 +50,10 @@ fn check_image(name: &str) -> Option<(CheckReport, u32)> {
 fn check_path(path: &std::path::Path) -> Option<(CheckReport, u32)> {
     let name = path.file_name()?.to_string_lossy().to_string();
     if !path.exists() {
-        panic!("{}: check_path was given a file that does not exist", path.display());
+        panic!(
+            "{}: check_path was given a file that does not exist",
+            path.display()
+        );
     }
     let dev = FileDevice::open(path).unwrap_or_else(|e| panic!("open {name}: {e}"));
     // A volume outside this project's scope is refused structurally, and there
@@ -77,7 +80,9 @@ fn every_generated_image_is_internally_consistent() {
     // generators wrote and `fsck.hfsplus` accepted unchanged.
     let mut checked = 0;
     for name in common::generated_names() {
-        let Some((report, _)) = check_image(&name) else { continue };
+        let Some((report, _)) = check_image(&name) else {
+            continue;
+        };
         let described = report.describe();
         assert!(
             described.is_empty(),
@@ -100,7 +105,9 @@ fn the_torn_catalog_image_is_consistent_because_replay_is_the_readers_job() {
     // This is a real limitation rather than a passing test: the checker does not
     // replay, so it cannot tell a volume needing recovery from a sound one.
     // Whether a journal needs replaying is Apple's check to make.
-    let Some((report, _)) = check_image("journal-torn-catalog") else { return };
+    let Some((report, _)) = check_image("journal-torn-catalog") else {
+        return;
+    };
     let described = report.describe();
     assert!(
         described.is_empty(),
@@ -121,7 +128,9 @@ fn a_block_marked_but_referenced_by_nothing_is_reported_orphaned() {
         freed = fragmented_blocks(img)[0];
         free_fragmented_extent(img);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     assert!(
@@ -145,7 +154,9 @@ fn a_fork_whose_extents_werent_marked_is_reported_missing() {
         cleared = fragmented_blocks(img)[0];
         mark_only_in_catalog(img, cleared);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     assert!(
@@ -168,7 +179,9 @@ fn a_fork_declaring_more_blocks_than_its_extents_describe_is_reported() {
     let image = break_image("journal-with-files", "totalblocks", |img| {
         inflate_total_blocks(img, FRAGMENTED_CNID, 7);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     // Reported through Apple's rule rather than as a bare count mismatch: the fork
@@ -199,7 +212,9 @@ fn a_next_catalog_id_behind_an_existing_cnid_is_reported() {
     let image = break_image("journal-with-files", "nextcnid", |img| {
         set_next_catalog_id(img, FRAGMENTED_CNID);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     let (next, highest) = report
@@ -219,7 +234,9 @@ fn a_file_with_no_thread_record_is_still_visited() {
     // data blocks would then be reported as orphaned -- a symptom, reported with
     // the wrong cause. Here the file is present, complete, and correctly accounted
     // for, which is the point: it must not be mistaken for damage.
-    let Some((report, _)) = check_image("journal-with-files") else { return };
+    let Some((report, _)) = check_image("journal-with-files") else {
+        return;
+    };
     assert!(
         report.orphaned.is_empty() && report.missing.is_empty(),
         "every file's blocks must be accounted for through the raw walk:\n  {}",
@@ -236,7 +253,9 @@ fn swapping_two_adjacent_keys_is_reported_as_out_of_order() {
     let image = break_image("journal-with-files", "keyorder", |img| {
         swap_two_records(img, RECORD_A, RECORD_B);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
     assert!(
         !report.key_order.is_empty(),
@@ -258,7 +277,9 @@ fn a_record_with_no_thread_record_is_reported() {
     let image = break_image("journal-with-files", "nothread", |img| {
         zero_thread_record(img, FRAGMENTED_CNID);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
     assert!(
         report.missing_thread.contains(&FRAGMENTED_CNID),
@@ -278,14 +299,20 @@ fn a_folder_whose_valence_disagrees_is_reported() {
     let image = break_image("journal-with-files", "valence", |img| {
         inflate_root_valence(img, 3);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
     let entry = report
         .valence
         .iter()
         .find(|(cnid, _, _)| *cnid == ROOT_CNID)
         .unwrap_or_else(|| panic!("a wrong valence must be reported, got {:?}", report));
-    assert_eq!(entry.1, expected_valence() + 3, "the inflated declared count");
+    assert_eq!(
+        entry.1,
+        expected_valence() + 3,
+        "the inflated declared count"
+    );
     assert_eq!(entry.2, expected_valence(), "the count actually implied");
 }
 
@@ -346,11 +373,16 @@ fn a_reachable_node_with_the_wrong_height_is_reported() {
         set_leaf_height(img, 1, 7, &mut set);
         assert!(set, "the catalog leaf node was not found");
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     assert!(
-        report.node_height.iter().any(|(tree, node)| *tree == 1 && *node == 1),
+        report
+            .node_height
+            .iter()
+            .any(|(tree, node)| *tree == 1 && *node == 1),
         "the catalog leaf's height must be reported, got {:?}",
         report.node_height
     );
@@ -364,7 +396,9 @@ fn an_index_record_pointing_nowhere_is_reported() {
     let image = break_image("journal-with-files", "child", |img| {
         make_dangling_child(img);
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
     assert!(
         !report.child_node.is_empty(),
@@ -382,21 +416,25 @@ fn a_node_nothing_points_at_that_is_not_erased_is_reported() {
         // Node 2 of the extents tree is unused, and the formatter zeroed it.
         // Writing into it makes it look edited rather than erased.
         let bs = block_size(img);
-        let extents_start =
-            u32::from_be_bytes([
-                img[VOLUME_HEADER_OFFSET + 112 + 80 + 16],
-                img[VOLUME_HEADER_OFFSET + 112 + 80 + 17],
-                img[VOLUME_HEADER_OFFSET + 112 + 80 + 18],
-                img[VOLUME_HEADER_OFFSET + 112 + 80 + 19],
-            ]);
+        let extents_start = u32::from_be_bytes([
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 16],
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 17],
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 18],
+            img[VOLUME_HEADER_OFFSET + 112 + 80 + 19],
+        ]);
         let at = (extents_start as usize + 2) * bs as usize;
         img[at] = 0xFF;
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     assert!(
-        report.unerased_node.iter().any(|(tree, node)| *tree == 2 && *node == 2),
+        report
+            .unerased_node
+            .iter()
+            .any(|(tree, node)| *tree == 2 && *node == 2),
         "the unerased extents-tree node must be reported, got {:?}",
         report.unerased_node
     );
@@ -437,10 +475,11 @@ fn a_tree_needing_the_short_key_form_is_reported_rather_than_walked() {
             img[attrs_at + 2],
             img[attrs_at + 3],
         ]);
-        img[attrs_at..attrs_at + 4]
-            .copy_from_slice(&(attrs & !K_BT_BIG_KEYS_MASK).to_be_bytes());
+        img[attrs_at..attrs_at + 4].copy_from_slice(&(attrs & !K_BT_BIG_KEYS_MASK).to_be_bytes());
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     assert_eq!(
@@ -478,10 +517,11 @@ fn clearing_the_bit_on_a_long_key_tree_is_not_the_same_thing() {
             img[attrs_at + 2],
             img[attrs_at + 3],
         ]);
-        img[attrs_at..attrs_at + 4]
-            .copy_from_slice(&(attrs & !K_BT_BIG_KEYS_MASK).to_be_bytes());
+        img[attrs_at..attrs_at + 4].copy_from_slice(&(attrs & !K_BT_BIG_KEYS_MASK).to_be_bytes());
     });
-    let Some((report, _)) = check_path(&image) else { panic!("in scope") };
+    let Some((report, _)) = check_path(&image) else {
+        panic!("in scope")
+    };
     let _ = std::fs::remove_file(&image);
 
     assert!(
@@ -831,12 +871,8 @@ fn free_fragmented_extent(img: &mut [u8]) {
         ]) as usize;
         let key_len = u16::from_be_bytes([img[base + at], img[base + at + 1]]) as usize;
         let body = base + at + 2 + key_len;
-        if u32::from_be_bytes([
-            img[body + 8],
-            img[body + 9],
-            img[body + 10],
-            img[body + 11],
-        ]) != FRAGMENTED_CNID
+        if u32::from_be_bytes([img[body + 8], img[body + 9], img[body + 10], img[body + 11]])
+            != FRAGMENTED_CNID
         {
             continue;
         }
@@ -1062,19 +1098,14 @@ fn file_record_offset(img: &[u8], cnid: u32) -> usize {
         ]) as usize;
         let key_len = u16::from_be_bytes([img[base + at], img[base + at + 1]]) as usize;
         let body = base + at + 2 + key_len;
-        if u32::from_be_bytes([
-            img[body + 8],
-            img[body + 9],
-            img[body + 10],
-            img[body + 11],
-        ]) == cnid
+        if u32::from_be_bytes([img[body + 8], img[body + 9], img[body + 10], img[body + 11]])
+            == cnid
         {
             return body;
         }
     }
     panic!("{cnid}: file record not found");
 }
-
 
 // --- Apple's two fork-size inequalities ----------------------------------
 
@@ -1099,7 +1130,10 @@ fn a_data_fork_longer_than_its_blocks_is_reported() {
         .unwrap_or_else(|| panic!("the oversized fork must be reported, got {:?}", report));
     let _ = finding;
     assert!(
-        report.describe().iter().any(|l| l.contains("cannot be sparse")),
+        report
+            .describe()
+            .iter()
+            .any(|l| l.contains("cannot be sparse")),
         "the reason must state the rule, not just the numbers: {:?}",
         report.describe()
     );
@@ -1117,9 +1151,10 @@ fn a_data_fork_claiming_more_blocks_than_its_extents_is_reported() {
         return;
     };
     assert!(
-        report.fork_rule.iter().any(|(cnid, reason)| {
-            *cnid == FRAGMENTED_CNID && reason.contains("E_PEOF")
-        }),
+        report
+            .fork_rule
+            .iter()
+            .any(|(cnid, reason)| { *cnid == FRAGMENTED_CNID && reason.contains("E_PEOF") }),
         "the overstated fork must be reported, got {:?}",
         report
     );
@@ -1147,12 +1182,18 @@ fn a_fork_may_be_shorter_than_its_blocks() {
         )
         .expect("lookup")
         .expect("present");
-    let fork = fragmented.as_file().expect("a file record").record.data_fork;
+    let fork = fragmented
+        .as_file()
+        .expect("a file record")
+        .record
+        .data_fork;
 
     let mut short = fork;
     short.logical_size = fork.logical_size - 1;
     assert!(
-        short.validate(u64::from(short.total_blocks), vol.header().block_size).is_ok(),
+        short
+            .validate(u64::from(short.total_blocks), vol.header().block_size)
+            .is_ok(),
         "a fork one byte shorter than its blocks is ordinary"
     );
 
@@ -1160,7 +1201,8 @@ fn a_fork_may_be_shorter_than_its_blocks() {
     let mut long = fork;
     long.logical_size = fork.logical_size + 1;
     assert!(
-        long.validate(u64::from(long.total_blocks), vol.header().block_size).is_err(),
+        long.validate(u64::from(long.total_blocks), vol.header().block_size)
+            .is_err(),
         "one byte beyond the blocks is a corrupt record"
     );
 }
@@ -1191,7 +1233,14 @@ fn a_finding_names_the_apple_rule_it_enforces() {
     // Every code above is one this project either reports or has checked
     // against. Recorded here so that adding a check without a code, or renaming
     // one, is a visible omission rather than a silent one.
-    let implemented = ["E_LEOF", "E_PEOF", "E_DirVal", "E_NHeight", "E_KeyOrd", "E_UnusedNodeNotZeroed"];
+    let implemented = [
+        "E_LEOF",
+        "E_PEOF",
+        "E_DirVal",
+        "E_NHeight",
+        "E_KeyOrd",
+        "E_UnusedNodeNotZeroed",
+    ];
     for code in implemented {
         assert!(
             CODES.iter().any(|(c, _)| *c == code),

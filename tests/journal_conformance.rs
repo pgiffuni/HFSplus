@@ -54,11 +54,19 @@ fn open(name: &str) -> Option<(FileDevice, VolumeHeader)> {
 #[test]
 fn journaled_volumes_declare_a_journal_and_the_info_block_agrees() {
     for name in journaled() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
 
         // The attribute bit is what makes journalInfoBlock meaningful at all.
-        assert!(vh.is_journaled(), "{name}: kHFSVolumeJournaledBit must be set");
-        assert_ne!(vh.journal_info_block, 0, "{name}: journalInfoBlock must be set");
+        assert!(
+            vh.is_journaled(),
+            "{name}: kHFSVolumeJournaledBit must be set"
+        );
+        assert_ne!(
+            vh.journal_info_block, 0,
+            "{name}: journalInfoBlock must be set"
+        );
         assert!(
             vh.journal_info_block < vh.total_blocks,
             "{name}: journalInfoBlock {} is outside the volume",
@@ -82,7 +90,8 @@ fn journaled_volumes_declare_a_journal_and_the_info_block_agrees() {
         // in whole blocks, and an unaligned offset would make every transaction
         // read land mid-block.
         assert_eq!(
-            journal.info().offset % block_size, 0,
+            journal.info().offset % block_size,
+            0,
             "{name}: journal offset {} is not a multiple of the {block_size}-byte block size",
             journal.info().offset
         );
@@ -90,7 +99,8 @@ fn journaled_volumes_declare_a_journal_and_the_info_block_agrees() {
         // And its size must match the `.journal` file's data fork, which is an
         // independent record of the same thing.
         assert_eq!(
-            journal.info().size, 524_288,
+            journal.info().size,
+            524_288,
             "{name}: hfsprogs sizes the journal in 512 kB"
         );
         assert!(
@@ -103,7 +113,9 @@ fn journaled_volumes_declare_a_journal_and_the_info_block_agrees() {
 #[test]
 fn a_fresh_journal_is_uninitialised_and_has_nothing_to_replay() {
     for name in journaled() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
         let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
             .expect("journal open")
             .expect("journal");
@@ -114,7 +126,10 @@ fn a_fresh_journal_is_uninitialised_and_has_nothing_to_replay() {
         );
         // No header has been written, so there is nothing to parse and nothing to
         // replay. This is a normal state, not an error.
-        assert!(journal.header().is_none(), "{name}: an uninitialised journal has no header");
+        assert!(
+            journal.header().is_none(),
+            "{name}: an uninitialised journal has no header"
+        );
         assert!(
             journal.transactions().is_empty(),
             "{name}: an uninitialised journal has no transactions"
@@ -142,7 +157,10 @@ fn the_journal_files_are_catalog_objects() {
             .read_dir(hfsplus::catalog::ROOT_FOLDER_ID)
             .expect("read_dir root");
         let names: Vec<String> = entries.iter().map(|e| e.name_string()).collect();
-        assert!(names.iter().any(|n| n == ".journal"), "{name}: saw {names:?}");
+        assert!(
+            names.iter().any(|n| n == ".journal"),
+            "{name}: saw {names:?}"
+        );
         assert!(
             names.iter().any(|n| n == ".journal_info_block"),
             "{name}: saw {names:?}"
@@ -164,7 +182,9 @@ fn the_journal_files_are_catalog_objects() {
 #[test]
 fn non_journaled_volumes_have_no_journal() {
     for name in non_journaled() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
         assert!(!vh.is_journaled(), "{name}: must not be journaled");
         // journalInfoBlock overlaps spare space on a non-journaled volume, so its
         // value is meaningless and must not be consulted.
@@ -239,7 +259,9 @@ fn the_corpus_cannot_exercise_transaction_replay() {
     // real one.
     let mut total_transactions = 0u32;
     for name in journaled() {
-        let Some((dev, vh)) = open(name) else { continue };
+        let Some((dev, vh)) = open(name) else {
+            continue;
+        };
         if let Ok(Some(j)) = Journal::open(&dev, vh.journal_info_block, vh.block_size) {
             total_transactions += j.transactions().len() as u32;
         }
@@ -359,7 +381,10 @@ fn a_journal_on_another_device_is_declined_rather_than_missed() {
 
     // The header still says journaled: this is a journaled volume whose journal
     // lives elsewhere, not a volume with no journal.
-    assert!(vol.is_journaled(), "the header still has kHFSVolumeJournaledBit");
+    assert!(
+        vol.is_journaled(),
+        "the header still has kHFSVolumeJournaledBit"
+    );
 
     // No journal to replay, and that is not an error.
     assert!(
@@ -374,9 +399,18 @@ fn a_journal_on_another_device_is_declined_rather_than_missed() {
         .expect("the journal must be reported as external");
     let flags = info.flag_set();
     assert!(!flags.in_filesystem(), "kJIJournalInFSMask must be clear");
-    assert!(flags.on_other_device(), "kJIJournalOnOtherDeviceMask must be set");
-    assert_eq!(info.offset, 0, "offset means nothing for a journal that is not here");
-    assert_eq!(info.size, 524288, "size still describes the journal, and Apple uses it");
+    assert!(
+        flags.on_other_device(),
+        "kJIJournalOnOtherDeviceMask must be set"
+    );
+    assert_eq!(
+        info.offset, 0,
+        "offset means nothing for a journal that is not here"
+    );
+    assert_eq!(
+        info.size, 524288,
+        "size still describes the journal, and Apple uses it"
+    );
 
     // And the volume reads normally: a journal elsewhere changes nothing about
     // what is on this filesystem.
@@ -440,7 +474,10 @@ fn the_independent_checker_accepts_the_external_journal_image() {
     let after = std::fs::read(&probe).expect("read the probe back");
     let _ = std::fs::remove_file(&probe);
 
-    assert!(text.contains("appears to be OK"), "expected a sound volume:\n{text}");
+    assert!(
+        text.contains("appears to be OK"),
+        "expected a sound volume:\n{text}"
+    );
     assert_eq!(
         digest(&std::fs::read(&path).expect("read the original")),
         digest(&after),
@@ -506,7 +543,10 @@ fn a_legacy_journal_header_is_replayed_without_a_checksum_check() {
 
     // The header is the old one, and is otherwise intact.
     let header = journal.header().expect("a header was read");
-    assert_eq!(header.magic, hfsplus::journal::info::OLD_JOURNAL_HEADER_MAGIC);
+    assert_eq!(
+        header.magic,
+        hfsplus::journal::info::OLD_JOURNAL_HEADER_MAGIC
+    );
     assert_eq!(header.start, 4096, "the transaction geometry is unchanged");
     assert_eq!(header.end, 12288);
     assert_eq!(header.sequence_num, 1);
@@ -541,7 +581,11 @@ fn the_current_magic_still_has_its_checksum_checked() {
     let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
         .expect("journal open")
         .expect("a written journal");
-    assert_eq!(journal.header_checksum_ok(), Some(true), "the fixture is sound");
+    assert_eq!(
+        journal.header_checksum_ok(),
+        Some(true),
+        "the fixture is sound"
+    );
 }
 
 #[test]
@@ -591,7 +635,9 @@ fn a_block_list_header_size_too_small_to_hold_one_is_refused() {
         jhdr_size: 4096,
         sequence_num: 1,
     };
-    let err = header.validate(524288).expect_err("four bytes cannot hold a header");
+    let err = header
+        .validate(524288)
+        .expect_err("four bytes cannot hold a header");
     let text = err.to_string();
     assert!(
         text.contains("blhdr_size"),
@@ -656,7 +702,10 @@ fn a_journal_header_pointing_at_its_own_header_is_refused() {
         jhdr_size: 4096,
         sequence_num: 1,
     };
-    assert!(sound.validate(524288).is_ok(), "a sound header must validate");
+    assert!(
+        sound.validate(524288).is_ok(),
+        "a sound header must validate"
+    );
 }
 
 /// The milestone's own acceptance criteria, run over every journaled image.
@@ -685,13 +734,17 @@ fn the_milestone_criteria_hold_for_every_journaled_image() {
     let mut names: Vec<String> = Vec::new();
     for dir in ["generated", "replayed"] {
         let path = common::repo_root().join("tests/images").join(dir);
-        let Ok(entries) = std::fs::read_dir(&path) else { continue };
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let p = entry.path();
             if p.extension().and_then(|e| e.to_str()) != Some("img") {
                 continue;
             }
-            let Some(name) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(name) = p.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             if name.starts_with("journal") {
                 names.push(format!("{dir}/{name}"));
             }
@@ -729,8 +782,7 @@ fn the_milestone_criteria_hold_for_every_journaled_image() {
             }
             // And through the overlaid device, which is the view a mount sees.
             if let Ok(vh) = VolumeHeader::read_from(&dev) {
-                if let Ok(Some(journal)) =
-                    Journal::open(&dev, vh.journal_info_block, vh.block_size)
+                if let Ok(Some(journal)) = Journal::open(&dev, vh.journal_info_block, vh.block_size)
                 {
                     let _ = journal.read_bytes(0, 4096);
                 }
@@ -739,8 +791,7 @@ fn the_milestone_criteria_hold_for_every_journaled_image() {
 
         let after = digest(&std::fs::read(&path).expect("read the source back"));
         assert_eq!(
-            before,
-            after,
+            before, after,
             "{entry}: reading the image modified the source"
         );
 
@@ -762,8 +813,7 @@ fn the_milestone_criteria_hold_for_every_journaled_image() {
                 "{entry}: the checker rejected a sound image:\n{text}"
             );
             assert_eq!(
-                before,
-                probe_after,
+                before, probe_after,
                 "{entry}: the checker modified its copy, so it repaired something:\n{text}"
             );
         }
@@ -803,8 +853,8 @@ fn a_journal_is_clean_exactly_when_start_equals_end() {
         }
         let dev = FileDevice::open(&path).expect("open");
         let vh = VolumeHeader::read_from(&dev).expect("header");
-        let journal = Journal::open(&dev, vh.journal_info_block, vh.block_size)
-            .expect("journal open")?;
+        let journal =
+            Journal::open(&dev, vh.journal_info_block, vh.block_size).expect("journal open")?;
         Some(Report {
             clean: journal.is_clean(),
             uninitialised: journal.is_uninitialized(),
@@ -824,7 +874,10 @@ fn a_journal_is_clean_exactly_when_start_equals_end() {
         let (start, end) = r.bounds.expect("a written journal has a header");
         assert_ne!(start, end, "this journal has a transaction");
         assert!(!r.clean, "so it must not be clean");
-        assert!(!r.uninitialised, "and it is not merely uninitialised either");
+        assert!(
+            !r.uninitialised,
+            "and it is not merely uninitialised either"
+        );
     }
 
     // And the predicate is exactly the equality, not a heuristic: a header whose

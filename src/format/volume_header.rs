@@ -156,7 +156,6 @@ pub const K_HFS_ROOT_PARENT_ID: u32 = 1;
 /// `vcb->vcbVN` to obtain the volume name.
 pub const K_HFS_ROOT_FOLDER_ID: u32 = 2;
 
-
 /// Which HFS family a volume belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FileSystemKind {
@@ -528,10 +527,7 @@ impl VolumeHeader {
         if self.block_size < 512 || !self.block_size.is_power_of_two() {
             return Err(Error::invalid(
                 "volume_header.blockSize",
-                format!(
-                    "{} must be >= 512 and a power of two",
-                    self.block_size
-                ),
+                format!("{} must be >= 512 and a power of two", self.block_size),
             ));
         }
         // A journaled volume must say where its journal info block is, and the
@@ -599,7 +595,6 @@ impl VolumeHeader {
         }
         Ok((total_sectors - 2) * crate::blockdev::SECTOR_SIZE)
     }
-
 
     /// Serialise back to the on-disk 512-byte layout.
     ///
@@ -701,9 +696,18 @@ mod tests {
 
     #[test]
     fn signature_classification() {
-        assert_eq!(FileSystemKind::from_signature(0x482B).unwrap(), FileSystemKind::HfsPlus);
-        assert_eq!(FileSystemKind::from_signature(0x4858).unwrap(), FileSystemKind::HfsX);
-        assert_eq!(FileSystemKind::from_signature(0x4244).unwrap(), FileSystemKind::ClassicHfs);
+        assert_eq!(
+            FileSystemKind::from_signature(0x482B).unwrap(),
+            FileSystemKind::HfsPlus
+        );
+        assert_eq!(
+            FileSystemKind::from_signature(0x4858).unwrap(),
+            FileSystemKind::HfsX
+        );
+        assert_eq!(
+            FileSystemKind::from_signature(0x4244).unwrap(),
+            FileSystemKind::ClassicHfs
+        );
         assert!(matches!(
             FileSystemKind::from_signature(0x0000),
             Err(Error::BadSignature { found: 0x0000 })
@@ -743,20 +747,35 @@ mod tests {
     fn rejects_hfsplus_signature_with_hfsx_version() {
         // Apple's validation pairs signature with version; a mismatch is corrupt.
         let h = synthetic_header(K_HFS_PLUS_SIG_WORD, K_HFSX_VERSION, 4096);
-        assert!(matches!(h.validate(), Err(Error::BadVersion { found: 5, expected: 4 })));
+        assert!(matches!(
+            h.validate(),
+            Err(Error::BadVersion {
+                found: 5,
+                expected: 4
+            })
+        ));
     }
 
     #[test]
     fn rejects_hfsx_signature_with_hfsplus_version() {
         let h = synthetic_header(K_HFSX_SIG_WORD, K_HFS_PLUS_VERSION, 4096);
-        assert!(matches!(h.validate(), Err(Error::BadVersion { found: 4, expected: 5 })));
+        assert!(matches!(
+            h.validate(),
+            Err(Error::BadVersion {
+                found: 4,
+                expected: 5
+            })
+        ));
     }
 
     #[test]
     fn rejects_classic_hfs_signature() {
         // Classic HFS is a real signature but not an HFS+ volume header.
         let h = synthetic_header(K_HFS_SIG_WORD, 0, 512);
-        assert!(matches!(h.validate(), Err(Error::BadSignature { found: 0x4244 })));
+        assert!(matches!(
+            h.validate(),
+            Err(Error::BadSignature { found: 0x4244 })
+        ));
     }
 
     #[test]
@@ -838,7 +857,10 @@ mod tests {
         assert_eq!(432 + FORK_DATA_SIZE, VOLUME_HEADER_SIZE);
         // And nothing overlaps finderInfo.
         assert_eq!(FORK_OFFSETS[0].1, 80 + 32);
-        assert_eq!(ForkData::from_bytes(&bytes[112..192]).unwrap(), h.allocation_file);
+        assert_eq!(
+            ForkData::from_bytes(&bytes[112..192]).unwrap(),
+            h.allocation_file
+        );
     }
 
     #[test]

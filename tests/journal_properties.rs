@@ -192,7 +192,11 @@ fn wrapping_lands_in_the_ring_for_every_offset_the_walk_can_produce() {
     // And an offset inside the ring is untouched, which is the other half: a wrap
     // that fired early would corrupt every ordinary read.
     for offset in [jhdr, jhdr + 1, size / 2, size - 1] {
-        assert_eq!(wrap(offset, size, jhdr), offset, "offset {offset} must not move");
+        assert_eq!(
+            wrap(offset, size, jhdr),
+            offset,
+            "offset {offset} must not move"
+        );
     }
 }
 
@@ -203,16 +207,14 @@ fn wrapping_a_single_read_yields_the_two_halves_read_separately() {
     // the tail and the head.
     // A journal *with* a written header: `journaled-hfsplus` has none, and
     // `jhdr_size` is read from it.
-    let path = common::repo_root()
-        .join("tests/images/replayed/journal-replay-be.img");
+    let path = common::repo_root().join("tests/images/replayed/journal-replay-be.img");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
     let bytes = std::fs::read(&path).expect("read");
     let device = MemoryDevice::new(bytes);
-    let header = hfsplus::format::volume_header::VolumeHeader::read_from(&device)
-        .expect("header");
+    let header = hfsplus::format::volume_header::VolumeHeader::read_from(&device).expect("header");
     let journal =
         hfsplus::journal::Journal::open(&device, header.journal_info_block, header.block_size)
             .expect("journal open")
@@ -245,7 +247,11 @@ fn wrapping_a_single_read_yields_the_two_halves_read_separately() {
             .expect("the head half on its own");
         let whole = journal.read_bytes(start, len).expect("a wrapping read");
 
-        assert_eq!(whole.len(), len, "a wrapping read must return what was asked for");
+        assert_eq!(
+            whole.len(),
+            len,
+            "a wrapping read must return what was asked for"
+        );
         assert_eq!(
             whole,
             [head_half, wrapped_head].concat(),
@@ -267,8 +273,7 @@ fn a_read_beyond_two_laps_still_lands_in_the_image() {
     }
     let bytes = std::fs::read(&path).expect("read");
     let device = MemoryDevice::new(bytes);
-    let header = hfsplus::format::volume_header::VolumeHeader::read_from(&device)
-        .expect("header");
+    let header = hfsplus::format::volume_header::VolumeHeader::read_from(&device).expect("header");
     let journal =
         hfsplus::journal::Journal::open(&device, header.journal_info_block, header.block_size)
             .expect("journal open")
@@ -279,7 +284,10 @@ fn a_read_beyond_two_laps_still_lands_in_the_image() {
         // Whatever it returns, it must be an error or a bounded read -- never a
         // request the device cannot satisfy, and never a panic.
         if let Ok(bytes) = journal.read_bytes(offset, 4096) {
-            assert!(bytes.len() <= 4096, "a read returned more than was asked for");
+            assert!(
+                bytes.len() <= 4096,
+                "a read returned more than was asked for"
+            );
         }
     }
 }

@@ -56,7 +56,9 @@ fn open_image(name: &str) -> Option<Open> {
 #[test]
 fn every_corpus_btree_opens_and_validates() {
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
 
         for (label, fork) in [
             ("catalog", vh.catalog_file),
@@ -74,7 +76,11 @@ fn every_corpus_btree_opens_and_validates() {
 
             // Apple core/BTree.c BTOpenPath: an HFS+ tree must not use 512-byte
             // nodes, and the size must be one of seven fixed values.
-            assert_ne!(bt.node_size(), 512, "{name}: {label} must not use 512-byte nodes");
+            assert_ne!(
+                bt.node_size(),
+                512,
+                "{name}: {label} must not use 512-byte nodes"
+            );
             assert!(
                 matches!(bt.node_size(), 1024 | 2048 | 4096 | 8192 | 16384 | 32768),
                 "{name}: {label} node size {} is not one of the seven legal values",
@@ -88,7 +94,9 @@ fn every_corpus_btree_opens_and_validates() {
 fn node_sizes_are_consistent_across_a_volumes_three_trees() {
     // A volume is formatted with one B-tree node size for all three trees.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let size_of = |f: &ForkData| {
             BTreeFile::open(&dev, f, vh.block_size, true)
                 .unwrap_or_else(|e| panic!("{name}: open: {e}"))
@@ -127,7 +135,9 @@ fn every_btree_node_fits_inside_its_fork() {
     // size; this re-checks it from the mapper's side so an off-by-one in either
     // would show up.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         for (label, fork) in [
             ("catalog", vh.catalog_file),
             ("extents", vh.extents_file),
@@ -158,7 +168,9 @@ fn the_catalog_root_is_reachable_from_every_leaf() {
     // reach lastLeafNode. This is the structural invariant a corrupted link
     // would break, and it exercises the extent mapper across many nodes.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true)
             .unwrap_or_else(|e| panic!("{name}: catalog: {e}"));
 
@@ -171,14 +183,23 @@ fn the_catalog_root_is_reachable_from_every_leaf() {
                 .read_node_bytes(node)
                 .unwrap_or_else(|e| panic!("{name}: leaf {node}: {e}"));
             let n = bt.parse_node(&bytes).unwrap();
-            assert_eq!(n.kind(), NodeKind::Leaf, "{name}: node {node} should be a leaf");
+            assert_eq!(
+                n.kind(),
+                NodeKind::Leaf,
+                "{name}: node {node} should be a leaf"
+            );
             assert!(n.num_records() > 0, "{name}: leaf {node} has no records");
 
             if node == header.last_leaf_node {
                 break;
             }
             let next = n.descriptor().f_link;
-            assert_eq!(next, node + 1, "{name}: leaf {node} fLink should be {}", node + 1);
+            assert_eq!(
+                next,
+                node + 1,
+                "{name}: leaf {node} fLink should be {}",
+                node + 1
+            );
             node = next;
             count += 1;
             assert!(count <= limit, "{name}: leaf chain did not terminate");
@@ -196,7 +217,9 @@ fn catalog_leaf_keys_decode_as_catalog_keys() {
     // with buildkey() (and the thread records with buildthread()), all of which
     // emit an HFSPlusCatalogKey.
     for (name, is_hfsx) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true)
             .unwrap_or_else(|e| panic!("{name}: catalog: {e}"));
 
@@ -236,7 +259,8 @@ fn catalog_leaf_keys_decode_as_catalog_keys() {
         );
         // The header's leafRecords must agree with what we walked.
         assert_eq!(
-            records as u32, bt.header().leaf_records,
+            records as u32,
+            bt.header().leaf_records,
             "{name}: walked {records} records but the header says {}",
             bt.header().leaf_records
         );
@@ -253,7 +277,9 @@ fn the_root_folder_record_carries_the_volume_name() {
     // cat_idlookup(hfsmp, kHFSRootFolderID, ...) and copies cd_nameptr into
     // vcb->vcbVN.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true)
             .unwrap_or_else(|e| panic!("{name}: catalog: {e}"));
         let case_sensitive = bt.is_case_sensitive();
@@ -302,7 +328,9 @@ fn catalog_keys_sort_ascending_within_a_leaf() {
     // enough to catch offset desynchronisation here, and is independent of the
     // case-folding rule.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true)
             .unwrap_or_else(|e| panic!("{name}: catalog: {e}"));
         let case_sensitive = bt.is_case_sensitive();
@@ -339,7 +367,9 @@ fn extents_and_attributes_trees_agree_with_the_volume_header() {
     // bthp->keyCompareType = kHFSBinaryCompare for the attributes tree, while
     // the catalog tree uses kHFSCaseFolding.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
 
         let cat = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true).unwrap();
         let attr = BTreeFile::open(&dev, &vh.attributes_file, vh.block_size, true).unwrap();
@@ -354,7 +384,10 @@ fn extents_and_attributes_trees_agree_with_the_volume_header() {
             let h = bt.header();
             assert!(h.free_nodes < h.total_nodes, "{name}: {label} freeNodes");
             assert!(h.root_node < h.total_nodes, "{name}: {label} rootNode");
-            assert!(h.first_leaf_node < h.total_nodes, "{name}: {label} firstLeaf");
+            assert!(
+                h.first_leaf_node < h.total_nodes,
+                "{name}: {label} firstLeaf"
+            );
             assert!(h.last_leaf_node < h.total_nodes, "{name}: {label} lastLeaf");
             // An empty tree has depth 0: there is no root, only the header and
             // map nodes. Apple's BTGetInformation reports this faithfully, so a
@@ -374,11 +407,14 @@ fn the_extents_tree_is_empty_on_a_fresh_volume() {
     // extents, so the extents B-tree has no leaf records. This also confirms
     // that an empty tree is not confused with a broken one.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let ext = BTreeFile::open(&dev, &vh.extents_file, vh.block_size, true)
             .unwrap_or_else(|e| panic!("{name}: extents: {e}"));
         assert_eq!(
-            ext.header().leaf_records, 0,
+            ext.header().leaf_records,
+            0,
             "{name}: a fresh volume should have no overflow extents"
         );
 
@@ -438,7 +474,9 @@ fn the_corpus_confirms_every_declared_key_length() {
     let mut attributes_seen = 0;
 
     for (name, hfs_plus) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
 
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, hfs_plus)
             .unwrap_or_else(|e| panic!("{name}: catalog tree: {e}"));
@@ -476,7 +514,10 @@ fn the_corpus_confirms_every_declared_key_length() {
 
     assert!(catalog_seen > 0, "no catalog tree to check");
     assert!(extents_seen > 0, "no volume had an extents file to check");
-    assert!(attributes_seen > 0, "no volume had an attributes file to check");
+    assert!(
+        attributes_seen > 0,
+        "no volume had an attributes file to check"
+    );
 }
 
 #[test]
@@ -488,14 +529,18 @@ fn the_corpus_confirms_the_catalog_record_sizes_by_measurement() {
     //
     // A record runs from its key to the next key, so its length is the span minus
     // the key. The last record's end is the node's `freeSpaceOffset`.
-    use hfsplus::catalog::record::{FILE_RECORD_SIZE, FOLDER_RECORD_SIZE, THREAD_RECORD_FIXED_SIZE};
+    use hfsplus::catalog::record::{
+        FILE_RECORD_SIZE, FOLDER_RECORD_SIZE, THREAD_RECORD_FIXED_SIZE,
+    };
 
     let mut folder_seen = 0usize;
     let mut file_seen = 0usize;
     let mut thread_seen = 0usize;
 
     for (name, hfs_plus) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, hfs_plus)
             .unwrap_or_else(|e| panic!("{name}: catalog tree: {e}"));
         let node_size = bt.node_size();
@@ -514,10 +559,12 @@ fn the_corpus_confirms_the_catalog_record_sizes_by_measurement() {
             }
             let count = node.num_records() as usize;
             let offsets: Vec<usize> = (0..count)
-                .map(|i| u16::from_be_bytes([
-                    bytes[node_size - 2 * (i + 1)],
-                    bytes[node_size - 2 * (i + 1) + 1],
-                ]) as usize)
+                .map(|i| {
+                    u16::from_be_bytes([
+                        bytes[node_size - 2 * (i + 1)],
+                        bytes[node_size - 2 * (i + 1) + 1],
+                    ]) as usize
+                })
                 .collect();
 
             // The last record's end is not derivable from the node: a leaf has no
@@ -575,12 +622,15 @@ fn a_header_record_is_still_recoverable_from_a_btree_node() {
     // BTreeHeader::from_node reads at offset 14, exactly as Apple's
     // hfs_btreeio.c GetBTreeBlock does. Confirm against a real header node.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true).unwrap();
         let bytes = bt.read_node_bytes(0).unwrap();
         let from_node = BTreeHeader::from_node(&bytes).unwrap();
         assert_eq!(
-            from_node, *bt.header(),
+            from_node,
+            *bt.header(),
             "{name}: header parsed from the node must equal the one used to open it"
         );
         // Node 0 is always the header node.
@@ -596,7 +646,9 @@ fn the_whole_leaf_chain_maps_through_the_extent_mapper() {
     // offset increases by exactly one node size. This catches a mapper that
     // silently collapses two nodes onto one block.
     for (name, _) in trees() {
-        let Some(Open { dev, vh }) = open_image(name) else { continue };
+        let Some(Open { dev, vh }) = open_image(name) else {
+            continue;
+        };
         let bt = BTreeFile::open(&dev, &vh.catalog_file, vh.block_size, true).unwrap();
         let header = bt.header();
 
@@ -609,4 +661,3 @@ fn the_whole_leaf_chain_maps_through_the_extent_mapper() {
         );
     }
 }
-

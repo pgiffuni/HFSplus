@@ -169,8 +169,7 @@ impl Comparator {
 ///   different names on systems with different folding rules.
 /// - **There is no normalisation.** Composed and decomposed spellings are
 ///   different names.
-pub const FOLDED_BLOCKS: &str =
-    "U+0100-U+01FF, U+0300-U+03FF, U+0400-U+04FF, U+0500-U+05FF, \
+pub const FOLDED_BLOCKS: &str = "U+0100-U+01FF, U+0300-U+03FF, U+0400-U+04FF, U+0500-U+05FF, \
      U+1000-U+10FF, U+2000-U+20FF, U+2100-U+21FF, U+FE00-U+FEFF, U+FF00-U+FFFF";
 
 /// The sixteen code units that HFS+ case folding skips.
@@ -297,7 +296,11 @@ pub fn fast_unicode_compare(a: &[u16], b: &[u16]) -> Ordering {
         match (next_valid(a, &mut i), next_valid(b, &mut j)) {
             (Some(x), Some(y)) => {
                 if x != y {
-                    return if x < y { Ordering::Less } else { Ordering::Greater };
+                    return if x < y {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    };
                 }
             }
             (None, None) => return Ordering::Equal,
@@ -344,19 +347,40 @@ mod tests {
     #[test]
     fn folding_comparator_ignores_case() {
         let c = Comparator::CaseFolding;
-        assert_eq!(c.compare(&units("TestVol"), &units("TestVol")), Ordering::Equal);
-        assert_eq!(c.compare(&units("TestVol"), &units("testvol")), Ordering::Equal);
-        assert_eq!(c.compare(&units("TESTVOL"), &units("testvol")), Ordering::Equal);
-        assert_eq!(c.compare(&units("ReadMe"), &units("readme")), Ordering::Equal);
+        assert_eq!(
+            c.compare(&units("TestVol"), &units("TestVol")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            c.compare(&units("TestVol"), &units("testvol")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            c.compare(&units("TESTVOL"), &units("testvol")),
+            Ordering::Equal
+        );
+        assert_eq!(
+            c.compare(&units("ReadMe"), &units("readme")),
+            Ordering::Equal
+        );
     }
 
     #[test]
     fn binary_comparator_preserves_case() {
         let c = Comparator::Binary;
         // Code unit order: 'T' (0x54) sorts before 't' (0x74).
-        assert_eq!(c.compare(&units("TestVol"), &units("testvol")), Ordering::Less);
-        assert_eq!(c.compare(&units("testvol"), &units("TestVol")), Ordering::Greater);
-        assert_eq!(c.compare(&units("TestVol"), &units("TestVol")), Ordering::Equal);
+        assert_eq!(
+            c.compare(&units("TestVol"), &units("testvol")),
+            Ordering::Less
+        );
+        assert_eq!(
+            c.compare(&units("testvol"), &units("TestVol")),
+            Ordering::Greater
+        );
+        assert_eq!(
+            c.compare(&units("TestVol"), &units("TestVol")),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -433,7 +457,10 @@ mod tests {
             Ordering::Equal,
             "binary comparison must see the extra code unit"
         );
-        assert_eq!(unicode_binary_compare(&with_zero_width, &with_zero_width), Ordering::Equal);
+        assert_eq!(
+            unicode_binary_compare(&with_zero_width, &with_zero_width),
+            Ordering::Equal
+        );
     }
 
     #[test]
@@ -456,17 +483,29 @@ mod tests {
     #[test]
     fn ordering_is_lexicographic_not_length_first() {
         // "ab" vs "abc": the shorter is less even though "b" > "c" is false.
-        assert_eq!(unicode_binary_compare(&units("ab"), &units("abc")), Ordering::Less);
+        assert_eq!(
+            unicode_binary_compare(&units("ab"), &units("abc")),
+            Ordering::Less
+        );
         // A difference in the shared prefix wins over the length difference.
-        assert_eq!(unicode_binary_compare(&units("az"), &units("ba")), Ordering::Less);
-        assert_eq!(unicode_binary_compare(&units("b"), &units("ab")), Ordering::Greater);
+        assert_eq!(
+            unicode_binary_compare(&units("az"), &units("ba")),
+            Ordering::Less
+        );
+        assert_eq!(
+            unicode_binary_compare(&units("b"), &units("ab")),
+            Ordering::Greater
+        );
     }
 
     #[test]
     fn folding_compares_lexicographically_after_folding() {
         let c = Comparator::CaseFolding;
         assert_eq!(c.compare(&units("apple"), &units("apples")), Ordering::Less);
-        assert_eq!(c.compare(&units("apples"), &units("apple")), Ordering::Greater);
+        assert_eq!(
+            c.compare(&units("apples"), &units("apple")),
+            Ordering::Greater
+        );
         assert_eq!(c.compare(&units("az"), &units("ba")), Ordering::Less);
     }
 
@@ -500,7 +539,7 @@ mod tests {
         // most surprises people coming from Unicode expectations.
         for upper in [
             0x00C0u16, 0x00C1, 0x00C9, 0x00D1, 0x00DD, // A-grave, A-acute, E-grave,
-            0x00DC, 0x00C7, 0x00D1, 0x00DA, 0x00DB,     // N-tilde, C-cedilla, U-ring, U-diaeresis
+            0x00DC, 0x00C7, 0x00D1, 0x00DA, 0x00DB, // N-tilde, C-cedilla, U-ring, U-diaeresis
         ] {
             assert_eq!(fold(upper), Some(upper), "U+{upper:04X} must be identity");
         }
@@ -516,7 +555,10 @@ mod tests {
         // Every ignorable character lives in the two-level table, not in
         // gLatinCaseFold. Asserted because it is the reason the Latin fast path
         // can `break` out of its loop without checking for a zero result.
-        assert_eq!(G_LATIN_CASE_FOLD[0], 0xFFFF, "the sentinel mapping of U+0000");
+        assert_eq!(
+            G_LATIN_CASE_FOLD[0], 0xFFFF,
+            "the sentinel mapping of U+0000"
+        );
         for (i, v) in G_LATIN_CASE_FOLD.iter().enumerate().skip(1) {
             assert_ne!(*v, 0, "U+{i:04X} must not fold to the ignore sentinel");
         }
@@ -577,7 +619,10 @@ mod tests {
         // specific example: U+E000 (private use) vs U+10000 (surrogate pair).
         let bmp = [0xE000u16];
         let supplementary = [0xD800u16, 0xDC00];
-        assert_eq!(unicode_binary_compare(&bmp, &supplementary), Ordering::Greater);
+        assert_eq!(
+            unicode_binary_compare(&bmp, &supplementary),
+            Ordering::Greater
+        );
         assert_eq!(
             unicode_binary_compare(&supplementary, &bmp),
             Ordering::Less,
@@ -623,9 +668,27 @@ mod tests {
         // Whatever the comparator, a name must equal itself. A wrong table entry
         // breaks this, which is why it is worth sweeping a range.
         let names = [
-            "a", "A", "z", "Z", "0", "9", " ", "-", "~", "_", ".", "cafe", "café",
-            "cafe\u{301}", "\u{00c0}", "\u{00e0}", "\u{0178}", "\u{00ff}",
-            "\u{1d400}", "\u{65e5}\u{672c}", "\u{0301}",
+            "a",
+            "A",
+            "z",
+            "Z",
+            "0",
+            "9",
+            " ",
+            "-",
+            "~",
+            "_",
+            ".",
+            "cafe",
+            "café",
+            "cafe\u{301}",
+            "\u{00c0}",
+            "\u{00e0}",
+            "\u{0178}",
+            "\u{00ff}",
+            "\u{1d400}",
+            "\u{65e5}\u{672c}",
+            "\u{0301}",
         ];
         for c in [Comparator::CaseFolding, Comparator::Binary] {
             for n in names {

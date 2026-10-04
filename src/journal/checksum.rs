@@ -67,12 +67,7 @@ pub fn verify_checksum(bytes: &[u8], at: usize, len: usize) -> Option<u32> {
     if bytes.len() < len || at + 4 > bytes.len() {
         return None;
     }
-    let stored = u32::from_be_bytes([
-        bytes[at],
-        bytes[at + 1],
-        bytes[at + 2],
-        bytes[at + 3],
-    ]);
+    let stored = u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
     let mut scratch = bytes[..len].to_vec();
     scratch[at..at + 4].fill(0);
     Some(stored) // caller compares against calc_checksum(&scratch)

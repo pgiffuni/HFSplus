@@ -82,7 +82,11 @@ enum Args {
 }
 
 fn parse_args() -> std::result::Result<Args, String> {
-    let mut opts = Options { json: false, verbose: false, btrees: false };
+    let mut opts = Options {
+        json: false,
+        verbose: false,
+        btrees: false,
+    };
     let mut paths = Vec::new();
     let it = std::env::args().skip(1);
     for arg in it {
@@ -93,9 +97,7 @@ fn parse_args() -> std::result::Result<Args, String> {
             // Asking for help is not a mistake, so it is reported as its own
             // case rather than folded in with "no arguments", which is an error.
             "--help" | "-h" => return Ok(Args::Help),
-            s if s.starts_with('-') && s.len() > 1 => {
-                return Err(format!("unknown option `{s}`"))
-            }
+            s if s.starts_with('-') && s.len() > 1 => return Err(format!("unknown option `{s}`")),
             s => paths.push(s.to_string()),
         }
     }
@@ -119,11 +121,7 @@ fn inspect(path: &str, opts: Options) -> Result<String> {
     inspect_device(&dev, path, opts)
 }
 
-fn inspect_device<D: BlockDevice + ?Sized>(
-    dev: &D,
-    path: &str,
-    opts: Options,
-) -> Result<String> {
+fn inspect_device<D: BlockDevice + ?Sized>(dev: &D, path: &str, opts: Options) -> Result<String> {
     let vh = VolumeHeader::read_from(dev)?;
     if opts.json {
         Ok(render_json(vh, path))
@@ -132,12 +130,20 @@ fn inspect_device<D: BlockDevice + ?Sized>(
     }
 }
 
-fn render_text(vh: VolumeHeader, dev: &(impl BlockDevice + ?Sized), path: &str, opts: Options) -> String {
+fn render_text(
+    vh: VolumeHeader,
+    dev: &(impl BlockDevice + ?Sized),
+    path: &str,
+    opts: Options,
+) -> String {
     let kind = vh.kind().unwrap_or(FileSystemKind::HfsPlus);
     let mut out = String::new();
 
     out.push_str(&format!("image:          {path}\n"));
-    out.push_str(&format!("device length:  {} bytes\n", dev.len().unwrap_or(0)));
+    out.push_str(&format!(
+        "device length:  {} bytes\n",
+        dev.len().unwrap_or(0)
+    ));
     out.push_str(&format!(
         "signature:      0x{:04x} ({})\n",
         vh.signature,
@@ -154,10 +160,7 @@ fn render_text(vh: VolumeHeader, dev: &(impl BlockDevice + ?Sized), path: &str, 
     // core/hfs_vfsutils.c (hfs_MountHFSPlusVolume) calls
     // cat_idlookup(kHFSRootFolderID) and copies cd_nameptr into vcb->vcbVN.
     out.push_str(&format!("root folder id: {}\n", vh.root_folder_id()));
-    out.push_str(&format!(
-        "block size:     {} bytes\n",
-        vh.block_size
-    ));
+    out.push_str(&format!("block size:     {} bytes\n", vh.block_size));
     out.push_str(&format!("total blocks:   {}\n", vh.total_blocks));
     out.push_str(&format!("free blocks:    {}\n", vh.free_blocks));
     match vh.volume_bytes() {
@@ -179,12 +182,32 @@ fn render_text(vh: VolumeHeader, dev: &(impl BlockDevice + ?Sized), path: &str, 
     out.push_str(&format!(
         "attributes:     0x{:08x}{}{}{}{}{}{}\n",
         vh.attributes,
-        if vh.is_clean() { " unmounted" } else { " DIRTY" },
+        if vh.is_clean() {
+            " unmounted"
+        } else {
+            " DIRTY"
+        },
         if vh.is_journaled() { " journaled" } else { "" },
-        if vh.has_expanded_times() { " expanded-times" } else { "" },
-        if vh.attribute_flags().has_content_protection() { " content-protection" } else { "" },
-        if vh.attribute_flags().is_software_locked() { " software-locked" } else { "" },
-        if vh.attribute_flags().is_inconsistent() { " inconsistent" } else { "" },
+        if vh.has_expanded_times() {
+            " expanded-times"
+        } else {
+            ""
+        },
+        if vh.attribute_flags().has_content_protection() {
+            " content-protection"
+        } else {
+            ""
+        },
+        if vh.attribute_flags().is_software_locked() {
+            " software-locked"
+        } else {
+            ""
+        },
+        if vh.attribute_flags().is_inconsistent() {
+            " inconsistent"
+        } else {
+            ""
+        },
     ));
     if vh.is_journaled() {
         out.push_str(&format!(
@@ -196,7 +219,11 @@ fn render_text(vh: VolumeHeader, dev: &(impl BlockDevice + ?Sized), path: &str, 
     }
     out.push_str(&format!(
         "clean:          {}\n",
-        if vh.is_clean() { "yes" } else { "no (needs fsck)" }
+        if vh.is_clean() {
+            "yes"
+        } else {
+            "no (needs fsck)"
+        }
     ));
 
     // Timestamps, decoded with the volume's own epoch convention.
@@ -417,7 +444,10 @@ fn render_json(vh: VolumeHeader, path: &str) -> String {
         let extents: Vec<String> = f
             .iter_inline()
             .map(|d: &ExtentDescriptor| {
-                format!("{{\"start_block\":{},\"block_count\":{}}}", d.start_block, d.block_count)
+                format!(
+                    "{{\"start_block\":{},\"block_count\":{}}}",
+                    d.start_block, d.block_count
+                )
             })
             .collect();
         format!(
@@ -441,7 +471,12 @@ fn render_json(vh: VolumeHeader, path: &str) -> String {
     .join(",");
 
     let ts = |t: hfsplus::timestamp::HfsTimestamp| match t.to_rfc3339() {
-        Some(s) => format!("{{\"raw\":{},\"unix\":{},\"rfc3339\":{}}}", t.raw, t.to_unix(), json_string(&s)),
+        Some(s) => format!(
+            "{{\"raw\":{},\"unix\":{},\"rfc3339\":{}}}",
+            t.raw,
+            t.to_unix(),
+            json_string(&s)
+        ),
         None => format!("{{\"raw\":{},\"unix\":null,\"rfc3339\":null}}", t.raw),
     };
 

@@ -183,7 +183,10 @@ mod tests {
         f.logical_size = 8192;
         f.total_blocks = 1;
         f.clump_size = 4096;
-        f.extents.raw[0] = ExtentDescriptor { start_block: 0, block_count: 1 };
+        f.extents.raw[0] = ExtentDescriptor {
+            start_block: 0,
+            block_count: 1,
+        };
         let _ = bytes;
         f
     }

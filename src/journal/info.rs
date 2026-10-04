@@ -436,7 +436,10 @@ impl JournalHeader {
         if self.size != journal_size {
             return Err(Error::invalid(
                 "journal_header.size",
-                format!("header says {} but the info block says {journal_size}", self.size),
+                format!(
+                    "header says {} but the info block says {journal_size}",
+                    self.size
+                ),
             ));
         }
         // `start` and `end` must both be positive and within the journal. A
@@ -481,7 +484,11 @@ impl JournalHeader {
             ));
         }
         if self.end > journal_size {
-            return Err(Error::out_of_range("journal_header.end", self.end, journal_size));
+            return Err(Error::out_of_range(
+                "journal_header.end",
+                self.end,
+                journal_size,
+            ));
         }
         if self.jhdr_size == 0 || u64::from(self.jhdr_size) > journal_size {
             return Err(Error::invalid(
@@ -510,7 +517,10 @@ impl JournalHeader {
         if u64::from(self.blhdr_size) > journal_size {
             return Err(Error::invalid(
                 "journal_header.blhdr_size",
-                format!("{} is not a plausible block-list header size", self.blhdr_size),
+                format!(
+                    "{} is not a plausible block-list header size",
+                    self.blhdr_size
+                ),
             ));
         }
         Ok(())
@@ -658,7 +668,9 @@ mod tests {
         .to_be_bytes();
         raw[JournalHeader::CHECKSUM_OFFSET..JournalHeader::CHECKSUM_OFFSET + 4]
             .copy_from_slice(&cksum);
-        let h = JournalHeader::parse(&raw).unwrap().expect("old magic still parses");
+        let h = JournalHeader::parse(&raw)
+            .unwrap()
+            .expect("old magic still parses");
         assert_eq!(h.magic, OLD_JOURNAL_HEADER_MAGIC);
         assert!(h.checksum_matches(&raw));
     }
@@ -669,7 +681,10 @@ mod tests {
         raw[4..8].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
         assert!(matches!(
             JournalHeader::parse(&raw),
-            Err(Error::InvalidField { field: "journal_header.endian", .. })
+            Err(Error::InvalidField {
+                field: "journal_header.endian",
+                ..
+            })
         ));
     }
 
@@ -677,8 +692,13 @@ mod tests {
     fn a_corrupt_checksum_is_detected() {
         let mut raw = make_header(ByteOrder::Big, 0, 4096, 4096);
         raw[JournalHeader::START_OFFSET] ^= 0xFF;
-        let h = JournalHeader::parse(&raw).unwrap().expect("still parses structurally");
-        assert!(!h.checksum_matches(&raw), "a corrupted field must fail the checksum");
+        let h = JournalHeader::parse(&raw)
+            .unwrap()
+            .expect("still parses structurally");
+        assert!(
+            !h.checksum_matches(&raw),
+            "a corrupted field must fail the checksum"
+        );
     }
 
     #[test]
@@ -690,11 +710,18 @@ mod tests {
         // Header claiming a different size than the info block.
         assert!(h.validate(4096).is_err());
         // start beyond end.
-        let bad = JournalHeader { start: 100, end: 50, ..h };
+        let bad = JournalHeader {
+            start: 100,
+            end: 50,
+            ..h
+        };
         assert!(bad.validate(524_288).is_err());
         // end past the journal.
         let bad = JournalHeader { end: 600_000, ..h };
-        assert!(matches!(bad.validate(524_288), Err(Error::OutOfRange { .. })));
+        assert!(matches!(
+            bad.validate(524_288),
+            Err(Error::OutOfRange { .. })
+        ));
         // Zero-sized header or block list.
         let bad = JournalHeader { jhdr_size: 0, ..h };
         assert!(bad.validate(524_288).is_err());

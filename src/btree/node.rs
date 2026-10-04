@@ -191,8 +191,17 @@ impl<'a> Node<'a> {
             ));
         }
         let desc = NodeDescriptor::parse(raw)?;
-        Node { raw, node_size, desc }.validate()?;
-        Ok(Node { raw, node_size, desc })
+        Node {
+            raw,
+            node_size,
+            desc,
+        }
+        .validate()?;
+        Ok(Node {
+            raw,
+            node_size,
+            desc,
+        })
     }
 
     /// Structural checks that every node access depends on.
@@ -364,10 +373,11 @@ impl<'a> Node<'a> {
             .checked_mul(OFFSET_SIZE)
             .and_then(|m| m.checked_add(OFFSET_SIZE))
             .ok_or(Error::overflow("offset slot address"))?;
-        let at = self
-            .node_size
-            .checked_sub(back)
-            .ok_or(Error::out_of_range("offset slot address", back as u64, self.node_size as u64))?;
+        let at = self.node_size.checked_sub(back).ok_or(Error::out_of_range(
+            "offset slot address",
+            back as u64,
+            self.node_size as u64,
+        ))?;
         Be::new(self.raw)
             .u16(at)
             .map_err(|_| Error::invalid("btree offset array", "offset array runs past the node"))
@@ -430,8 +440,7 @@ mod tests {
         }
         for i in 0..=usize::from(num_records) {
             let slot = node_size - 2 * i - 2;
-            raw[slot..slot + 2]
-                .copy_from_slice(&((NODE_DESCRIPTOR_SIZE + i) as u16).to_be_bytes());
+            raw[slot..slot + 2].copy_from_slice(&((NODE_DESCRIPTOR_SIZE + i) as u16).to_be_bytes());
         }
         raw
     }
@@ -487,7 +496,13 @@ mod tests {
         let mut raw = node(4096, 1);
         raw[10..12].copy_from_slice(&30000u16.to_be_bytes());
         let err = Node::parse(&raw, 4096).unwrap_err();
-        assert!(matches!(err, Error::InvalidField { field: "BTNodeDescriptor.numRecords", .. }));
+        assert!(matches!(
+            err,
+            Error::InvalidField {
+                field: "BTNodeDescriptor.numRecords",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -496,7 +511,10 @@ mod tests {
         raw[8] = 7;
         assert!(matches!(
             Node::parse(&raw, 4096),
-            Err(Error::InvalidField { field: "BTNodeDescriptor.kind", .. })
+            Err(Error::InvalidField {
+                field: "BTNodeDescriptor.kind",
+                ..
+            })
         ));
     }
 
@@ -516,8 +534,8 @@ mod tests {
     fn an_inverted_offset_pair_is_rejected() {
         // Record 0 starts above where it ends.
         let mut raw = node(4096, 2);
-        let s0 = 4096 - 2;   // offset[0]
-        let s1 = 4096 - 4;   // offset[1]
+        let s0 = 4096 - 2; // offset[0]
+        let s1 = 4096 - 4; // offset[1]
         let o0 = u16::from_be_bytes([raw[s0], raw[s0 + 1]]);
         let o1 = u16::from_be_bytes([raw[s1], raw[s1 + 1]]);
         raw[s0..s0 + 2].copy_from_slice(&o1.to_be_bytes());

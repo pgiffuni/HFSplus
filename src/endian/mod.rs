@@ -30,8 +30,7 @@ use crate::error::{Error, Result};
 /// assert_eq!(be.u16(2).unwrap(), 0x0004);
 /// assert!(be.u16(4).is_err());
 /// ```
-#[derive(Clone, Copy)]
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct Be<'a> {
     bytes: &'a [u8],
 }
@@ -202,7 +201,11 @@ pub struct Cursor<'a> {
 impl<'a> Cursor<'a> {
     /// Start a cursor at `off` within `bytes`.
     pub fn at(bytes: &'a [u8], off: usize, what: &'static str) -> Self {
-        Cursor { be: Be::new(bytes), pos: off, what }
+        Cursor {
+            be: Be::new(bytes),
+            pos: off,
+            what,
+        }
     }
 
     /// Start a cursor at the beginning of `bytes`.

@@ -121,12 +121,12 @@ pub fn read_volume_header<D: blockdev::BlockDevice + ?Sized>(
 /// let dev = MemoryDevice::new(vec![0u8; 1024]);
 /// assert!(hfsplus::probe_signature(&dev).is_err());
 /// ```
-pub fn probe_signature<D: blockdev::BlockDevice + ?Sized>(
-    device: &D,
-) -> Result<u16> {
-    device.read_array::<2>(blockdev::VOLUME_HEADER_OFFSET).map(u16::from_be_bytes)
+pub fn probe_signature<D: blockdev::BlockDevice + ?Sized>(device: &D) -> Result<u16> {
+    device
+        .read_array::<2>(blockdev::VOLUME_HEADER_OFFSET)
+        .map(u16::from_be_bytes)
 }
 
 /// Re-exported so `format::volume_header::K_HFS_PLUS_SIG_WORD` and the
 /// unqualified spelling are both available to callers.
-pub use format::volume_header::{K_HFS_PLUS_SIG_WORD, K_HFSX_SIG_WORD, K_HFS_SIG_WORD};
+pub use format::volume_header::{K_HFSX_SIG_WORD, K_HFS_PLUS_SIG_WORD, K_HFS_SIG_WORD};

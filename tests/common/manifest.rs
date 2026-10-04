@@ -74,7 +74,11 @@ impl Manifest {
             }
 
             let Some((key, value)) = line.split_once('=') else {
-                panic!("line {}: expected `key = value`, got `{}`", lineno + 1, line);
+                panic!(
+                    "line {}: expected `key = value`, got `{}`",
+                    lineno + 1,
+                    line
+                );
             };
             let key = key.trim();
             let value = value.trim();
@@ -136,9 +140,11 @@ impl Manifest {
     /// Read an optional integer.
     pub fn opt_int(&self, key: &str) -> Option<i64> {
         let raw = self.opt(key)?.trim();
-        Some(raw.parse::<i64>().unwrap_or_else(|e| {
-            panic!("manifest key `{key}` is not an integer: {raw:?} ({e})")
-        }))
+        Some(
+            raw.parse::<i64>().unwrap_or_else(|e| {
+                panic!("manifest key `{key}` is not an integer: {raw:?} ({e})")
+            }),
+        )
     }
 
     /// Whether the manifest declares the given key.
@@ -167,7 +173,9 @@ impl Manifest {
 
     /// Read the `key` of entry `index` (1-based) of array `name`.
     pub fn array_item(&self, name: &str, index: usize, key: &str) -> Option<&str> {
-        self.values.get(&format!("{name}.{index}.{key}")).map(|s| s.as_str())
+        self.values
+            .get(&format!("{name}.{index}.{key}"))
+            .map(|s| s.as_str())
     }
 
     /// The manifest's `name` field.
@@ -204,7 +212,9 @@ impl Manifest {
 fn unquote(value: &str, lineno: usize) -> String {
     let v = value.trim();
     if v.len() >= 2 && v.starts_with('"') && v.ends_with('"') {
-        return v[1..v.len() - 1].replace("\\\"", "\"").replace("\\\\", "\\");
+        return v[1..v.len() - 1]
+            .replace("\\\"", "\"")
+            .replace("\\\\", "\\");
     }
     // Strip a trailing inline comment outside quotes.
     if let Some(pos) = v.find(" #") {

@@ -23,17 +23,26 @@ pub struct MemoryDevice {
 impl MemoryDevice {
     /// Wrap an existing buffer read-only.
     pub fn new(data: Vec<u8>) -> Self {
-        MemoryDevice { data, writable: false }
+        MemoryDevice {
+            data,
+            writable: false,
+        }
     }
 
     /// Wrap an existing buffer read-write.
     pub fn new_writable(data: Vec<u8>) -> Self {
-        MemoryDevice { data, writable: true }
+        MemoryDevice {
+            data,
+            writable: true,
+        }
     }
 
     /// Create a zero-filled buffer of `len` bytes, read-write.
     pub fn zeroed(len: usize) -> Self {
-        MemoryDevice { data: vec![0u8; len], writable: true }
+        MemoryDevice {
+            data: vec![0u8; len],
+            writable: true,
+        }
     }
 
     /// Borrow the underlying bytes.
@@ -60,17 +69,22 @@ impl BlockDevice for MemoryDevice {
             return Ok(());
         }
         let available = self.data.len();
-        let end = offset.checked_add(buf.len() as u64).ok_or(Error::overflow("memory read"))?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::overflow("memory read"))?;
         let end_usize = usize::try_from(end).map_err(|_| Error::OutOfRange {
             what: "memory read offset",
             value: end,
             limit: available as u64,
         })?;
-        let src = self.data.get(offset as usize..end_usize).ok_or(Error::Truncated {
-            what: "memory read",
-            needed: end as usize,
-            available,
-        })?;
+        let src = self
+            .data
+            .get(offset as usize..end_usize)
+            .ok_or(Error::Truncated {
+                what: "memory read",
+                needed: end as usize,
+                available,
+            })?;
         buf.copy_from_slice(src);
         Ok(())
     }
@@ -86,17 +100,22 @@ impl BlockDeviceMut for MemoryDevice {
             return Err(Error::ReadOnly);
         }
         let available = self.data.len();
-        let end = offset.checked_add(buf.len() as u64).ok_or(Error::overflow("memory write"))?;
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or(Error::overflow("memory write"))?;
         let end_usize = usize::try_from(end).map_err(|_| Error::OutOfRange {
             what: "memory write offset",
             value: end,
             limit: available as u64,
         })?;
-        let dst = self.data.get_mut(offset as usize..end_usize).ok_or(Error::Truncated {
-            what: "memory write",
-            needed: end as usize,
-            available,
-        })?;
+        let dst = self
+            .data
+            .get_mut(offset as usize..end_usize)
+            .ok_or(Error::Truncated {
+                what: "memory write",
+                needed: end as usize,
+                available,
+            })?;
         dst.copy_from_slice(buf);
         Ok(())
     }

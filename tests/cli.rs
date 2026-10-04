@@ -125,8 +125,16 @@ fn help_text_lists_every_option_the_tool_accepts() {
 #[test]
 fn missing_arguments_are_a_usage_error() {
     for out in [hfsls(&[]), hfsinspect(&[])] {
-        assert_eq!(code(&out), 1, "no arguments must exit 1, got {}", code(&out));
-        assert!(!stderr(&out).is_empty(), "a usage error must explain itself");
+        assert_eq!(
+            code(&out),
+            1,
+            "no arguments must exit 1, got {}",
+            code(&out)
+        );
+        assert!(
+            !stderr(&out).is_empty(),
+            "a usage error must explain itself"
+        );
     }
 }
 
@@ -169,7 +177,10 @@ fn a_good_image_exits_zero_and_a_bad_one_exits_two() {
 
 #[test]
 fn a_missing_image_is_reported_not_panicked() {
-    for out in [hfsls(&["/nonexistent/hfs.img"]), hfsinspect(&["/nonexistent/hfs.img"])] {
+    for out in [
+        hfsls(&["/nonexistent/hfs.img"]),
+        hfsinspect(&["/nonexistent/hfs.img"]),
+    ] {
         assert_eq!(code(&out), 2, "an unreadable path must exit 2");
         let text = stderr(&out);
         assert!(
@@ -354,7 +365,13 @@ fn the_json_output_is_well_formed() {
     let bracket_closes = text.matches(']').count();
     assert_eq!(brackets, bracket_closes, "unbalanced brackets in:\n{text}");
 
-    for field in ["name", "filesystem", "block_size", "total_blocks", "objects"] {
+    for field in [
+        "name",
+        "filesystem",
+        "block_size",
+        "total_blocks",
+        "objects",
+    ] {
         assert!(text.contains(field), "--json must include {field}");
     }
 }
@@ -471,7 +488,10 @@ fn hfsinspect_json_is_well_formed_even_when_an_image_fails() {
     // one was inspected and reported.
     assert_eq!(code(&out), 2, "a failed image must set the exit status");
     let text = stdout(&out);
-    assert!(text.contains("\"ok\":false"), "the failure must be in the output:\n{text}");
+    assert!(
+        text.contains("\"ok\":false"),
+        "the failure must be in the output:\n{text}"
+    );
     assert!(
         text.contains("\"ok\":true"),
         "the good image must still be reported, not abandoned:\n{text}"
@@ -503,8 +523,15 @@ fn hfsinspect_keeps_going_after_a_bad_image() {
     assert_eq!(code(&out), 2);
     let text = stdout(&out);
     let entries: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(entries.len(), 2, "both images must be reported, got:\n{text}");
-    assert!(entries[0].contains("\"ok\":false"), "the first image failed");
+    assert_eq!(
+        entries.len(),
+        2,
+        "both images must be reported, got:\n{text}"
+    );
+    assert!(
+        entries[0].contains("\"ok\":false"),
+        "the first image failed"
+    );
     assert!(
         entries[1].contains("\"ok\":true"),
         "the second image must still be inspected, got {:?}",
@@ -627,7 +654,10 @@ fn inspecting_a_torn_volume_does_not_recover_it() {
         !text.contains("torn.txt"),
         "hfsls must not replay; the journal report is the explicit way to ask"
     );
-    assert!(text.contains(".journal"), "the stale view must still list what is there");
+    assert!(
+        text.contains(".journal"),
+        "the stale view must still list what is there"
+    );
 }
 
 // --- Name comparison ----------------------------------------------------
@@ -646,7 +676,12 @@ fn name_resolution_follows_the_volumes_own_comparison_rule() {
 
     // On a case-folding volume, a differently-cased name finds the same entry.
     let out = hfsls(&[&folding, ".JOURNAL"]);
-    assert_eq!(code(&out), 0, "a folding volume must accept any case: {}", stderr(&out));
+    assert_eq!(
+        code(&out),
+        0,
+        "a folding volume must accept any case: {}",
+        stderr(&out)
+    );
     assert!(
         stdout(&out).contains(".journal"),
         "the entry must be found and reported under its real name, got {:?}",
