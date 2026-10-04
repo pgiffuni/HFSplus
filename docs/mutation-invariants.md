@@ -187,12 +187,16 @@ allocated with nothing else changed makes it report that block as orphaned. A
 checker that returned "clean" unconditionally would make the assertion above
 worthless.
 
+`truncate_file` closes the gap the previous revision listed as missing, and its
+own property is the round trip: grow a file, then empty it, and the volume must
+return to exactly what it was — one block *fewer* than before, because the file's
+original block was released too. Coming back to the original count would mean that
+block had leaked, which is the specific failure an allocator and a deallocator that
+disagree would produce, and which nothing above would notice until the volume
+filled.
+
 What is *not* yet true of any mutation here:
 
-- **No freeing.** A write may shrink a file's *logical size*, but the blocks it
-  no longer needs stay allocated. There is no `release` on a mutation path, so a
-  volume that is written to repeatedly grows monotonically. `do_hfs_truncate` is
-  the reference and is unmapped.
 - **No structural change.** The record is replaced only at its original length,
   because a length change moves every later record in the node. No B-tree node
   has been created, split or deleted, so the extent mapper and the node
@@ -202,6 +206,10 @@ What is *not* yet true of any mutation here:
   mutation above runs on a volume with no journal. The checker therefore never
   has to reason about a transaction it did not write.
 - **No creation.** Every mutation here needs a CNID that already exists.
+- **Partial blocks are not reclaimable.** A file whose length uses part of its
+  last block cannot give that block back by truncation, because the new size
+  rounds *up*. Reclaiming it means rewriting the file, which is a different
+  operation and is not implemented.
 
 The gap these leave is specific: an invariant can be enforced by the checker and
 still be impossible for a mutation to maintain, because the checker sees only

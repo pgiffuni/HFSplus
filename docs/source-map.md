@@ -360,10 +360,11 @@ Milestones 7 through 13 depend on all of these, and none has been translated:
 | Compression metadata | `core/hfs_attrlist.c`, `core/hfs_cnode.c` (`decmpfs`) | 7B.2 |
 | B-tree mutation | `core/BTreeWrapper.c` `InsertRecord`, `SplitRecord`, `BTUpdateRecord`; `core/hfs_btreeio.c` `ExtendFile`, `BTAddNewBlock` | Milestone 8C |
 | The extents B-tree | `core/hfs_extents.c` `extents_search`, `AddExtents`; overflow records | Milestone 8D |
-| Truncation and freeing | `core/hfs_readwrite.c` `do_hfs_truncate`, `TruncateFile` | Milestone 8B |
+| The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
 
-Until those rows are filled, this crate can overwrite and grow a file's contents
-within its eight inline extents. It cannot create or remove a file, cannot shrink
-a file's allocation, cannot overflow a fork into the extents tree, and cannot
-write to a volume with a journal.
+Until those rows are filled, this crate can overwrite, grow and truncate a file's
+contents within its eight inline extents, keeping the bitmap, the header's free
+count and the catalog in agreement. It cannot create or remove a file, cannot
+overflow a fork into the extents tree, cannot restructure a B-tree node, and
+cannot write to a volume with a journal.

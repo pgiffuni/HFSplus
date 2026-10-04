@@ -281,6 +281,241 @@ fn writing_an_empty_file_leaves_no_trailing_bytes() {
     assert_fsck_clean(&path, "an in-place write to zero length");
 }
 
+// --- Truncation, which frees -----------------------------------------------
+
+/// Grow `payload.bin` to 8192 bytes so there is a block to give back.
+fn grown_to_two_blocks(path: &std::path::Path, cnid: u32) {
+    let new_data: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+    write(path, cnid, &new_data);
+}
+
+#[test]
+fn truncating_releases_the_blocks_a_file_no_longer_needs() {
+    // 8192 bytes in two blocks, truncated to 4096: one block released, one kept.
+    // Both halves of the fact are asserted, because a writer that freed the block
+    // and did not update the free count leaves a volume the checker recomputes
+    // differently from what the header claims.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+    grown_to_two_blocks(&path, cnid);
+
+    let (blocks_before, free_before) = (allocated_blocks(&path), header_free_blocks(&path));
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable.truncate_file(cnid, 4096).expect("truncate");
+        dev.sync().expect("flush");
+    }
+
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before - 1,
+        "one block was released, so one fewer may be marked allocated"
+    );
+    assert_eq!(
+        header_free_blocks(&path),
+        free_before + 1,
+        "and the header's free count must rise to match"
+    );
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin exists");
+    let f = object.as_file().expect("a file");
+    assert_eq!(f.record.data_fork.logical_size, 4096);
+    assert_eq!(
+        f.record.data_fork.total_blocks, 1,
+        "the record must claim the blocks it kept, not the ones it gave back"
+    );
+    assert_eq!(
+        f.record.data_fork.extents.used(),
+        1,
+        "the emptied extent is zeroed, which is what makes it the terminator"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(
+        report.is_clean(),
+        "orphaned {:?} missing {:?}",
+        report.orphaned,
+        report.missing
+    );
+    assert_fsck_clean(&path, "a truncation that released a block");
+}
+
+#[test]
+fn a_partial_trailing_block_is_rounded_up_and_frees_nothing() {
+    // 5000 bytes needs two blocks. Truncating to 4097 rounds up to two, so nothing
+    // is freed. This is the property that follows from blocks being the unit of
+    // allocation: the only sizes a file can have are multiples of the block size,
+    // and a truncation that shaved the tail would be inventing a size.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+    grown_to_two_blocks(&path, cnid);
+    let (blocks_before, free_before) = (allocated_blocks(&path), header_free_blocks(&path));
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable.truncate_file(cnid, 4097).expect("truncate");
+        dev.sync().expect("flush");
+    }
+
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before,
+        "4097 rounds up to two blocks, so no block is freeable"
+    );
+    assert_eq!(header_free_blocks(&path), free_before);
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin exists");
+    let f = object.as_file().expect("a file");
+    assert_eq!(
+        f.record.data_fork.logical_size, 4097,
+        "the size itself is exact"
+    );
+    assert_eq!(f.record.data_fork.total_blocks, 2);
+
+    assert_fsck_clean(&path, "a truncation that rounded up and freed nothing");
+}
+
+#[test]
+fn truncating_to_zero_frees_everything() {
+    // The `peof == 0` path, taken first and unconditionally: `truncateToExtent`
+    // has no meaning with no containing extent, and keeping one would leave a
+    // zero-length file holding storage forever.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+    grown_to_two_blocks(&path, cnid);
+    let blocks_before = allocated_blocks(&path);
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable.truncate_file(cnid, 0).expect("truncate to zero");
+        dev.sync().expect("flush");
+    }
+
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before - 2,
+        "both blocks must come back, or the volume leaks one every time a file is \
+         emptied"
+    );
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin still exists after being emptied");
+    let f = object.as_file().expect("a file");
+    assert_eq!(f.record.data_fork.logical_size, 0);
+    assert_eq!(f.record.data_fork.total_blocks, 0);
+    assert_eq!(
+        f.record.data_fork.extents.used(),
+        0,
+        "every descriptor is zeroed, so the file describes no blocks at all"
+    );
+    assert_eq!(
+        vol.read(&object, 0, 1).expect("read past the end"),
+        Vec::<u8>::new(),
+        "an emptied file reads as nothing"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(
+        report.is_clean(),
+        "orphaned {:?} missing {:?}",
+        report.orphaned,
+        report.missing
+    );
+    assert_fsck_clean(&path, "a truncation to zero");
+}
+
+#[test]
+fn a_file_that_is_grown_and_then_truncated_returns_to_the_same_allocation() {
+    // The round trip is the property that matters: an allocator and a deallocator
+    // that disagree would leak a block every cycle, and nothing above would notice
+    // until the volume filled.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+    let (blocks_before, free_before) = (allocated_blocks(&path), header_free_blocks(&path));
+
+    let big: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+    write(&path, cnid, &big);
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before + 9,
+        "40000 bytes is ten blocks and the file had one"
+    );
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable.truncate_file(cnid, 0).expect("truncate to zero");
+        dev.sync().expect("flush");
+    }
+    // One *fewer* than before, not the same: the file's original block was
+    // allocated too, and truncating to zero releases it along with the nine that
+    // growth added. Coming back to exactly `blocks_before` would mean the
+    // original block had leaked.
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before - 1,
+        "all ten blocks must come back, including the one the file started with"
+    );
+    assert_eq!(
+        header_free_blocks(&path),
+        free_before + 1,
+        "and the free count must rise by exactly as many as the bitmap fell"
+    );
+
+    assert_fsck_clean(&path, "a grow-then-truncate round trip");
+}
+
+#[test]
+fn truncating_to_what_the_file_already_is_refused() {
+    // Not truncation. A request that keeps every block would rewrite the record
+    // with the same numbers, which looks like success while changing a file's
+    // modification time for no reason.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+    let before = std::fs::read(&path).expect("read image");
+
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    let err = writable
+        .truncate_file(cnid, 4096)
+        .expect_err("the file is already 4096 bytes in one block");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("not a truncation"),
+        "the refusal must say what was wrong, not merely fail; got: {rendered}"
+    );
+    dev.sync().expect("flush");
+    drop(dev);
+    assert_untouched(&path, &before, "a truncation that freed nothing");
+}
+
 // --- What it refuses -------------------------------------------------------
 
 // --- Growing, which allocates ----------------------------------------------

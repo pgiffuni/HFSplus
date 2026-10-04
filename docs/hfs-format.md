@@ -1015,6 +1015,69 @@ to the device. Nothing opens the device for writing, so a wrong replay cannot
 damage the image. `tests/journal_conformance.rs` hashes the whole image before
 and after mounting, replaying and reading, and requires it to be byte-identical.
 
+### The summary bitmap is not on disk
+
+Apple maintains a second, coarser allocation bitmap alongside the real one, and
+`BlockDeallocate` updates both (`hfs_release_summary`). It is easy to read that as
+a format requirement — a second bitmap that a writer must maintain — and it is
+not.
+
+`hfs_summary_table` is a `hfs_malloc_zero_data` buffer built at mount, sized from
+the volume, and **freed at unmount** (`hfs_vfsops.c` `hfs_unmount` clears
+`hfs_summary_table` and the `HFS_SUMMARY_TABLE` flag). Nothing writes it into the
+image and nothing reads it back out. A userspace implementation cannot maintain
+one, and does not need to: the on-disk format has exactly one allocation bitmap,
+in `allocationFile`.
+
+The flag is worth knowing about for a different reason. Apple short-circuits its
+allocation scan on the summary ("`trustSummary` … if it tells us that it could not
+find any free space"), which means a volume with the summary table enabled can
+report full slightly differently from one without. That is a property of the
+kernel's cache, not of the volume, so nothing in this crate depends on it.
+
+### A freed extent is zeroed, not removed
+
+Truncating a file does not compact its extent record. Every descriptor that is
+released has both `startBlock` and `blockCount` set to zero
+(`TruncateFileC`, `core/FileExtentMapping.c`), and a zeroed descriptor *is* the
+terminator that ends the record. A descriptor left partly in use keeps its start
+block and loses only its tail.
+
+This is what makes truncation possible without touching the B-tree: an
+`HFSPlusExtentRecord` is a fixed eight-slot array, and the survivors are left
+where they are, so the catalog record is exactly the same length before and after.
+The same property is what lets growth append an extent. Anything that compacted
+the record instead would change its length, move every later record in the leaf,
+and require rebuilding the node's offset array.
+
+### Truncation rounds the new size up
+
+`nextBlock = howmany(peof, blockSize)`. The new size is rounded **up** to a whole
+allocation block, so the block count that survives is never less than
+`howmany(new_size, blockSize)`. Truncating 5000 bytes to 4097 frees nothing.
+
+The corollary is that a file's size and its allocation cannot always be made to
+agree: a file may have a length that uses only part of its last block, and that
+partial block is not reclaimable by truncation. It is reclaimable by rewriting the
+file, which is a different operation.
+
+### Zero length frees everything, unconditionally
+
+`TruncateFileC` takes the `peof == 0` path first, before any extent search, and
+deallocates the whole fork. The `truncateToExtent` option — round the new size out
+to the end of the extent containing it — has no meaning at zero: there is no
+containing extent, and keeping one would leave a zero-length file holding storage
+that no later operation would release.
+
+### Freeing writes the bitmap before the record
+
+`BlockDeallocate` marks the blocks free and increments `freeBlocks`; the catalog
+record is rewritten afterwards. A crash in between leaves a record claiming fewer
+blocks than the fork once had, so the released blocks are orphans — which
+`fsck_hfs` reclaims. The other order would leave a record claiming blocks the
+bitmap has already handed to something else, which is two files sharing storage.
+Allocation orders its writes the same way, for the same reason.
+
 ## Checklist for any new structure
 
 Before adding a parser:
