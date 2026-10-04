@@ -170,7 +170,7 @@ a file's contents in place.
 | --- | --- | --- |
 | Structure | `FileRecord::write_to` is the inverse of `parse`, so a record read and written back is the same bytes | `a_file_record_round_trips_through_the_same_bytes` -- byte equality against the input, not a re-parse |
 | Round trip | the data blocks and the record are written in the order that never exposes a torn file: blocks first, then the length that points at them | `writing_shorter_contents_keeps_the_volume_readable`, `writing_the_same_number_of_bytes_keeps_the_allocation`, `writing_an_empty_file_leaves_no_trailing_bytes`, `a_partial_trailing_block_is_read_back_as_the_tail_and_not_beyond` |
-| Independent | `fsck.hfsplus` accepts every written image | `assert_fsck_clean` in `tests/write.rs`, on every write above |
+| Independent | `fsck.hfsplus` accepts every written image | `assert_fsck_clean` in `tests/write.rs`, on every write and create above |
 
 When a write *allocates*, the bitmap and the volume header's `freeBlocks` have to
 agree with each other and with the catalog's extents — three places, one fact.
@@ -195,7 +195,26 @@ block had leaked, which is the specific failure an allocator and a deallocator t
 disagree would produce, and which nothing above would notice until the volume
 filled.
 
+`create_file` is the first mutation that *adds* rather than changes, and it keeps
+four structures in step: the file record, its thread record, the parent's child
+count, and the header's next-CNID counter. A file in three of the four is a file
+that cannot be found by name, cannot be found by CNID, or will be handed the same
+identity twice — and only the thread record is what makes a lookup by CNID work at
+all.
+
+Node mutation is asserted by the property rather than by the bytes:
+`every_record_is_still_findable_after_an_insertion` inserts at every position and
+checks that each original record is intact, that the new one is where it was asked
+for, and that the used region grew by exactly one record.
+
 What is *not* yet true of any mutation here:
+
+- **No node splitting.** A catalog leaf with no room is refused by name. Splitting
+  means redistributing records across two nodes, updating the parent's index, and
+  allocating a node from the free list — so a volume whose catalog leaf fills up
+  becomes read-only to this crate rather than corrupt.
+- **No folders.** A file can be created in the root or any existing folder, but no
+  folder can be created, and `folderCount` in the header is never written.
 
 - **No structural change.** The record is replaced only at its original length,
   because a length change moves every later record in the node. No B-tree node

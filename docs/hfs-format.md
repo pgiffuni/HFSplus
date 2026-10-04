@@ -1078,6 +1078,35 @@ blocks than the fork once had, so the released blocks are orphans — which
 bitmap has already handed to something else, which is two files sharing storage.
 Allocation orders its writes the same way, for the same reason.
 
+### `leafRecords` is a count a writer must keep
+
+The B-tree header's `leafRecords` is the number of records in *all* leaf nodes.
+A reader does not need it — it descends by key — which is exactly why it goes
+stale unnoticed. `fsck.hfsplus` recounts and reports `Invalid leaf record count`
+when the two disagree, and the header is what sizes a leaf-node map.
+
+Its offset is 6 within the header record, not 8. The fields are packed with no
+alignment padding: `treeDepth` is a `u16`, so `rootNode` is at 2, `leafRecords`
+at 6, `firstLeafNode` at 10. Writing at 8 lands in `firstLeafNode`.
+
+The header record itself starts at offset 14 of node 0, immediately after the
+node descriptor — so `leafRecords` is at byte 20 of node 0, and none of these
+offsets are relative to the node.
+
+### Node offsets are counted from the end, and the array is full width
+
+A node's record offsets occupy its last `2 * (numRecords + 1)` bytes, with
+record 0's offset in the final two bytes. Two consequences that are easy to get
+backwards:
+
+- **Free space is `nodeSize - freeOffset - numRecords * 2 - 2`.** The trailing
+  `- 2` is the slot the *next* record would need, so an insertion is refused when
+  there is room for its bytes but not for its offset. Accepting it writes over the
+  offset array and loses every record after the insertion point.
+- **A freed extent in the offset array is still a slot.** `numRecords` shrinks and
+  the free offset moves down; the bytes above it are reused by the next insertion
+  and are not cleared.
+
 ## Checklist for any new structure
 
 Before adding a parser:

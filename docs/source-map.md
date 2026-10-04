@@ -358,13 +358,12 @@ Milestones 7 through 13 depend on all of these, and none has been translated:
 | Catalog mutation | `core/hfs_catalog.c` `cat_create`, `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildkey`, `buildrecord`, `buildthread` | Milestone 9 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
 | Compression metadata | `core/hfs_attrlist.c`, `core/hfs_cnode.c` (`decmpfs`) | 7B.2 |
-| B-tree mutation | `core/BTreeWrapper.c` `InsertRecord`, `SplitRecord`, `BTUpdateRecord`; `core/hfs_btreeio.c` `ExtendFile`, `BTAddNewBlock` | Milestone 8C |
+| B-tree node splitting | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path; `core/BTreeAllocate.c` node allocation | Milestone 8F |
 | The extents B-tree | `core/hfs_extents.c` `extents_search`, `AddExtents`; overflow records | Milestone 8D |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
 
-Until those rows are filled, this crate can overwrite, grow and truncate a file's
-contents within its eight inline extents, keeping the bitmap, the header's free
-count and the catalog in agreement. It cannot create or remove a file, cannot
-overflow a fork into the extents tree, cannot restructure a B-tree node, and
-cannot write to a volume with a journal.
+Until those rows are filled, this crate can create an empty file, and overwrite,
+grow or truncate its contents within eight inline extents. It cannot create a
+folder, remove or rename a file, overflow a fork into the extents tree, split a
+B-tree node, or write to a volume with a journal.

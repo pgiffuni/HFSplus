@@ -24,6 +24,7 @@
 //! that makes a FUSE mount usable.
 
 use crate::blockdev::{BlockDevice, BlockDeviceMut};
+use crate::btree::node::NODE_DESCRIPTOR_SIZE;
 use crate::btree::ExtentKey;
 use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID};
 use crate::catalog::lookup::Catalog;
@@ -714,6 +715,488 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         record.content_mod_date = now;
         record.attribute_mod_date = now;
         self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Create an empty file called `name` inside folder `parent`, and return its CNID.
+    ///
+    /// The first mutation that adds something rather than changing something, and
+    /// therefore the first that has to keep four structures in step: the catalog's
+    /// two new records, the containing folder's child count, and the volume
+    /// header's next-CNID counter. A file created in only three of those is a file
+    /// that cannot be found by name, cannot be counted, or will be handed the same
+    /// CNID twice.
+    ///
+    /// # Why two records and not one
+    ///
+    /// A file is a *file record*, keyed by `(parent folder, name)`, plus a *thread
+    /// record*, keyed by `(its own CNID, no name)`. The thread record is what makes
+    /// a lookup by CNID possible at all -- walking file records alone finds a name,
+    /// never an object. `cat_create` builds both, and a file with no thread record
+    /// is a file this crate's own checker reports as `missing_thread`.
+    ///
+    /// # The CNID
+    ///
+    /// Taken from the header's `nextCatalogID` and the header written back with
+    /// the next value. Nothing else allocates CNIDs on HFS+, and reusing one would
+    /// give two objects the same identity -- which for a filesystem means a hard
+    /// link, silently, rather than an error.
+    ///
+    /// # What it refuses
+    ///
+    /// - **A name that already exists**, rather than creating a second record under
+    ///   a key that is already there. A leaf with duplicate keys still parses and
+    ///   still searches; it just answers with whichever comes first, forever.
+    /// - **A folder that is not a folder.** CNID 1 is the volume's root by
+    ///   convention, but nothing guarantees it, and writing a child count into a
+    ///   file record would corrupt it.
+    /// - **A leaf with no room**, named as the node-split it would need. A node
+    ///   cannot grow: splitting one means redistributing records between two nodes
+    ///   and updating the parent index, which is Milestone 8C's remaining half.
+    ///
+    /// Mining reference: `core/hfs_catalog.c` `cat_create` and `catrec_update`,
+    /// with `buildkey` and `buildthread` for the two records; `cat_create` calls
+    /// `newcatalogid()` for the CNID and `incvalency()` for the parent's count.
+    pub fn create_file(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::record::{
+            FileRecord, K_HFS_PLUS_FILE_THREAD_RECORD, S_IFREG, THREAD_RECORD_NAME_LEN_OFFSET,
+        };
+
+        if name.is_empty() {
+            return Err(Error::invalid("create", "a file cannot have an empty name"));
+        }
+        let parent_cnid = Cnid(parent);
+        let cnid = self.header.next_catalog_id;
+        if cnid <= ROOT_FOLDER_ID.0 {
+            return Err(Error::invalid(
+                "volume_header.nextCatalogID",
+                format!(
+                    "{cnid} is at or below the reserved CNID range, so it cannot \
+                     identify a new file"
+                ),
+            ));
+        }
+
+        // The containing folder, so its child count can be incremented. Read before
+        // anything is written, so a bad CNID costs nothing.
+        // Validated before anything is written, so a bad parent CNID costs nothing.
+        self.read_folder_record(parent)?;
+        let now =
+            crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+
+        let file = FileRecord {
+            record_type: crate::catalog::record::K_HFS_PLUS_FILE_RECORD,
+            file_id: Cnid(cnid),
+            create_date: now,
+            content_mod_date: now,
+            attribute_mod_date: now,
+            access_date: now,
+            backup_date: now,
+            bsd_info: crate::catalog::record::BsdInfo {
+                file_mode: S_IFREG | 0o644,
+                ..FileRecord::EMPTY.bsd_info
+            },
+            ..FileRecord::EMPTY
+        };
+        // The thread record, built by hand because its length follows its name and
+        // `ThreadRecord::parse` is the only encoder it has. Layout: recordType 0..2,
+        // reserved 2..4, parentID 4..8, name length 8..10, then the name.
+        // Fixed prefix, the two-byte name length, then the name. `FIXED_SIZE` is
+        // the prefix *before* the length, so the length has to be added too.
+        let mut thread = vec![0u8; THREAD_RECORD_NAME_LEN_OFFSET + 2 + name.len() * 2];
+        thread[0..2].copy_from_slice(&K_HFS_PLUS_FILE_THREAD_RECORD.to_be_bytes());
+        thread[4..8].copy_from_slice(&parent_cnid.0.to_be_bytes());
+        thread[THREAD_RECORD_NAME_LEN_OFFSET..THREAD_RECORD_NAME_LEN_OFFSET + 2]
+            .copy_from_slice(&(name.len() as u16).to_be_bytes());
+        for (i, unit) in name.iter().enumerate() {
+            let at = THREAD_RECORD_NAME_LEN_OFFSET + 2 + i * 2;
+            thread[at..at + 2].copy_from_slice(&unit.to_be_bytes());
+        }
+
+        // Order: the header first, so a CNID is never handed out twice even if the
+        // catalog write below fails. The reverse would let a retry reuse it.
+        self.write_header_u32(64, cnid + 1)?;
+
+        let child_key = CatalogKey::for_child(parent_cnid, name);
+        let thread_key = CatalogKey::for_child(Cnid(cnid), &[]);
+        let mut child = child_key.to_record();
+        child.extend_from_slice(&file.to_bytes());
+        let mut thread_record = thread_key.to_record();
+        thread_record.extend_from_slice(&thread);
+
+        self.insert_catalog_record(&child)?;
+        self.insert_catalog_record(&thread_record)?;
+        self.bump_folder_valence(parent, now)?;
+        self.write_header_u32(32, self.header.file_count + 1)?;
+        self.header.next_catalog_id = cnid + 1;
+        self.header.file_count += 1;
+        Ok(cnid)
+    }
+
+    /// Read a folder record by CNID.
+    fn read_folder_record(&self, cnid: u32) -> Result<crate::catalog::record::FolderRecord> {
+        let bytes = match self.find_catalog_record_any(cnid)? {
+            Some(hit) => hit,
+            None => {
+                return Err(Error::NotFound {
+                    what: "folder record",
+                })
+            }
+        };
+        if bytes.len() != crate::catalog::record::FOLDER_RECORD_SIZE {
+            return Err(Error::invalid(
+                "catalog record",
+                format!(
+                    "CNID {cnid} has a {}-byte record, which is neither a file \
+                     ({}) nor a folder ({}), so it is not a folder",
+                    crate::catalog::record::FILE_RECORD_SIZE,
+                    bytes.len(),
+                    crate::catalog::record::FOLDER_RECORD_SIZE
+                ),
+            ));
+        }
+        crate::catalog::record::FolderRecord::parse(&bytes)
+    }
+
+    /// Increment a folder's child count and touch its modification time.
+    ///
+    /// A folder's `valence` is the number of children it has, and a name lookup
+    /// that never consults it still works -- which is exactly why it goes stale
+    /// unnoticed. `fsck.hfsplus` counts.
+    fn bump_folder_valence(&mut self, cnid: u32, now: u32) -> Result<()> {
+        let mut record = self.read_folder_record(cnid)?;
+        record.valence = record
+            .valence
+            .checked_add(1)
+            .ok_or_else(|| Error::overflow("folder valence"))?;
+        record.content_mod_date = now;
+        let body = record.to_bytes();
+        self.replace_catalog_body(cnid, &body)
+    }
+
+    /// Write one `u32` field of the volume header.
+    ///
+    /// Offsets are named at the call site as a bare number, which is a readability
+    /// problem this does not solve -- but a symbolic constant per header field
+    /// would be a wider change than this method, and getting it wrong is caught by
+    /// `fsck.hfsplus` recomputing the count.
+    fn write_header_u32(&mut self, offset: u64, value: u32) -> Result<()> {
+        self.device.write_at(
+            crate::blockdev::VOLUME_HEADER_OFFSET + offset,
+            &value.to_be_bytes(),
+        )
+    }
+
+    /// Locate any catalog record whose body names `cnid` in its `fileID`/`folderID`.
+    ///
+    /// File and folder records both carry the object's CNID in their body at the
+    /// same offset -- 8..12 -- so one walk finds either, and the record's length
+    /// says which. Thread records do not: they carry the *parent's* CNID in their
+    /// body and the object's in their key, so they are matched by key instead and
+    /// handled separately.
+    fn find_catalog_record_any(&self, cnid: u32) -> Result<Option<Vec<u8>>> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::lookup::split_record;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let mut node_num = btree_header.first_leaf_node;
+        let mut budget = btree_header.total_nodes;
+
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            for index in 0..node.num_records() {
+                let Some((_key, body)) = split_record(node.record(index)?) else {
+                    continue;
+                };
+                if body.len() < 12 {
+                    continue;
+                }
+                let id = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+                if id == cnid
+                    && (body.len() == crate::catalog::record::FILE_RECORD_SIZE
+                        || body.len() == crate::catalog::record::FOLDER_RECORD_SIZE)
+                {
+                    return Ok(Some(body.to_vec()));
+                }
+            }
+            if node_num == btree_header.last_leaf_node {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            if node_num == 0 || node_num >= btree_header.total_nodes {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Insert a catalog record at its sorted position.
+    ///
+    /// The key order is the catalog's, so this is a binary search for the first key
+    /// greater than the one being inserted and an insertion there. A leaf with no
+    /// room is refused by name: splitting means redistributing records across two
+    /// nodes and updating the parent's index, and a node that grew past its
+    /// allocated blocks would need allocation as well.
+    ///
+    /// Mining reference: the search half is the same descent a reader already
+    /// performs; the insert half is `BTInsertRecord` into `core/BTree.c`.
+    fn insert_catalog_record(&mut self, record: &[u8]) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::{insert_record, NodeKind};
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        // Everything that reads the device happens inside this one scope, because
+        // `BTreeFile` and `Catalog` both borrow it and the write below needs it
+        // mutably. The only things that cross the boundary are owned values.
+        let (at_node_offset, buf) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let btree_header = *bt.header();
+            let node_num = btree_header.first_leaf_node;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                return Err(Error::invalid(
+                    "catalog",
+                    "the catalog's first node is not a leaf, which no HFS+ volume has",
+                ));
+            }
+
+            // The first key greater than or equal to the one being inserted. An
+            // equal key means the name is taken, and inserting beside it would
+            // leave a leaf with two records under one key -- which still parses,
+            // still searches, and answers with whichever comes first, forever.
+            let incoming =
+                CatalogKey::from_record(record, usize::from(btree_header.max_key_length))
+                    .map_err(|e| Error::invalid("catalog key", e.to_string()))?;
+            let mut at = node.num_records();
+            let mut duplicate = false;
+            {
+                let catalog = crate::catalog::lookup::Catalog::open(
+                    &*self.device,
+                    &self.header.catalog_file,
+                    self.header.block_size,
+                    self.header.is_hfsx(),
+                )?;
+                for index in 0..node.num_records() {
+                    let Some((existing, _)) = split_record(node.record(index)?) else {
+                        continue;
+                    };
+                    match catalog.compare_keys(&existing, &incoming) {
+                        Ordering::Less => continue,
+                        Ordering::Equal => {
+                            duplicate = true;
+                            at = index;
+                            break;
+                        }
+                        Ordering::Greater => {
+                            at = index;
+                            break;
+                        }
+                    }
+                }
+            }
+            if duplicate {
+                return Err(Error::invalid(
+                    "catalog",
+                    format!(
+                        "CNID {} already has a child named {:?}",
+                        incoming.parent_id.0,
+                        incoming.name_string()
+                    ),
+                ));
+            }
+
+            let mut buf = bytes;
+            match insert_record(&mut buf, usize::from(at), record) {
+                Ok(()) => {}
+                Err(crate::error::Error::NoSpace { .. }) => {
+                    return Err(Error::invalid(
+                        "catalog leaf",
+                        format!(
+                            "the catalog's leaf node has no room for a {}-byte \
+                             record; splitting a node is not implemented",
+                            record.len()
+                        ),
+                    ))
+                }
+                Err(e) => return Err(e),
+            }
+            (bt.node_offset(node_num)?, buf)
+        };
+        self.device.write_at(at_node_offset, &buf)?;
+        // `leafRecords` in the B-tree header counts the records in *all* leaf
+        // nodes. Leaving it alone is not a cosmetic omission: fsck counts the
+        // records it finds and reports "Invalid leaf record count" when the header
+        // disagrees, and every other implementation reading this tree uses the
+        // field to size its leaf-node map.
+        self.write_btree_header_u32(
+            crate::btree::header::LEAF_RECORDS_OFFSET,
+            self.btree_header_leaf_records()? + 1,
+        )
+    }
+
+    /// Read `leafRecords` from the catalog's B-tree header.
+    fn btree_header_leaf_records(&self) -> Result<u32> {
+        use crate::btree::io::BTreeFile;
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        Ok(bt.header().leaf_records)
+    }
+
+    /// Write one `u32` field of the catalog's B-tree header.
+    ///
+    /// `offset` is relative to the `HFSBTreeHeader` record, which begins *after*
+    /// the node descriptor at offset 14 of node 0. Getting that wrong is not a
+    /// subtle corruption: offset 8 of node 0 is the descriptor's `kind` and
+    /// `height`, so writing `leafRecords` there turns the header node into
+    /// something that no longer parses as a node.
+    fn write_btree_header_u32(&mut self, offset: u64, value: u32) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        let at = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            bt.node_offset(0)? + NODE_DESCRIPTOR_SIZE as u64
+        };
+        self.device.write_at(at + offset, &value.to_be_bytes())
+    }
+
+    /// Replace the record whose body names `cnid`, whatever its type.
+    ///
+    /// File and folder records both carry their object's CNID at the same offset in
+    /// the body, so one walk finds either and the caller supplies the bytes. The
+    /// replacement must still be the same length as what it replaces; see
+    /// [`Self::replace_catalog_record`].
+    fn replace_catalog_body(&mut self, cnid: u32, body: &[u8]) -> Result<()> {
+        let (node_num, node_at, offset, len) = match self.find_catalog_body(cnid)? {
+            Some(hit) => hit,
+            None => {
+                return Err(Error::NotFound {
+                    what: "catalog record",
+                })
+            }
+        };
+        if len != body.len() {
+            return Err(Error::invalid(
+                "write",
+                format!(
+                    "the replacement record is {} bytes and the one it replaces is \
+                     {len}; a length change moves every later record in the node",
+                    body.len()
+                ),
+            ));
+        }
+        let patched = {
+            let mut buf = self.read_catalog_node(node_num)?;
+            if buf.len() < offset + len {
+                return Err(Error::out_of_range(
+                    "catalog record end offset",
+                    (offset + len) as u64,
+                    buf.len() as u64,
+                ));
+            }
+            buf[offset..offset + len].copy_from_slice(body);
+            buf
+        };
+        // `node_at` comes from the extent mapper, not `node_num * node_size`: a
+        // catalog that does not start at block 0 -- which is every volume this
+        // crate generates, and most real ones -- would otherwise be written over
+        // the allocation bitmap and the volume header.
+        self.device.write_at(node_at, &patched)
+    }
+
+    /// Locate the record whose body names `cnid`.
+    ///
+    /// Returns `(node number, the node's byte address, the record's offset within
+    /// the node, the record's length)`. The address is from the extent mapper.
+    fn find_catalog_body(&self, cnid: u32) -> Result<Option<(u32, u64, usize, usize)>> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::lookup::split_record;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let mut node_num = btree_header.first_leaf_node;
+        let mut budget = btree_header.total_nodes;
+
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            for index in 0..node.num_records() {
+                let Some((key, body)) = split_record(node.record(index)?) else {
+                    continue;
+                };
+                if body.len() < 12 {
+                    continue;
+                }
+                let id = u32::from_be_bytes([body[8], body[9], body[10], body[11]]);
+                if id == cnid {
+                    return Ok(Some((
+                        node_num,
+                        bt.node_offset(node_num)?,
+                        node.record_offset(index)? + 2 + key.key_length,
+                        body.len(),
+                    )));
+                }
+            }
+            if node_num == btree_header.last_leaf_node {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            if node_num == 0 || node_num >= btree_header.total_nodes {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// Read one catalog node's bytes.
+    fn read_catalog_node(&self, node_num: u32) -> Result<Vec<u8>> {
+        use crate::btree::io::BTreeFile;
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        bt.read_node_bytes(node_num)
     }
 
     /// Free a file's blocks beyond `new_len`, shrinking its allocation.

@@ -389,6 +389,45 @@ impl FolderRecord {
             folder_count: be.u32(84)?,
         })
     }
+    /// Encode into `out`, which must be at least [`FOLDER_RECORD_SIZE`] bytes.
+    ///
+    /// The inverse of [`FolderRecord::parse`]. `valence` is the reason this
+    /// exists: a folder's child count lives in its record, so creating a file
+    /// inside one means writing the folder back, and a `valence` written as
+    /// anything but a count makes the folder read as having children that do not
+    /// exist.
+    pub fn write_to(&self, out: &mut [u8]) -> Result<()> {
+        let available = out.len();
+        let dst = out.get_mut(..FOLDER_RECORD_SIZE).ok_or(Error::Truncated {
+            what: "folder record write",
+            needed: FOLDER_RECORD_SIZE,
+            available,
+        })?;
+        dst.fill(0);
+        dst[0..2].copy_from_slice(&self.record_type.to_be_bytes());
+        dst[2..4].copy_from_slice(&self.flags.to_be_bytes());
+        dst[4..8].copy_from_slice(&self.valence.to_be_bytes());
+        dst[8..12].copy_from_slice(&self.folder_id.0.to_be_bytes());
+        dst[12..16].copy_from_slice(&self.create_date.to_be_bytes());
+        dst[16..20].copy_from_slice(&self.content_mod_date.to_be_bytes());
+        dst[20..24].copy_from_slice(&self.attribute_mod_date.to_be_bytes());
+        dst[24..28].copy_from_slice(&self.access_date.to_be_bytes());
+        dst[28..32].copy_from_slice(&self.backup_date.to_be_bytes());
+        self.bsd_info.write_to(&mut dst[32..48])?;
+        dst[48..64].copy_from_slice(&self.user_info);
+        dst[64..80].copy_from_slice(&self.finder_info);
+        dst[80..84].copy_from_slice(&self.text_encoding.to_be_bytes());
+        // dst[84..88] is reserved3, zeroed by the fill above.
+        Ok(())
+    }
+
+    /// Encode to a [`FOLDER_RECORD_SIZE`]-byte array.
+    pub fn to_bytes(&self) -> [u8; FOLDER_RECORD_SIZE] {
+        let mut out = [0u8; FOLDER_RECORD_SIZE];
+        // Writing into a correctly sized array cannot fail.
+        let _ = self.write_to(&mut out);
+        out
+    }
 }
 
 /// `struct HFSPlusCatalogFile`, 248 bytes.

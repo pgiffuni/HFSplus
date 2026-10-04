@@ -281,6 +281,201 @@ fn writing_an_empty_file_leaves_no_trailing_bytes() {
     assert_fsck_clean(&path, "an in-place write to zero length");
 }
 
+// --- Creation, which adds records ------------------------------------------
+
+#[test]
+fn creating_a_file_puts_it_where_a_reader_will_find_it() {
+    // Four structures have to move together, so all four are checked: the file
+    // record (found by name), the thread record (found by CNID), the parent
+    // folder's child count, and the header's next-CNID counter. A file in three
+    // of the four is a file that cannot be found, cannot be counted, or will be
+    // handed the same CNID twice.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let (parent, next_before, file_count_before) = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        (
+            vol.root_cnid().0,
+            vol.header().next_catalog_id,
+            vol.header().file_count,
+        )
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let cnid = writable
+            .create_file(parent, &units("created.bin"))
+            .expect("create file");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+
+    // By name -- the file record.
+    let object = vol
+        .lookup(vol.root_cnid(), &units("created.bin"))
+        .expect("lookup")
+        .expect("the created file must be findable by name");
+    let f = object.as_file().expect("a file, not a folder");
+    assert_eq!(f.cnid.0, cnid);
+    assert_eq!(f.record.data_fork.logical_size, 0, "a new file is empty");
+    assert_eq!(f.record.data_fork.total_blocks, 0);
+    assert_eq!(
+        f.record.bsd_info.file_mode & 0o7777,
+        0o644,
+        "and readable and writable, or a caller cannot write to what it just made"
+    );
+
+    // By CNID -- the thread record. `lookup_cnid` goes through it, so this is the
+    // only way a file with no thread record could be caught here.
+    let by_cnid = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("the created file must be findable by CNID");
+    assert_eq!(by_cnid.name(), &units("created.bin")[..]);
+
+    // The counters.
+    assert_eq!(
+        vol.header().next_catalog_id,
+        next_before + 1,
+        "nextCatalogID must advance, or the next file gets this one's identity"
+    );
+    assert_eq!(vol.header().file_count, file_count_before + 1);
+
+    // The parent folder's child count. The root folder's valence is readable
+    // through the catalog, and `fsck` counts children independently.
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(
+        report.is_clean(),
+        "orphaned {:?} missing {:?} missing_thread {:?}",
+        report.orphaned,
+        report.missing,
+        report.missing_thread
+    );
+    assert_fsck_clean(&path, "a created file");
+}
+
+#[test]
+fn creating_a_file_then_writing_it_takes_the_whole_path() {
+    // Creation and growth together, which is the sequence a FUSE `create` then
+    // `write` performs. The point is that a file created by *this* crate is
+    // writable by it: the record it wrote is one the growth path can find.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let cnid = writable
+            .create_file(parent, &units("grown.bin"))
+            .expect("create");
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 241) as u8).collect();
+        writable
+            .write_file_contents(cnid, &data)
+            .expect("a file created by this crate must be writable by it");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let object = vol
+        .lookup(vol.root_cnid(), &units("grown.bin"))
+        .expect("lookup")
+        .expect("grown.bin exists");
+    let expected: Vec<u8> = (0..10_000u32).map(|i| (i % 241) as u8).collect();
+    assert_eq!(vol.read(&object, 0, 10_000).expect("read back"), expected);
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(
+        report.is_clean(),
+        "orphaned {:?} missing {:?}",
+        report.orphaned,
+        report.missing
+    );
+    assert_fsck_clean(&path, "a file created and then grown");
+}
+
+#[test]
+fn creating_a_file_with_an_existing_name_is_refused() {
+    // Two records under one key still parse, still search, and answer with
+    // whichever comes first -- forever. So this has to be refused rather than
+    // inserted beside the existing record.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    let err = writable
+        .create_file(parent, &units("payload.bin"))
+        .expect_err("payload.bin already exists");
+    let rendered = format!("{err}");
+    assert!(
+        rendered.contains("payload.bin"),
+        "the refusal must name the conflict, or a caller cannot tell which name \
+         was taken; got: {rendered}"
+    );
+}
+
+#[test]
+fn creating_a_file_in_a_folder_that_is_a_file_is_refused() {
+    // CNID 16 is `payload.bin`, a file. Writing a child count into a file record
+    // would corrupt it, so the CNID has to be rejected before anything is written.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let before = std::fs::read(&path).expect("read image");
+
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    let err = writable
+        .create_file(16, &units("child.bin"))
+        .expect_err("CNID 16 is a file, not a folder");
+    assert!(
+        format!("{err}").contains("not a folder"),
+        "the refusal must say what is wrong with the CNID; got: {err}"
+    );
+    dev.sync().expect("flush");
+    drop(dev);
+    assert_untouched(&path, &before, "a create refused for a bad parent");
+}
+
+#[test]
+fn an_empty_name_is_refused() {
+    // A record keyed by an empty name is a thread record's key shape, so a file
+    // with one would be indistinguishable from a thread in the key ordering.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+    writable
+        .create_file(parent, &[])
+        .expect_err("a file cannot be nameless");
+}
+
 // --- Truncation, which frees -----------------------------------------------
 
 /// Grow `payload.bin` to 8192 bytes so there is a block to give back.
