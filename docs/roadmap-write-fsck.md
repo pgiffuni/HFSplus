@@ -148,3 +148,16 @@ Producing a genuinely *crash-consistent* image — a volume whose journal is new
 than its filesystem because the machine died mid-write — needs either macOS or
 fault injection. `tools/mktorn.py` writes the same on-disk state directly, which
 covers what replay must do, but not the fact that a real crash produces it.
+
+# Superseded
+
+This was the plan while the milestone was "make a checker". That is done, and the
+roadmap has moved on. See:
+
+- `docs/source-map.md` — where every translated item came from, and what is not
+  yet mined
+- `docs/mutation-invariants.md` — the rules a mutation must preserve, written
+  down before any mutation exists
+
+The framing that carried over unchanged: the oracle is Apple's source, and an
+external checker is evidence of agreement rather than a source of truth.

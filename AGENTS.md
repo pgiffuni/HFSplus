@@ -22,9 +22,17 @@ depends on the library.
 
 ## Hard rules
 
-- **Cite the mining source.** Every item derived from Apple states its origin in
-  rustdoc: which file, which function, and which on-disk structures are involved.
-  Verify with `rg -n 'Mining reference: Apple' src/`.
+- **Record what mining found, in rustdoc.** Every item derived from Apple carries
+  a doc comment explaining what it represents, its on-disk layout, the invariants
+  it depends on, and any behaviour that differs from Apple. That is the substance
+  of the mining and it belongs next to the code it describes.
+
+  The `.c`/`.h` origin — which file and which function — is **not** carried in
+  rustdoc. It lives in `docs/source-map.md`, once per item, where it can be
+  checked against the Apple tree instead of being asserted 225 times in a form
+  nobody audits. A doc comment may name a function when the *name itself* carries
+  the meaning, as `replay_journal` and `CheckFileData` do; that is a citation in
+  the useful sense, not provenance bookkeeping.
 - **Explain, do not paste.** Describe an Apple algorithm in original words. Never
   paste large source fragments into documentation.
 - **No `unsafe` over image bytes.** `#![deny(unsafe_code)]` is set. Use the
@@ -57,6 +65,14 @@ far, all recorded in `docs/hfs-format.md`:
 - `fsck.hfsplus` **modifies** the image it checks, and repairs a bad primary
   header from the backup. It is not a conformance oracle, and it must never be
   pointed at a fixture.
+
+## Documentation
+
+- `docs/hfs-format.md` — the on-disk format, and the disagreements between sources
+- `docs/source-map.md` — where each translated item came from, and what is not yet mined
+- `docs/mutation-invariants.md` — the rules a mutation must preserve
+- `docs/dev-tools.md` — the tools, and what each can and cannot establish
+- `docs/roadmap-write-fsck.md` — superseded; kept for the record
 
 ## Tests
 
