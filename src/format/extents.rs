@@ -170,6 +170,43 @@ impl ExtentRecord {
     pub fn used(&self) -> usize {
         self.iter().count()
     }
+
+    /// The index of the first free slot, if there is one.
+    ///
+    /// # Why adding an extent does not change a record's length
+    ///
+    /// An `HFSPlusExtentRecord` is a fixed eight-slot array, not a variable-length
+    /// list: "the extent record is full" is a real condition, and the answer to it
+    /// is a record in the extents B-tree rather than a wider inline record. So a
+    /// file that grows within its eight inline extents has a catalog record of
+    /// exactly the same size as before, and growing it needs no B-tree mutation at
+    /// all. That is what makes allocation testable before Milestone 8C.
+    ///
+    /// Returns `None` once all eight slots are meaningful. The ninth extent has to
+    /// go somewhere else, and pretending otherwise by overflowing the array is how
+    /// a catalog record ends up 8 bytes longer than the format allows.
+    pub fn next_free(&self) -> Option<usize> {
+        self.raw.iter().position(ExtentDescriptor::is_terminator)
+    }
+
+    /// Fill slot `index` with `descriptor`.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an index past the end of the record. It does *not* check that the
+    /// slot is free: an allocation that skipped a used slot would produce two
+    /// extents describing the same block range, and the catalog would read as
+    /// though the file were larger than the volume.
+    pub fn set(&mut self, index: usize, descriptor: ExtentDescriptor) -> Result<()> {
+        let len = self.raw.len();
+        let slot = self.raw.get_mut(index).ok_or(Error::out_of_range(
+            "extent slot",
+            index as u64,
+            len as u64,
+        ))?;
+        *slot = descriptor;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -666,26 +666,30 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // The fork's blocks, as device block numbers, in logical order. No overflow
         // here: a fork that overflowed needs the extents tree, which is allocation
         // work rather than a serialisation change.
-        let record = self.read_file_record(cnid)?;
-        let mut blocks = Vec::new();
-        for extent in record.data_fork.extents.iter() {
-            for offset in 0..extent.block_count {
-                blocks.push(extent.start_block + offset);
-            }
-        }
-        let capacity = blocks.len() * block_size as usize;
+        let mut record = self.read_file_record(cnid)?;
+
+        let owned = record.data_fork.total_blocks as usize;
+        let capacity = owned * block_size as usize;
         if data.len() > capacity {
-            return Err(Error::invalid(
-                "write",
-                format!(
-                    "{} bytes exceeds the {} that the file's {} existing block(s) hold; \
-                     growing a file needs an allocator",
-                    data.len(),
-                    capacity,
-                    blocks.len()
-                ),
-            ));
+            // Round up to whole blocks, the way `AddExtents` computes
+            // `blocksToAdd` with `howmany`. A request of one byte over a block
+            // boundary needs a whole extra block, and rounding down would leave
+            // the file with fewer blocks than its logical size requires.
+            // `howmany(n, d)` rather than `div_ceil`, which is 1.73 and this crate
+            // is 1.70.
+            let needed = (data.len() + block_size as usize - 1) / block_size as usize;
+            let extra = needed - owned;
+            self.grow_fork(&mut record, extra)?;
         }
+
+        // The fork's blocks, as device block numbers, in logical order. Built after
+        // any growth, so a newly allocated extent is written like any other.
+        let blocks: Vec<u32> = record
+            .data_fork
+            .extents
+            .iter()
+            .flat_map(|e| (0..e.block_count).map(move |o| e.start_block + o))
+            .collect();
 
         // The data blocks first: until the record says so, the old length is
         // still what a reader will ask for, so writing the blocks before the
@@ -703,7 +707,6 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // Then the record: logicalSize, and the two timestamps a content change
         // touches. One clock read for both, so the record does not disagree with
         // itself across a second boundary.
-        let mut record = record;
         record.data_fork.logical_size = data.len() as u64;
         let now = crate::timestamp::now_hfs(expanded).map_err(|e| Error::Io {
             message: e.to_string(),
@@ -711,6 +714,146 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         record.content_mod_date = now;
         record.attribute_mod_date = now;
         self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Give `record`'s data fork `extra` more blocks, and put them on disk.
+    ///
+    /// Order of operations, and why each step is where it is:
+    ///
+    /// 1. **Check there is a free extent slot.** An `HFSPlusExtentRecord` is eight
+    ///    fixed slots, and the ninth extent lives in the extents B-tree. Adding a
+    ///    ninth is a B-tree insert, which is Milestone 8C; refusing here names that
+    ///    rather than overflowing a fixed array.
+    /// 2. **Check the header's free count against the bitmap.** Apple trusts
+    ///    `freeBlocks` for its disk-full short-circuit without recounting, because
+    ///    the kernel holds the mount and updates both together. There is no such
+    ///    lock here and the image is untrusted, so a disagreement means the image is
+    ///    damaged -- and allocating on top of it would destroy the evidence.
+    /// 3. **Reserve**, then extend the extent record in memory.
+    /// 4. **Flush the bitmap and the header's free count to disk**, before the data
+    ///    blocks and before the catalog record.
+    ///
+    /// Step 4 is where it has to be. A crash after it leaves blocks that are
+    /// marked allocated but that nothing references -- orphans, which
+    /// [`crate::check`] reports and `fsck.hfsplus` reclaims. The reverse order
+    /// leaves a catalog record pointing at blocks the bitmap calls free, so a later
+    /// writer could hand the same blocks to a second file. Leaking space is
+    /// recoverable; two files sharing blocks is not.
+    fn grow_fork(&mut self, record: &mut FileRecord, extra: usize) -> Result<()> {
+        use crate::alloc::AllocationMap;
+        use crate::format::extents::ExtentDescriptor;
+
+        if record.data_fork.extents.next_free().is_none() {
+            return Err(Error::invalid(
+                "write",
+                format!(
+                    "the file's data fork already uses all {} inline extents; a \
+                     ninth extent has to go in the extents B-tree, which is not \
+                     implemented",
+                    record.data_fork.extents.raw.len()
+                ),
+            ));
+        }
+
+        // The allocation file is read whole, using its own declared length: it is a
+        // full allocation block on every volume, not merely the bytes the bitmap
+        // needs. Same as the checker reads it, so the two cannot disagree about
+        // which bits are set.
+        let fork = &self.header.allocation_file;
+        let limit = usize::try_from(fork.logical_size).unwrap_or(1 << 20);
+        let bytes = {
+            let reader = ForkReader::new(&*self.device, fork, self.header.block_size);
+            reader.read(0, limit)?
+        };
+        let mut map = AllocationMap::from_bytes(&bytes, self.header.total_blocks)?
+            .with_alloc_limit(self.header.total_blocks);
+
+        // Apple's disk-full short-circuit, and the check that makes it safe to
+        // trust: the header's count must agree with the bitmap before it is used.
+        let declared = self.header.free_blocks;
+        let counted = self
+            .header
+            .total_blocks
+            .saturating_sub(map.count_allocated().min(u64::from(u32::MAX)) as u32);
+        if counted != declared {
+            return Err(Error::invalid(
+                "volume_header.freeBlocks",
+                format!(
+                    "the header says {declared} free block(s) but the allocation \
+                     bitmap has {counted}; refusing to allocate on a volume whose \
+                     free count and bitmap disagree"
+                ),
+            ));
+        }
+
+        // Ask for space adjacent to the file's last extent. That is the whole
+        // reason a growing file gets one extent instead of eight: the allocator is
+        // told where the file already is, so first fit finds the block just after
+        // it rather than the first gap anywhere on the volume.
+        let hint = record
+            .data_fork
+            .extents
+            .iter()
+            .last()
+            .map_or(1, |e| e.end_block().map_or(1, |end| end as u32 + 1));
+        let start = map.reserve(hint, extra as u32)?;
+
+        let slot = record
+            .data_fork
+            .extents
+            .next_free()
+            .expect("checked above that a slot is free");
+        record.data_fork.extents.set(
+            slot,
+            ExtentDescriptor {
+                start_block: start,
+                block_count: extra as u32,
+            },
+        )?;
+        record.data_fork.total_blocks += extra as u32;
+
+        // The bitmap goes to disk before the data blocks and before the record.
+        // See the method doc for why that order and not the other.
+        self.write_allocation_bitmap(&map, declared - extra as u32)?;
+        Ok(())
+    }
+
+    /// Write the allocation bitmap, and the volume header's free count.
+    ///
+    /// One whole allocation block at a time, because that is the unit a checker
+    /// reads. The header is written *after* the bitmap, never before: a header
+    /// claiming fewer free blocks than the bitmap shows is an inconsistency this
+    /// crate would rather not create even transiently.
+    fn write_allocation_bitmap(
+        &mut self,
+        map: &crate::alloc::AllocationMap,
+        free_blocks: u32,
+    ) -> Result<()> {
+        use crate::blockdev::VOLUME_HEADER_OFFSET;
+        use crate::extent::mapper::ExtentMapper;
+
+        let block_size = self.header.block_size as usize;
+        let fork = &self.header.allocation_file;
+        let mapper = ExtentMapper::new(fork, self.header.block_size);
+        let bytes = map.as_bytes();
+
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let in_block = i % block_size;
+            // A whole block at a time where the bitmap starts on a block
+            // boundary; otherwise one byte, because a partial-block write would
+            // clobber whatever shares the block.
+            let span = if in_block == 0 && block_size >= 64 {
+                block_size.min(bytes.len() - i)
+            } else {
+                1
+            };
+            let at = mapper.map_to_device_offset((i / block_size) as u32, in_block as u64)?;
+            self.device.write_at(at, &bytes[i..i + span])?;
+            i += span;
+        }
+        self.device
+            .write_at(VOLUME_HEADER_OFFSET + 48, &free_blocks.to_be_bytes())
     }
 
     /// Read a file's catalog record.
