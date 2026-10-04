@@ -1055,6 +1055,73 @@ fn renaming_onto_a_name_that_is_taken_is_refused() {
 }
 
 #[test]
+fn renaming_onto_a_name_that_folds_onto_an_existing_one_is_refused() {
+    // On this volume `keyCompareType` is `kHFSCaseFolding`, so `README.TXT` and
+    // `Readme.txt` are *one key to the tree* even though the strings differ. A
+    // rename must treat that as a collision.
+    //
+    // This is a safety property rather than a feature, and it was pinned after an
+    // attempt at the case-variant rename produced the opposite: a record removed
+    // that was then not put back, and a second record under a key the tree
+    // considers equal to an existing one. Neither may happen, and the way to say
+    // so is to assert the refusal *and* that all three records survive it.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_file(parent, &units("Readme.txt"))
+                .expect("create");
+            writable
+                .create_file(parent, &units("other.bin"))
+                .expect("create");
+            let err = writable
+                .rename(parent, &units("other.bin"), parent, &units("README.TXT"))
+                .expect_err("README.TXT folds onto Readme.txt");
+            assert!(
+                format!("{err}").contains("README.TXT"),
+                "the refusal must name the destination; got: {err}"
+            );
+            dev.sync().expect("flush");
+        }
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    for n in ["Readme.txt", "other.bin"] {
+        assert!(
+            vol.lookup(vol.root_cnid(), &units(n))
+                .expect("lookup")
+                .is_some(),
+            "{n} must survive the refused rename: a rename that has already \
+             removed a record when it discovers the collision has lost it"
+        );
+    }
+    // And no second record under a key the tree considers equal to an existing one.
+    let under_parent = vol
+        .catalog()
+        .all_records()
+        .expect("walk the catalog")
+        .into_iter()
+        .filter(|(k, _)| k.parent_id.0 == parent)
+        .count();
+    assert_eq!(
+        under_parent, 3,
+        "three entries -- the two files and the root's own -- and no duplicate"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a rename onto a case-folded name, refused");
+}
+
+#[test]
 fn a_folder_is_created_and_counted() {
     // `folderCount` excludes the root, which is the kind of off-by-one that only
     // an independent checker notices: a volume with one folder and nothing else
