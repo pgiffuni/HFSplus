@@ -21,6 +21,17 @@ pub const HEADER_RECORD_SIZE: usize = 106;
 /// `GetBTreeBlock`, which writes 14 rather than `sizeof(...)` deliberately.
 pub const HEADER_RECORD_OFFSET: usize = 14;
 
+/// Byte offset of `leafRecords` within the header record.
+///
+/// Named because a writer needs it and 6 is not guessable: the fields are packed
+/// with no alignment padding -- `treeDepth` is a `u16`, so `rootNode` starts at 2
+/// and `leafRecords` at 6 -- and writing at 8 instead lands in `firstLeafNode`,
+/// which then reads as a node number no volume has.
+pub const LEAF_RECORDS_OFFSET: u64 = 6;
+
+/// Byte offset of `firstLeafNode` within the header record.
+pub const FIRST_LEAF_OFFSET: u64 = 10;
+
 /// `kBTreeHeaderUserBytes`: the user data area that follows the header record.
 ///
 /// Mining reference: Apple `core/BTreesInternal.h` `#define kBTreeHeaderUserBytes 128`.

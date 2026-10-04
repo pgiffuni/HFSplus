@@ -598,3 +598,458 @@ mod tests {
         assert_eq!(n.free_space().unwrap(), 0);
     }
 }
+
+// --- Mutation -------------------------------------------------------------
+//
+// The layout here is a fixed fact of the format, verified against real images
+// rather than inferred: a node's record offsets live at the *end* of the node,
+// with record 0's offset in the last two bytes, record 1's two bytes below that,
+// and so on. So slot `i` is at `node_size - 2 * (i + 1)`, and the offset values
+// increase with `i` because records are stored in ascending address order.
+//
+// Mining reference: `GetRecordOffset` and `GetOffsetAddress` in
+// `core/BTreeNodeOps.c` are `node + nodeSize - (index << 1) - kOffsetSize`, and
+// `kOffsetSize` is 2 (`core/BTreesPrivate.h`).
+
+/// Byte offset of the offset slot for record `index`.
+///
+/// `index` may equal the record count, which is the free offset — the address one
+/// past the last record, and how a node's used length is found.
+pub fn offset_slot(node_size: usize, index: usize) -> Option<usize> {
+    let at = node_size.checked_sub(index.checked_mul(2)?.checked_add(OFFSET_SIZE)?)?;
+    Some(at)
+}
+
+/// Read the offset slot for record `index`.
+pub fn read_offset(node: &[u8], index: usize) -> Result<usize> {
+    let node_size = node.len();
+    let at = offset_slot(node_size, index).ok_or(Error::Truncated {
+        what: "btree node offset slot",
+        needed: index.saturating_mul(2).saturating_add(OFFSET_SIZE),
+        available: node_size,
+    })?;
+    Ok(usize::from(u16::from_be_bytes([
+        *node.get(at).ok_or(Error::Truncated {
+            what: "btree node offset slot",
+            needed: 2,
+            available: node_size.saturating_sub(at),
+        })?,
+        *node.get(at + 1).ok_or(Error::Truncated {
+            what: "btree node offset slot",
+            needed: 2,
+            available: node_size.saturating_sub(at),
+        })?,
+    ])))
+}
+
+/// Write the offset slot for record `index`.
+fn write_offset(node: &mut [u8], index: usize, value: usize) -> Result<()> {
+    let node_size = node.len();
+    let at = offset_slot(node_size, index).ok_or(Error::Truncated {
+        what: "btree node offset slot",
+        needed: index.saturating_mul(2).saturating_add(OFFSET_SIZE),
+        available: node_size,
+    })?;
+    let bytes = u16::try_from(value)
+        .map_err(|_| Error::out_of_range("node record offset", value as u64, u16::MAX as u64))?;
+    node.get_mut(at..at + OFFSET_SIZE)
+        .ok_or(Error::Truncated {
+            what: "btree node offset slot",
+            needed: OFFSET_SIZE,
+            available: node_size.saturating_sub(at),
+        })?
+        .copy_from_slice(&bytes.to_be_bytes());
+    Ok(())
+}
+
+/// The record count in a node's descriptor.
+///
+/// At offset 10: `fLink` 0..4, `bLink` 4..8, `kind` 8, `height` 9,
+/// `numRecords` 10..12, `reserved` 12..14.
+pub fn num_records(node: &[u8]) -> Result<u16> {
+    let at = 10;
+    Ok(u16::from_be_bytes([
+        *node.get(at).ok_or(Error::Truncated {
+            what: "btree node descriptor",
+            needed: at + 1,
+            available: node.len(),
+        })?,
+        *node.get(at + 1).ok_or(Error::Truncated {
+            what: "btree node descriptor",
+            needed: at + 2,
+            available: node.len(),
+        })?,
+    ]))
+}
+
+fn set_num_records(node: &mut [u8], count: u16) -> Result<()> {
+    let len = node.len();
+    node.get_mut(10..12)
+        .ok_or(Error::Truncated {
+            what: "btree node descriptor",
+            needed: 12,
+            available: len,
+        })?
+        .copy_from_slice(&count.to_be_bytes());
+    Ok(())
+}
+
+/// Unused bytes in a node, as `GetNodeFreeSize` computes it.
+///
+/// `nodeSize - freeOffset - numRecords * 2 - kOffsetSize`: everything between the
+/// end of the last record and the offset array, minus the array itself. The `-2`
+/// matters — an insertion needs a slot for the new record's offset as well as
+/// room for its bytes, and a node that has room for the bytes but not the slot
+/// cannot take the record.
+///
+/// Mining reference: `GetNodeFreeSize`, `core/BTreeNodeOps.c`.
+pub fn free_space(node: &[u8]) -> Result<usize> {
+    let node_size = node.len();
+    let count = usize::from(num_records(node)?);
+    let free_offset = read_offset(node, count)?;
+    let used_slots = (count + 1) * OFFSET_SIZE;
+    node_size
+        .checked_sub(free_offset)
+        .and_then(|v| v.checked_sub(used_slots))
+        .ok_or(Error::invalid(
+            "btree node",
+            format!(
+                "freeOffset {free_offset} and {count} record(s) need more than the \
+                 {node_size}-byte node"
+            ),
+        ))
+}
+
+/// Insert `record` at `index`, shifting later records and their offsets right.
+///
+/// # The layout, and why the new record goes where the old one was
+///
+/// Records occupy a contiguous run starting just after the descriptor, in
+/// ascending address order, and the offset array at the node's end maps slot `i`
+/// to record `i`'s address. Inserting therefore has to open a hole: everything from
+/// `index` onwards slides right by `record.len()`, the offsets of those records
+/// move with them, and a new offset slot appears for the free offset. The new
+/// record lands at the *old* address of record `index`, which is why slot `index`
+/// itself does not change — the slot is still correct, it just describes different
+/// bytes.
+///
+/// Afterwards, with `n` the original record count:
+///
+/// | slot | value |
+/// | --- | --- |
+/// | `0..index` | unchanged |
+/// | `index` | unchanged (the new record took record `index`'s address) |
+/// | `index+1 ..= n` | the old slot below it, plus `record.len()` |
+/// | `n+1` | the old free offset, plus `record.len()` |
+///
+/// # Errors
+///
+/// [`Error::NoSpace`] when the record and its offset slot do not both fit. The
+/// node is left untouched in that case, so a caller that splits the node instead
+/// has not half-applied anything.
+///
+/// Mining reference: `InsertRecord` and `InsertKeyRecord` in
+/// `core/BTreeNodeOps.c` — `GetNodeFreeSize`, the `MoveRecordsRight`, the
+/// `InsertOffset`, then the copy. `InsertKeyRecord` splits key and record; this
+/// takes one already-encoded blob, because the caller has the key bytes.
+///
+/// # A note on the source, unresolved
+///
+/// `InsertOffset` there writes `numRecords - index` slots, starting at the free
+/// slot and walking down. By the layout above, that leaves slot `index + 1`
+/// holding the old value rather than the old `index` slot plus `delta`. The layout
+/// itself is not in doubt — it was measured against real images, where slot 0 is
+/// the last two bytes of the node. So either that loop count is short by one, or
+/// `index` reaches it adjusted, and reading it did not settle which. This
+/// implementation follows the layout rather than the loop, and
+/// `every_record_is_still_findable_after_an_insertion` is the test that decides
+/// whether the layout is self-consistent.
+pub fn insert_record(node: &mut [u8], index: usize, record: &[u8]) -> Result<()> {
+    let node_size = node.len();
+    let count = usize::from(num_records(node)?);
+    if index > count {
+        return Err(Error::out_of_range(
+            "btree record index",
+            index as u64,
+            count as u64,
+        ));
+    }
+    let need = record.len() + OFFSET_SIZE;
+    let available = free_space(node)?;
+    if available < need {
+        return Err(Error::no_space(need as u32, available as u64));
+    }
+
+    let at = read_offset(node, index)?;
+    let free_at = read_offset(node, count)?;
+    let moved = free_at - at;
+
+    // Slide the tail right, from the back so the overlap is never read as stale.
+    //
+    // `at + record.len() + moved` must not exceed the free offset's new position:
+    // the node's used region grows by exactly `record.len()`, and `free_space`
+    // already proved the offset array has room for one more slot.
+    let end = at + record.len() + moved;
+    if end > node_size - (count + 2) * OFFSET_SIZE {
+        return Err(Error::no_space(need as u32, available as u64));
+    }
+    node.copy_within(at..free_at, at + record.len());
+
+    // Offsets. Walk from the last one down so each read is still the old value.
+    for i in (index + 1..=count + 1).rev() {
+        let below = read_offset(node, i - 1)?;
+        write_offset(node, i, below + record.len())?;
+    }
+    set_num_records(node, count as u16 + 1)?;
+    node.get_mut(at..at + record.len())
+        .ok_or(Error::Truncated {
+            what: "btree node record area",
+            needed: record.len(),
+            available: node_size.saturating_sub(at),
+        })?
+        .copy_from_slice(record);
+    Ok(())
+}
+
+/// Remove record `index`, sliding later records and their offsets left.
+///
+/// The inverse of [`insert_record`], and it leaves the freed bytes in place rather
+/// than clearing them: the next insertion overwrites them, and a node's unused
+/// tail is not interpreted by anything.
+///
+/// Mining reference: `DeleteRecord` and `DeleteOffset` in `core/BTreeNodeOps.c`.
+pub fn remove_record(node: &mut [u8], index: usize) -> Result<()> {
+    let count = usize::from(num_records(node)?);
+    if index >= count {
+        return Err(Error::out_of_range(
+            "btree record index",
+            index as u64,
+            count.saturating_sub(1) as u64,
+        ));
+    }
+    let at = read_offset(node, index)?;
+    let next = read_offset(node, index + 1)?;
+    let free_at = read_offset(node, count)?;
+    let size = next - at;
+    node.copy_within(next..free_at, at);
+
+    for i in index..count {
+        let below = read_offset(node, i + 1)?;
+        write_offset(node, i, below - size)?;
+    }
+    // The new free offset is the last real record's offset, or 14 when the node is
+    // left empty -- the first free byte after the descriptor.
+    let new_free = if count == 1 {
+        NODE_DESCRIPTOR_SIZE
+    } else {
+        read_offset(node, count - 1)?
+    };
+    write_offset(node, count - 1, new_free)?;
+    set_num_records(node, count as u16 - 1)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+
+    /// A node of `node_size` bytes with `count` records of `rec_size` each,
+    /// written the way a real one is: descriptor, then records in ascending
+    /// address order, then the offset array from the end.
+    fn build(node_size: usize, rec_size: usize, count: usize) -> Vec<u8> {
+        let mut node = vec![0u8; node_size];
+        let base = NODE_DESCRIPTOR_SIZE;
+        for i in 0..count {
+            let at = base + i * rec_size;
+            node[at..at + rec_size].fill(0xA0u8.wrapping_add(i as u8));
+            write_offset(&mut node, i, at).expect("offset");
+        }
+        let free = if count == 0 {
+            base
+        } else {
+            base + count * rec_size
+        };
+        write_offset(&mut node, count, free).expect("free offset");
+        // Leaf, height 1. Written after the offsets so nothing clobbers them:
+        // `numRecords` lives at 10, which is inside the region a careless helper
+        // would have used for the record area.
+        node[8] = 0xFF; // kBTLeafNode
+        node[9] = 1;
+        set_num_records(&mut node, count as u16).expect("count");
+        node
+    }
+
+    fn record_at(node: &[u8], i: usize) -> Vec<u8> {
+        let at = read_offset(node, i).expect("offset");
+        let end = read_offset(node, i + 1).expect("next offset");
+        node[at..end].to_vec()
+    }
+
+    /// The property the whole module rests on: after an insertion, every record
+    /// that was there is still findable, at its new offset, with its bytes
+    /// intact -- and a search over the node finds them all.
+    ///
+    /// This is the test that decides whether the layout in the docs is
+    /// self-consistent, rather than whether it matches a particular loop in
+    /// Apple's source. Every other mutation test here is a special case of it.
+    #[test]
+    fn every_record_is_still_findable_after_an_insertion() {
+        let node_size = 512;
+        let rec_size = 20;
+        let before: Vec<Vec<u8>> = (0..6)
+            .map(|i| vec![0xA0u8.wrapping_add(i as u8); rec_size])
+            .collect();
+
+        // Insert at every position, including the end and the beginning.
+        for index in 0..=6usize {
+            let mut node = build(node_size, rec_size, 6);
+            let inserted = vec![0xEEu8; rec_size];
+            insert_record(&mut node, index, &inserted).expect("insert");
+
+            assert_eq!(
+                num_records(&node).expect("count"),
+                7,
+                "inserting at {index} must leave seven records"
+            );
+
+            // Every original record survives, in order, with the new one in the
+            // right place.
+            for (i, want) in before.iter().enumerate() {
+                let got_index = if i < index { i } else { i + 1 };
+                assert_eq!(
+                    &record_at(&node, got_index),
+                    want,
+                    "inserting at {index}: original record {i} moved or changed"
+                );
+            }
+            assert_eq!(
+                &record_at(&node, index),
+                &inserted,
+                "inserting at {index}: the new record is not where it was asked for"
+            );
+
+            // The free offset accounts for every byte, and free space agrees.
+            let used_end = read_offset(&node, 7).expect("free offset");
+            assert_eq!(
+                used_end,
+                NODE_DESCRIPTOR_SIZE + 7 * rec_size,
+                "inserting at {index}: the used region must grow by exactly one record"
+            );
+            assert_eq!(
+                free_space(&node).expect("free space"),
+                node_size - used_end - 8 * OFFSET_SIZE,
+                "inserting at {index}: free space must account for the new offset slot"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_with_no_records_starts_its_first_record_after_the_descriptor() {
+        // The boundary: with no records there is no slot 0 to copy an offset from,
+        // so the used region starts at the descriptor's end. Getting this wrong
+        // writes a record over the descriptor, which still parses as a node.
+        let mut node = build(512, 20, 0);
+        insert_record(&mut node, 0, &[7u8; 20]).expect("insert");
+        assert_eq!(read_offset(&node, 0).expect("offset"), NODE_DESCRIPTOR_SIZE);
+        assert_eq!(&record_at(&node, 0), &vec![7u8; 20]);
+    }
+
+    #[test]
+    fn a_record_that_does_not_fit_is_refused_and_changes_nothing() {
+        let mut node = build(512, 20, 4);
+        let snapshot = node.clone();
+        // Free space here is 512 - 94 (four records and a descriptor) - 10 (five
+        // offset slots) = 408, so 500 bytes cannot fit and 400 easily could.
+        let err = insert_record(&mut node, 2, &[0u8; 500]).expect_err("500 bytes will not fit");
+        assert!(
+            matches!(err, Error::NoSpace { .. }),
+            "a record that does not fit is out of space, not a corrupt node; got {err:?}"
+        );
+        assert_eq!(
+            node, snapshot,
+            "a refused insert must not have moved anything"
+        );
+    }
+
+    /// The `+2` is the new offset slot. A node with room for the bytes but not the
+    /// slot cannot take the record, and accepting it would write over the offset
+    /// array -- losing every record after the insertion point.
+    #[test]
+    fn the_new_offset_slot_is_charged_against_free_space() {
+        let node_size = 512;
+        let mut node = build(node_size, 40, 5);
+        let free = free_space(&node).expect("free space");
+        // Exactly free bytes fit a record of that length *plus* no slot.
+        insert_record(&mut node, 5, &vec![1u8; free - OFFSET_SIZE]).expect("exact fit");
+        assert_eq!(free_space(&node).expect("after"), 0);
+        assert!(insert_record(&mut node, 6, &[2u8; 2]).is_err(), "now full");
+    }
+
+    #[test]
+    fn removal_is_the_inverse_of_insertion() {
+        let node_size = 512;
+        let rec_size = 20;
+        let original: Vec<Vec<u8>> = (0..5)
+            .map(|i| vec![0xA0u8.wrapping_add(i as u8); rec_size])
+            .collect();
+
+        for index in 0..5usize {
+            let mut node = build(node_size, rec_size, 5);
+            // Push it to the back first so removal has both a tail and a middle.
+            insert_record(&mut node, index, &vec![0xEEu8; rec_size]).expect("insert");
+            remove_record(&mut node, index).expect("remove");
+
+            assert_eq!(num_records(&node).expect("count"), 5);
+            for (i, want) in original.iter().enumerate() {
+                assert_eq!(
+                    &record_at(&node, i),
+                    want,
+                    "removing index {index}: record {i} did not come back intact"
+                );
+            }
+            assert_eq!(
+                read_offset(&node, 5).expect("free offset"),
+                NODE_DESCRIPTOR_SIZE + 5 * rec_size,
+                "removing index {index}: the used region must shrink by exactly one record"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_the_only_record_leaves_the_region_after_the_descriptor() {
+        let mut node = build(512, 20, 1);
+        remove_record(&mut node, 0).expect("remove");
+        assert_eq!(num_records(&node).expect("count"), 0);
+        assert_eq!(read_offset(&node, 0).expect("offset"), NODE_DESCRIPTOR_SIZE);
+        // And a node that has been emptied can take a record again.
+        insert_record(&mut node, 0, &[3u8; 20]).expect("insert");
+        assert_eq!(&record_at(&node, 0), &vec![3u8; 20]);
+    }
+
+    /// A node whose descriptor and offsets are truncated must produce an error
+    /// rather than a panic or a read past the end. `Node` parses defensively;
+    /// these functions have to be as careful.
+    #[test]
+    fn a_truncated_node_is_an_error_rather_than_a_panic() {
+        assert!(read_offset(&[], 0).is_err());
+        assert!(
+            read_offset(&[0u8; 1], 0).is_err(),
+            "one byte cannot hold a slot"
+        );
+        assert!(read_offset(&[0u8; 3], 1).is_err(), "index 1 needs four");
+        assert!(num_records(&[0u8; 11]).is_err());
+        assert!(set_num_records(&mut [0u8; 5], 1).is_err());
+        assert!(insert_record(&mut [0u8; 8], 0, &[1, 2]).is_err());
+        assert!(remove_record(&mut [0u8; 8], 0).is_err());
+    }
+
+    #[test]
+    fn an_out_of_range_index_is_refused() {
+        let mut node = build(512, 20, 3);
+        assert!(
+            insert_record(&mut node, 4, &[1u8; 20]).is_err(),
+            "past the count"
+        );
+        assert!(remove_record(&mut node, 3).is_err(), "past the last record");
+    }
+}
