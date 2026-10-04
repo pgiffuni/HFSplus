@@ -233,10 +233,43 @@ Three findings, none of which the crate had recorded:
   than read -- so "the resource fork is empty" can mean hidden, not absent, and
   "the data fork is short" can mean compressed rather than truncated.
 
-The attribute names HFS+ writes for its own bookkeeping are pinned in
-`src/attributes/names.rs`, verified against the source rather than recalled:
-they are exact, case-sensitive strings that are part of the on-disk key, and no
-case folding applies to them.
+## Compression metadata
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_vnops.c` `hfs_vnop_listxattr`, `hfs_vnop_getxattr`; `core/hfs_readwrite.c` `hfs_read`; the decmpfs reader is not vendored here |
+| Structures | a decmpfs disk header, carried as an attribute's value |
+| Invariants | the attribute is hidden from the extended-attribute interface |
+| Rust | `src/attributes/names.rs` — the name, and `is_compressed` |
+| Differences | nothing decodes a decmpfs payload, by design |
+
+Where the metadata lives: an attribute named `com.apple.decmpfs`, **filtered out
+of `listxattr` and `getxattr`**. So a reader that enumerates attributes does not
+see it, and one that reads the data fork gets compressed bytes rather than the
+file's contents.
+
+Two wrong answers this produces, both silent:
+
+- "the data fork is shorter than the logical size" can mean compressed, not
+  truncated.
+- "this file has no attributes" can mean it has compression metadata that was
+  hidden.
+
+The name is **corroborated, not mined**: `core/` uses the macro
+`DECMPFS_XATTR_NAME` but its definition is in a decmpfs header this tree does not
+vendor, and `livefiles_hfs_plugin/lf_hfs_vnode.c` spells the same literal. Two
+implementations agreeing is weaker evidence than the authority, and it is recorded
+as such rather than presented as mined.
+
+Decoding is deliberately absent. The roadmap's instruction is not to implement
+compression mutation because the metadata can be parsed, and the read side has the
+same shape of trap: a reader that meets a compressed file must say so rather than
+serve compressed bytes as if they were the file.
+
+The other attribute names HFS+ writes for its own bookkeeping are pinned in
+`src/attributes/names.rs`, verified against the source rather than recalled: they
+are exact, case-sensitive strings that are part of the on-disk key, and no case
+folding applies to them.
 
 ## Writable volume
 

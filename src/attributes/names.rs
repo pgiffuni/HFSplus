@@ -52,6 +52,35 @@ pub const CONTENT_PROTECTION_NAME: &str = "com.apple.system.cprotect";
 /// The quarantine flag macOS sets on a downloaded file.
 pub const QUARANTINE_NAME: &str = "com.apple.quarantine";
 
+/// The decmpfs compression metadata.
+///
+/// Present on a compressed file, and **hidden from the extended-attribute
+/// interface**: `listxattr` and `getxattr` filter it out, so a reader that
+/// enumerates attributes does not see it and a reader that reads the data fork
+/// naively gets compressed bytes rather than the file's contents.
+///
+/// Two consequences worth stating, because both produce wrong answers rather than
+/// errors:
+///
+/// - "This file's data fork is shorter than its logical size" can mean the file is
+///   compressed, not truncated.
+/// - "This file has no attributes" can mean it has compression metadata that was
+///   hidden.
+///
+/// The name is corroborated rather than mined: `core/` uses the macro
+/// `DECMPFS_XATTR_NAME` but its definition is in a decmpfs header this tree does
+/// not vendor. `livefiles_hfs_plugin/lf_hfs_vnode.c` spells the same literal,
+/// which is a second implementation agreeing rather than the authority.
+///
+/// # Not implemented
+///
+/// Nothing here decodes a decmpfs payload. That is deliberate and it is the
+/// roadmap's instruction: do not implement compression mutation merely because
+/// the metadata can be parsed. The correct behaviour for a reader that meets a
+/// compressed file is to say so rather than to serve compressed bytes as if they
+/// were the file.
+pub const DECOMPRESSION_NAME: &str = "com.apple.decmpfs";
+
 /// Every attribute name HFS+ writes for its own bookkeeping.
 ///
 /// Useful for a caller that must tell system metadata from user attributes --
@@ -63,7 +92,25 @@ pub const SYSTEM_ATTRIBUTE_NAMES: &[&str] = &[
     FIRST_LINK_NAME,
     CONTENT_PROTECTION_NAME,
     QUARANTINE_NAME,
+    DECOMPRESSION_NAME,
 ];
+
+/// Whether the file is compressed, according to its attributes.
+///
+/// False both when there is no decmpfs attribute and when one exists but does not
+/// describe a compressed file -- so "not compressed" is not "no attribute".
+///
+/// Mining reference: `core/hfs_vnops.c` `hfs_vnop_listxattr` and
+/// `hfs_vnop_getxattr`, which consult `decmpfs_hides_xattr` and omit it.
+pub fn is_compressed(
+    tree: &crate::attributes::AttributesFile<'_, impl crate::blockdev::BlockDevice + ?Sized>,
+    cnid: u32,
+) -> crate::error::Result<bool> {
+    Ok(tree
+        .attributes_for(cnid)?
+        .iter()
+        .any(|a| a.name == DECOMPRESSION_NAME))
+}
 
 /// Whether `name` is one HFS+ writes for itself.
 pub fn is_system_attribute(name: &str) -> bool {
@@ -91,6 +138,15 @@ mod tests {
         assert!(!is_system_attribute("com.apple.quarantine_custom"));
         assert!(!is_system_attribute("user.xattr"));
         assert!(!is_system_attribute(""));
+    }
+
+    #[test]
+    fn the_decompression_name_matches_the_corroborating_literal() {
+        // `core/` uses the macro `DECMPFS_XATTR_NAME`, whose definition is not in
+        // this tree; the livefiles plugin spells the same string. So this is two
+        // implementations agreeing, not one mined definition.
+        assert_eq!(DECOMPRESSION_NAME, "com.apple.decmpfs");
+        assert!(is_system_attribute(DECOMPRESSION_NAME));
     }
 
     #[test]
