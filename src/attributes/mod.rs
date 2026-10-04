@@ -29,9 +29,11 @@
 //! overflow, but keyed inside this tree rather than the shared extents tree.
 
 pub mod key;
+pub mod names;
 pub mod record;
 
 pub use key::{AttrKey, ATTR_KEY_BODY_SIZE, ATTR_KEY_RECORD_SIZE, MAX_ATTR_NAME_LEN};
+pub use names::{is_system_attribute, SYSTEM_ATTRIBUTE_NAMES};
 pub use record::{AttrRecord, AttrRecordType, ATTR_RECORD_FIXED_SIZE};
 
 use crate::blockdev::BlockDevice;

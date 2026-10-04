@@ -205,6 +205,39 @@ where classic HFS had no equivalent to move it to. A POSIX extended attribute is
 a fourth thing again — which attributes become `getxattr` is a decision for the
 FUSE adapter, not for this module.
 
+## Resource forks and FinderInfo
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_format.h` `struct HFSPlusCatalogFile`; `core/hfs_xattr.c` `hfs_vnop_getnamedstream`; `core/hfs_readwrite.c` `hfs_read` |
+| Structures | `ForkData` for both forks; `FileAttrs` carries both |
+| Invariants | a resource fork is a real fork — allocation, extents overflow and truncation apply to it as to any other; its *name* at the POSIX boundary is unrelated to that |
+| Rust | `src/volume/mod.rs` `Object` documents the four-way split; `src/attributes/names.rs` |
+| Differences | none yet: mutation does not exist. What is new is the distinction being written down where it is read. |
+
+Three findings, none of which the crate had recorded:
+
+- **A resource fork is a catalog fork, not an attribute.** macOS also exposes it
+  as `com.apple.ResourceFork`, and that is the only stream `getnamedstream`
+  supports -- it answers `ENOATTR` for every other name. So the name belongs to
+  the POSIX boundary, and modelling the fork internally as an xattr would lose
+  the fork identity that allocation depends on.
+- **FinderInfo is not in the catalog record at all.** The 16-byte
+  `HFSPlusBSDInfo` has no FinderInfo field. HFS+ kept FinderInfo in the
+  attributes tree, where classic HFS had no equivalent to move it to. Earlier in
+  this project FinderInfo's placement was assumed from classic HFS, and the
+  assumption was wrong in a way nothing would have caught.
+- **A compressed file's data fork does not contain the file's contents.** It
+  contains decmpfs data; the logical bytes come from decompressing it. And
+  `hfs_hides_rsrc` means such a file's resource fork is *reported empty* rather
+  than read -- so "the resource fork is empty" can mean hidden, not absent, and
+  "the data fork is short" can mean compressed rather than truncated.
+
+The attribute names HFS+ writes for its own bookkeeping are pinned in
+`src/attributes/names.rs`, verified against the source rather than recalled:
+they are exact, case-sensitive strings that are part of the on-disk key, and no
+case folding applies to them.
+
 ## Writable volume
 
 | | |

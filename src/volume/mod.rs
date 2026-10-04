@@ -602,6 +602,42 @@ fn kind_label(kind: FileSystemKind) -> &'static str {
 
 /// A resolved catalog object: a directory or a file.
 ///
+/// # Where an object's data actually lives
+///
+/// HFS+ spreads one object's contents across three mechanisms, and they are not
+/// interchangeable. Keeping them apart here is deliberate: allocation, extents
+/// overflow and truncation all depend on a fork being a fork, and a reader that
+/// reaches for the wrong one gets a wrong answer rather than an error.
+///
+/// | | where it is | reached by |
+/// | --- | --- | --- |
+/// | data fork | `dataFork` in the catalog record | [`Volume::read`] |
+/// | resource fork | `resourceFork` in the catalog record | [`Volume::read_resource`] |
+/// | FinderInfo | an *attribute*, not a field | [`crate::attributes`] |
+/// | named attributes | the attributes tree | [`crate::attributes`] |
+/// | a POSIX xattr | whichever of the above the adapter chose | the FUSE layer |
+///
+/// Three things follow that are easy to get wrong:
+///
+/// - **The resource fork is a real fork.** macOS *also* surfaces it as an
+///   extended attribute named `com.apple.ResourceFork`, and that is the only
+///   stream `getnamedstream` answers, so the name is the POSIX boundary's, not the
+///   filesystem's. Internally it must stay a fork.
+/// - **FinderInfo is not in the catalog record.** The 16-byte
+///   `HFSPlusBSDInfo` has no FinderInfo field; HFS+ kept FinderInfo in the
+///   attributes tree, where classic HFS had no equivalent to move it to. A reader
+///   looking for it in the catalog record will not find it, because it is not there.
+/// - **A compressed file's data fork does not hold the file's contents.** It
+///   holds decmpfs data, and the logical bytes come from decompressing it -- and
+///   the resource fork of such a file may be *hidden*, i.e. reported empty
+///   rather than read. So "the data fork is short" can mean compressed rather
+///   than truncated.
+///
+/// Mining reference: `core/hfs_format.h` `struct HFSPlusCatalogFile`, which
+/// carries `dataFork` and `resourceFork` but no FinderInfo; `core/hfs_xattr.c`
+/// `hfs_vnop_getnamedstream` for the name; `core/hfs_readwrite.c`
+/// `hfs_read` for the compressed and hidden-resource-fork branches.
+///
 /// The variants mirror the record types, because the two are not
 /// interchangeable: a directory has no forks, and a file's `is_symlink` answer
 /// lives in its permissions rather than in its name.
