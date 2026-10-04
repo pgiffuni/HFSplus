@@ -238,22 +238,50 @@ length is the thread record's 6 where the leaf's real first key is 28.
 
 ## The one defect Milestone 8 leaves behind
 
-`lookup_cnid` misses some files once the catalog has grown past a single node. Every
-file is findable by name at any size this crate can produce, and `fsck.hfsplus`
-accepts the volume, so this is a reader bug rather than a damaged volume -- but it
-is a real one, and it was **unreachable** rather than absent until catalog growth
-existed: a single-node catalog tops out at 47 files, so nothing could create the
-conditions.
+`lookup_cnid` misses some files once the catalog has grown past a single node, and
+the cause is a **leaf-chain ordering violation**: two adjacent leaves overlap in key
+space, so a search for a key in the overlap is sent to the wrong one. Every file is
+still findable by *name*, and `fsck.hfsplus` accepts the volume, because the
+overlap happens to fall between two file records and between two thread records
+rather than across a lookup that every tool performs.
 
-`every_file_is_still_findable_by_cnid_before_the_catalog_grows` pins the working
-half, so the boundary is a fact rather than a suspicion. 47 is where growth first
-happens, so that test covers the whole of the previously reachable range.
+### Where it starts
 
-Not yet diagnosed. By-name and by-CNID differ in one respect: the by-name search
-compares a `(parent, name)` key and the by-CNID search a `(cnid, "")` key, and the
-latter's keys are *thread* keys, which all sort past every `(parent, name)` key.
-So the two search disjoint parts of the key space, and a defect that affected only
-the second would look exactly like this.
+Exactly at the **first catalog growth** — the 48th file, which is the first create
+that needs a node and therefore the first that extends the file. Up to 47 files the
+leaves are in ascending key order and every file is findable both ways; from 48 the
+last two leaves of the chain overlap.
+
+That is a much sharper lead than "it breaks at some size", and it points at
+`grow_catalog` rather than at the split: a split at 47 is fine, and the only thing
+different at 48 is that the file grew first.
+
+### The two things growth does that could do it
+
+- **Node numbering.** New nodes are numbered from `oldTotalNodes` and their map bits
+  are marked *after* the map nodes are written. If a bit lands in the wrong map
+  record, `allocate_node` hands out a node number that is already in use — and a
+  node written over a leaf is exactly the shape of this symptom, except that the
+  record count came out right.
+- **The in-memory header.** Growth updates `self.header.catalog_file` when the fork
+  is written, and `total_nodes` and `free_nodes` are re-read afterwards. A stale
+  value anywhere in that chain makes `leaf_for` resolve through an index whose
+  separators no longer describe the leaves.
+
+`leaf_for` is the thing that suffers, and it suffers silently: an upper-bound search
+over *unsorted* separators returns a plausible answer rather than an error. Once
+the separators disagree with the chain, a wrong-leaf insert makes them disagree
+more, so the corruption is self-reinforcing — which is why it is worth fixing the
+first break rather than the visible symptom.
+
+### What would settle it
+
+Compare, at file 48, the separators in the index node against the actual first key
+of each leaf. If they match, the chain was already wrong before the index was
+rebuilt and the fault is in the split. If they do not, the fault is in the rebuild.
+
+Not yet done. `every_file_is_still_findable_by_cnid_before_the_catalog_grows` pins
+the working half, so the boundary is a fact rather than a suspicion.
 
 What is *not* yet true of any mutation here:
 
