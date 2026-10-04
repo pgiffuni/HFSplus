@@ -163,12 +163,31 @@ from Apple's own code agrees with.
 
 # Coverage, as of this writing
 
-No mutation exists yet. Every invariant above is therefore a property of the
-*reader* and the *checker*, enforced and tested — but none has been tested against
-a writer, which is the only test that matters for this milestone.
+One mutation exists: `WritableVolume::write_file_contents`, replacing a file's
+contents in place.
 
-The gap this leaves is specific: an invariant can be enforced by the checker and
-still be impossible for a mutation to maintain, because the checker sees only the
-final state and the mutation has to hold the property across every intermediate
-step. `mkfs.hfsplus` and `newfs_hfs` are the only implementations of these
-transitions currently available, and both are external to this crate.
+| Invariant | Holds because | Tested by |
+| --- | --- | --- |
+| Structure | `FileRecord::write_to` is the inverse of `parse`, so a record read and written back is the same bytes | `a_file_record_round_trips_through_the_same_bytes` -- byte equality against the input, not a re-parse |
+| Round trip | the data blocks and the record are written in the order that never exposes a torn file: blocks first, then the length that points at them | `writing_shorter_contents_keeps_the_volume_readable`, `writing_the_same_number_of_bytes_keeps_the_allocation`, `writing_an_empty_file_leaves_no_trailing_bytes` |
+| Independent | `fsck.hfsplus` accepts every written image | `assert_fsck_clean` in `tests/write.rs`, on all three writes above |
+
+What is *not* yet true of any mutation here:
+
+- **No allocation.** A write may not change how many blocks a file owns, so a
+  write past the file's capacity is refused with the shortfall named rather than
+  truncated. Nothing exercises `AllocationBitmap` as a *writer*.
+- **No structural change.** The record is replaced only at its original length,
+  because a length change moves every later record in the node. No B-tree node
+  has been created, split or deleted, so the extent mapper and the node
+  descriptor are exercised as readers only.
+- **No journal.** `WritableVolume::open` refuses a journaled volume, so every
+  mutation above runs on a volume with no journal. The checker therefore never
+  has to reason about a transaction it did not write.
+
+The gap these leave is specific: an invariant can be enforced by the checker and
+still be impossible for a mutation to maintain, because the checker sees only
+the final state and the mutation has to hold the property across every
+intermediate step. That is why the order of writes above is asserted rather than
+merely documented -- an interrupted write is not something `fsck.hfsplus` is
+going to be shown.

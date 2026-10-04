@@ -279,7 +279,7 @@ folding applies to them.
 | Structures | none — a capability, not a layout |
 | Invariants | every structural check and the journal replay run before any write is possible; a volume whose journal cannot be replayed does not mount |
 | Rust | `src/volume/mod.rs` `WritableVolume`, and `BlockDeviceMut` in `src/blockdev/mod.rs` |
-| Differences | mutation is not implemented. The type exists so that "this volume is safe to change" is a distinct, checked claim rather than a comment. |
+| Differences | the type now owns a `&mut D` rather than borrowing a `Volume`, so that a write can reach the bytes at all. `from_validated` is gone with it. |
 
 Two separate axes, which the roadmap is right to keep apart:
 
@@ -290,11 +290,47 @@ Two separate axes, which the roadmap is right to keep apart:
   with a visible cost. Changing it is not, because a write lands on a filesystem
   the writer never saw.
 
-`WritableVolume::from_validated` takes an already-opened `Volume` rather than a
-device, so validation has one code path and cannot drift between the read and
-write routes. It records whether a journal was replayed, because a writer needs
-that fact told to it rather than inferring it -- and `false` legitimately means
-either "no journal" or "the journal is on another device".
+`WritableVolume::open` validates by opening a temporary `Volume` over a shared
+reborrow of the device, keeping the header and whether a journal was replayed,
+and dropping the temporary before taking the mutable borrow. So there is still
+exactly one validation path and it is `Volume::open`, which cannot drift from the
+read route -- but the handle owns the device rather than borrowing a `Volume`,
+because `&D` and `&mut D` at once is not borrowable. It is also therefore an
+*exclusive* handle: there is no accessor returning a `Volume`, because every
+cached view is invalidated by the first successful write, and a view handed out
+from here would be a way to read stale data while holding a writer.
+
+It records whether a journal was replayed, because a writer needs that fact told
+to it rather than inferring it. It is always `false` today, since `open` refuses
+a journaled volume; it is kept because the refusal is a property of what is
+implemented, not of the volume.
+
+## First mutation: file contents in place
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_cnode.c` `hfs_update` (`c_touch_modtime`, `c_touch_chgtime`); `core/hfs_vfsops.c` `hfs_bwrite`; `core/hfs_readwrite.c` `do_hfs_truncate` for the size half |
+| Structures | none new. `FileRecord::write_to` and `BsdInfo::write_to` serialise what `parse` already deserialises; `ForkData::write_to` and `ExtentRecord::to_bytes` already existed |
+| Invariants | data blocks are written *before* the catalog record that names their length, so an interrupted write leaves a file that reads as its old contents rather than as torn new ones; the record is replaced only at the same length, because a length change moves every later record in the node |
+| Rust | `src/volume/mod.rs` `write_file_contents`, `replace_catalog_record`, `find_catalog_record`; `src/catalog/record.rs` `FileRecord::write_to` |
+| Differences | refuses growth, refuses a length change, and refuses a journaled volume. Each refusal names the reason rather than degrading |
+
+Two things this got wrong before it was right, both found by asking what
+`fsck.hfsplus` says rather than by reading the code again:
+
+- The CNID of a file is `fileID` in the record *body*, not the key's parentID --
+  the key names the containing folder. Only a *thread* record keys on the object
+  itself. Matching the key found the root folder for every file on it.
+- A node's byte address comes from the fork's extent mapper (`node_offset`), not
+  from `node_num * node_size`. Those agree only while a fork is contiguous from
+  block 0, and the second write went to the wrong place silently.
+
+And one from synthesising the fixture rather than reading a real image:
+
+- `fileMode` is a `u16`. Packed as a `u32` it wrote four bytes and overran into
+  the next record. `FileRecord::write_to` now has a test asserting a record
+  re-encodes to exactly the bytes it was parsed from -- a round trip through the
+  parser would not have caught it, because the result still parsed.
 
 ## Checker
 
@@ -322,9 +358,10 @@ Milestones 7 through 13 depend on all of these, and none has been translated:
 | Catalog mutation | `core/hfs_catalog.c` `cat_create`, `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildkey`, `buildrecord`, `buildthread` | Milestone 9 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
 | Compression metadata | `core/hfs_attrlist.c`, `core/hfs_cnode.c` (`decmpfs`) | 7B.2 |
-| B-tree mutation | `core/BTreeWrapper.c` `InsertRecord`, `SplitRecord`, `BTUpdateRecord`; `core/hfs_btreeio.c` | Milestone 8 |
-| Fork mutation | `core/hfs_readwrite.c` | Milestone 8A, 8B |
+| B-tree mutation | `core/BTreeWrapper.c` `InsertRecord`, `SplitRecord`, `BTUpdateRecord`; `core/hfs_btreeio.c` | Milestone 8C |
+| Fork allocation | `core/hfs_readwrite.c`; `core/VolumeAllocation.c` `BlockFindAny` | Milestone 8A, 8B |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
 
-Until those rows are filled, this crate can read and check an HFS+ volume. It
-cannot change one.
+Until those rows are filled, this crate can change a file's existing bytes and
+nothing else: it cannot grow a file, create or remove one, or write to a volume
+with a journal.
