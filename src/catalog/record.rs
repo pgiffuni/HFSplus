@@ -193,6 +193,27 @@ impl BsdInfo {
         self.file_mode & S_IFMT
     }
 
+    /// Encode into `out`, which must be at least [`BSD_INFO_SIZE`] bytes.
+    ///
+    /// The inverse of [`BsdInfo::parse`]. Needed because a mutation has to write
+    /// a record back: `fileMode` is how a file becomes a directory or a symlink,
+    /// so a writer that could not write it could not change a file's type.
+    pub fn write_to(&self, out: &mut [u8]) -> Result<()> {
+        let available = out.len();
+        let dst = out.get_mut(..BSD_INFO_SIZE).ok_or(Error::Truncated {
+            what: "bsd info write",
+            needed: BSD_INFO_SIZE,
+            available,
+        })?;
+        dst[0..4].copy_from_slice(&self.owner_id.to_be_bytes());
+        dst[4..8].copy_from_slice(&self.group_id.to_be_bytes());
+        dst[8] = self.admin_flags;
+        dst[9] = self.owner_flags;
+        dst[10..12].copy_from_slice(&self.file_mode.to_be_bytes());
+        dst[12..BSD_INFO_SIZE].copy_from_slice(&self.special.to_be_bytes());
+        Ok(())
+    }
+
     /// Whether the file type is a directory.
     pub fn is_dir(&self) -> bool {
         self.file_type() == S_IFDIR
@@ -495,6 +516,51 @@ impl FileRecord {
     }
 
     /// Whether this file has extended attributes.
+    /// Encode into `out`, which must be at least [`FILE_RECORD_SIZE`] bytes.
+    ///
+    /// The inverse of [`FileRecord::parse`], and byte-for-byte the same layout,
+    /// so a record read from an image and written straight back is identical to
+    /// what was read. The test that asserts that is the one worth having here:
+    /// a writer that got a single field's width wrong would produce a record
+    /// that still parses, just wrongly -- which is how `fileMode` was once
+    /// written as a u32 and overran into the next record.
+    pub fn write_to(&self, out: &mut [u8]) -> Result<()> {
+        let available = out.len();
+        let dst = out.get_mut(..FILE_RECORD_SIZE).ok_or(Error::Truncated {
+            what: "file record write",
+            needed: FILE_RECORD_SIZE,
+            available,
+        })?;
+        // Zeroed first so that every reserved byte is written as zero rather
+        // than left holding whatever the image had there.
+        dst.fill(0);
+        dst[0..2].copy_from_slice(&self.record_type.to_be_bytes());
+        dst[2..4].copy_from_slice(&self.flags.to_be_bytes());
+        dst[8..12].copy_from_slice(&self.file_id.0.to_be_bytes());
+        dst[12..16].copy_from_slice(&self.create_date.to_be_bytes());
+        dst[16..20].copy_from_slice(&self.content_mod_date.to_be_bytes());
+        dst[20..24].copy_from_slice(&self.attribute_mod_date.to_be_bytes());
+        dst[24..28].copy_from_slice(&self.access_date.to_be_bytes());
+        dst[28..32].copy_from_slice(&self.backup_date.to_be_bytes());
+        self.bsd_info.write_to(&mut dst[32..48])?;
+        dst[48..64].copy_from_slice(&self.user_info);
+        dst[64..80].copy_from_slice(&self.finder_info);
+        dst[80..84].copy_from_slice(&self.text_encoding.to_be_bytes());
+        // dst[84..88] is reserved2, left zero by the fill above.
+        self.data_fork.write_to(&mut dst[88..168])?;
+        self.resource_fork
+            .write_to(&mut dst[168..FILE_RECORD_SIZE])?;
+        Ok(())
+    }
+
+    /// Encode to a [`FILE_RECORD_SIZE`]-byte array.
+    pub fn to_bytes(&self) -> [u8; FILE_RECORD_SIZE] {
+        let mut out = [0u8; FILE_RECORD_SIZE];
+        // Writing into a correctly sized array cannot fail.
+        let _ = self.write_to(&mut out);
+        out
+    }
+
     pub fn has_attributes(&self) -> bool {
         self.flags & K_HFS_HAS_ATTRIBUTES_MASK != 0
     }
@@ -745,6 +811,104 @@ pub fn parse_record(body: &[u8]) -> Result<CatalogRecord> {
 
 #[cfg(test)]
 mod tests {
+    /// A record read from a real image must re-encode to exactly those bytes.
+    ///
+    /// This is the assertion `FileRecord::write_to` exists to make possible, and
+    /// it is the one that would have caught the `fileMode` width bug: packed as a
+    /// u32, `write_to` still produced a record that *parsed* -- with the wrong
+    /// mode, and four bytes stolen from the following record. Both symptoms are
+    /// invisible to any test that round-trips through the parser.
+    ///
+    /// Built from literal bytes rather than a fixture so the test needs no image,
+    /// but every field is non-zero on purpose: a zero field cannot tell a field
+    /// that is written from one that is merely left zeroed.
+    #[test]
+    fn a_file_record_round_trips_through_the_same_bytes() {
+        let mut bytes = [0u8; FILE_RECORD_SIZE];
+        // recordType, flags and the three catalog flag bits mkfs sets on a file.
+        bytes[0..2].copy_from_slice(&2i16.to_be_bytes());
+        bytes[2..4].copy_from_slice(&0x0004u16.to_be_bytes());
+        bytes[8..12].copy_from_slice(&42u32.to_be_bytes()); // fileID
+        bytes[12..16].copy_from_slice(&1_000_000_001u32.to_be_bytes()); // createDate
+        bytes[16..20].copy_from_slice(&1_000_000_002u32.to_be_bytes()); // contentModDate
+        bytes[20..24].copy_from_slice(&1_000_000_003u32.to_be_bytes()); // attributeModDate
+        bytes[24..28].copy_from_slice(&1_000_000_004u32.to_be_bytes()); // accessDate
+        bytes[28..32].copy_from_slice(&1_000_000_005u32.to_be_bytes()); // backupDate
+                                                                        // BSDInfo: owner, group, adminFlags, ownerFlags, fileMode, special.
+        bytes[32..36].copy_from_slice(&501u32.to_be_bytes());
+        bytes[36..40].copy_from_slice(&20u32.to_be_bytes());
+        bytes[40] = 3;
+        bytes[41] = 7;
+        // 0o100644 -- a regular file. A u32 here would eat bytes 44..46.
+        bytes[42..44].copy_from_slice(&0o100644u16.to_be_bytes());
+        bytes[44..48].copy_from_slice(&9u32.to_be_bytes());
+        bytes[48..64].copy_from_slice(&[0x11u8; 16]); // userInfo
+        bytes[64..80].copy_from_slice(&[0x22u8; 16]); // finderInfo
+        bytes[80..84].copy_from_slice(&4u32.to_be_bytes()); // textEncoding
+                                                            // reserved2 at 84..88 stays zero, as it must be written.
+                                                            // dataFork: logicalSize, clumpSize, totalBlocks, one extent.
+        bytes[88..96].copy_from_slice(&1234u64.to_be_bytes());
+        bytes[96..100].copy_from_slice(&65_536u32.to_be_bytes());
+        bytes[100..104].copy_from_slice(&1u32.to_be_bytes());
+        bytes[104..108].copy_from_slice(&500u32.to_be_bytes()); // startBlock
+        bytes[108..112].copy_from_slice(&1u32.to_be_bytes()); // blockCount
+                                                              // resourceFork: empty, but its blockCount is still a field that must be
+                                                              // written -- a writer that skipped it would truncate a resource fork.
+        bytes[168..176].copy_from_slice(&0u64.to_be_bytes());
+
+        let record = FileRecord::parse(&bytes).expect("parse");
+        assert_eq!(record.file_id.0, 42);
+        assert_eq!(record.bsd_info.file_mode, 0o100644);
+        assert_eq!(record.bsd_info.special, 9);
+        assert_eq!(record.data_fork.logical_size, 1234);
+        assert_eq!(
+            record
+                .data_fork
+                .extents
+                .iter()
+                .next()
+                .expect("one extent")
+                .start_block,
+            500
+        );
+        assert_eq!(
+            record.to_bytes(),
+            bytes,
+            "a record written back must be byte-identical to what was read"
+        );
+    }
+
+    #[test]
+    fn bsd_info_round_trips() {
+        let info = BsdInfo {
+            owner_id: 0xDEAD_BEEFu32,
+            group_id: 0x0BADF00Du32,
+            admin_flags: 0xAB,
+            owner_flags: 0xCD,
+            file_mode: 0o040755,
+            special: 0x0102_0304,
+        };
+        let mut bytes = [0u8; BSD_INFO_SIZE];
+        info.write_to(&mut bytes).expect("write");
+        assert_eq!(
+            BsdInfo::parse(&bytes, 0).expect("parse"),
+            info,
+            "BSDInfo must round-trip, because a mutation changes fileMode"
+        );
+    }
+
+    /// A short destination is an error, not a partial write.
+    ///
+    /// The writer checks the length once, up front, so a caller cannot get half a
+    /// record -- which would be worse than none, because the node would then hold a
+    /// record that parses as something else.
+    #[test]
+    fn writing_into_a_short_buffer_is_refused() {
+        let record = FileRecord::EMPTY;
+        assert!(record.write_to(&mut [0u8; FILE_RECORD_SIZE - 1]).is_err());
+        assert!(record.write_to(&mut [0u8; 0]).is_err());
+    }
+
     use super::*;
     use crate::format::extents::ExtentDescriptor;
 

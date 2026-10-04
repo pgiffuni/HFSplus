@@ -23,7 +23,7 @@
 //! deliberately not done here, because a lossy mapping would break the caching
 //! that makes a FUSE mount usable.
 
-use crate::blockdev::BlockDevice;
+use crate::blockdev::{BlockDevice, BlockDeviceMut};
 use crate::btree::ExtentKey;
 use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID};
 use crate::catalog::lookup::Catalog;
@@ -501,9 +501,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 /// A volume opened for mutation.
 ///
 /// This type exists to make the trust boundary explicit rather than to expose
-/// mutation. It performs exactly the same work as [`Volume::open`] -- header
-/// validation, then journal detection, then journal replay -- and then stops.
-/// No mutation is available yet; that is Milestone 8.
+/// mutation. Opening one performs exactly the same work as [`Volume::open`] --
+/// header validation, then journal detection, then journal replay -- and then
+/// stops. Anything that changes the volume has to be asked for by name.
 ///
 /// # Why a separate type at all
 ///
@@ -530,46 +530,86 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 /// Mining reference: `core/hfs_vfsops.c` `hfs_mount_existing` refuses a NULL
 /// journal from `journal_open` with `EINVAL` rather than mounting, and the
 /// mount path runs every structural check before any write is possible.
-pub struct WritableVolume<'v, 'a, D: ?Sized> {
-    /// The validated, journal-current view of the same bytes.
-    ///
-    /// Borrowed rather than rebuilt so that there is exactly one reading of
-    /// the volume, and no way for the writable path to disagree with the
-    /// read-only one about what it is looking at.
-    inner: &'v Volume<'a, D>,
-    /// The journal the volume was validated against, kept so a future
-    /// mutation can journal itself rather than discover the position later.
+///
+/// # Why it owns the device rather than borrowing a `Volume`
+///
+/// A writer needs `&mut D`, and a [`Volume`] holds `&D`. Both at once is not
+/// borrowable, so this does not hold one. Instead it runs the *same* validation
+/// by opening a temporary `Volume` over the shared reborrow, keeps the two facts
+/// worth keeping -- the header and whether a journal was replayed -- and drops
+/// it before taking the mutable borrow. One validation path, not two that could
+/// drift: `from_validated` was the alternative, and it is what made this look
+/// impossible rather than merely awkward.
+///
+/// # It is an exclusive handle
+///
+/// There is deliberately no `volume()` accessor returning a `Volume`. Every
+/// cached view of these bytes is invalidated by the first successful mutation,
+/// so a view handed out from here would be a way to read stale data while
+/// holding a writer. To read, drop this and open a new [`Volume`]. That is a
+/// small cost and it makes the invalidation impossible to forget.
+pub struct WritableVolume<'d, D: ?Sized> {
+    /// Exclusive access to the bytes, for as long as this exists.
+    device: &'d mut D,
+    /// The validated header, kept so a mutation does not re-read it and so the
+    /// facts validation established travel with the handle.
+    header: VolumeHeader,
+    /// The filesystem kind, decided once during validation.
+    kind: FileSystemKind,
+    /// Whether a journal was replayed while validating.
     journal_replayed: bool,
 }
 
-impl<D: ?Sized> std::fmt::Debug for WritableVolume<'_, '_, D> {
+impl<D: ?Sized> std::fmt::Debug for WritableVolume<'_, D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Deliberately omits the volume. The interesting question about this
-        // type is what it established, and printing the volume would bury that.
+        // Deliberately omits the device. The interesting question about this
+        // type is what it established, and printing the device would bury that.
         f.debug_struct("WritableVolume")
+            .field("filesystem", &self.kind)
             .field("journal_was_replayed", &self.journal_replayed)
             .finish_non_exhaustive()
     }
 }
 
-impl<'v, 'a, D: BlockDevice + ?Sized> WritableVolume<'v, 'a, D> {
-    /// Validate `volume` for mutation and adopt it.
+impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
+    /// Validate `device` for mutation and take it.
     ///
-    /// Takes an already-opened [`Volume`] so there is one code path for
-    /// validation rather than two that could drift. The caller obtains the
-    /// journal-free reading first and this only decides whether changing it is
-    /// allowed.
-    pub fn from_validated(volume: &'v Volume<'a, D>) -> Result<Self> {
+    /// `BlockDeviceMut` rather than `BlockDevice`, because opening for mutation
+    /// is a claim about intent and a read-only device cannot satisfy it -- better
+    /// at compile time than at the first write.
+    pub fn open(device: &'d mut D) -> Result<Self> {
+        // The shared reborrow ends here, which is what makes the mutable borrow
+        // below legal. Explicit rather than relying on the drop order.
+        let volume = Volume::open(&*device)?;
         let journal_replayed = volume.journal()?.is_some();
+        let header = volume.header;
+        let kind = volume.kind;
+        drop(volume);
+
+        if journal_replayed {
+            return Err(Error::invalid(
+                "write",
+                "journalled writes are not implemented; a write without a journal entry \
+                 would leave a journal that does not describe the volume",
+            ));
+        }
+
         Ok(WritableVolume {
-            inner: volume,
+            device,
+            header,
+            kind,
             journal_replayed,
         })
     }
 
-    /// The validated volume.
-    pub fn volume(&self) -> &'v Volume<'a, D> {
-        self.inner
+    /// The validated header.
+    pub fn header(&self) -> &VolumeHeader {
+        &self.header
+    }
+
+    /// The filesystem kind, decided during validation.
+    pub fn kind(&self) -> FileSystemKind {
+        self.kind
     }
 
     /// Whether a journal was replayed during validation.
@@ -577,9 +617,284 @@ impl<'v, 'a, D: BlockDevice + ?Sized> WritableVolume<'v, 'a, D> {
     /// False for a volume with no journal at all, and false for one whose
     /// journal lives on another device. A writer needs to know which, and
     /// needs to be told rather than infer it.
+    ///
+    /// Always false today: [`WritableVolume::open`] refuses a journaled volume
+    /// outright. It is kept because the refusal is a property of what is
+    /// implemented, not of the volume, and a writer that could not tell the two
+    /// apart would have no way to notice when the refusal is lifted.
     pub fn journal_was_replayed(&self) -> bool {
         self.journal_replayed
     }
+
+    /// Replace a file's contents, without changing its allocation.
+    ///
+    /// The first mutation, and deliberately the narrowest one that is still real:
+    /// the new bytes must fit the blocks the fork already owns, so no allocation,
+    /// no extent change and no B-tree split is involved. That is the point -- it
+    /// exercises serialisation, the leaf write and the timestamps on their own,
+    /// so a failure says which of them is wrong.
+    ///
+    /// Takes a CNID rather than a resolved object, so the caller reads the
+    /// catalog with a read-only [`Volume`] first and drops it before opening
+    /// this. Holding both at once is not borrowable, and the CNID is the whole of
+    /// what this needs.
+    ///
+    /// The data blocks and the catalog's leaf node are written, and the record's
+    /// `logicalSize` and timestamps are updated. Nothing else: no bitmap, no
+    /// volume header, no journal.
+    ///
+    /// # What it refuses, and why
+    ///
+    /// - **Growth.** A file that outgrows its blocks needs an allocator, and an
+    ///   allocator that guessed at a free block would be worse than no mutation.
+    ///   The error names the shortfall rather than truncating the write.
+    /// - **A journaled volume.** Refused in [`WritableVolume::open`], before any
+    ///   byte is written.
+    /// - **A length change in the record.** See [`Self::replace_catalog_record`].
+    ///
+    /// Mining reference: `core/hfs_cnode.c` `hfs_update` sets `c_touch_modtime`
+    /// and `c_touch_chgtime` on a content change, which become `contentModDate`
+    /// and `attributeModDate`. `accessDate` is deliberately not touched: Apple
+    /// defers an atime-only update to vnode recycle rather than writing it
+    /// immediately, and this library has no recycle point to defer to. Leaving it
+    /// alone is also the only choice that does not invent semantics -- an
+    /// atime a writer had to guess at would be worse than a stale one.
+    pub fn write_file_contents(&mut self, cnid: u32, data: &[u8]) -> Result<()> {
+        let block_size = self.header.block_size;
+        let expanded = self.header.has_expanded_times();
+
+        // The fork's blocks, as device block numbers, in logical order. No overflow
+        // here: a fork that overflowed needs the extents tree, which is allocation
+        // work rather than a serialisation change.
+        let record = self.read_file_record(cnid)?;
+        let mut blocks = Vec::new();
+        for extent in record.data_fork.extents.iter() {
+            for offset in 0..extent.block_count {
+                blocks.push(extent.start_block + offset);
+            }
+        }
+        let capacity = blocks.len() * block_size as usize;
+        if data.len() > capacity {
+            return Err(Error::invalid(
+                "write",
+                format!(
+                    "{} bytes exceeds the {} that the file's {} existing block(s) hold; \
+                     growing a file needs an allocator",
+                    data.len(),
+                    capacity,
+                    blocks.len()
+                ),
+            ));
+        }
+
+        // The data blocks first: until the record says so, the old length is
+        // still what a reader will ask for, so writing the blocks before the
+        // record is the order that never exposes a torn file.
+        for (i, block) in blocks.iter().enumerate() {
+            let start = i * block_size as usize;
+            let end = (start + block_size as usize).min(data.len());
+            if end <= start {
+                break;
+            }
+            let at = u64::from(*block) * u64::from(block_size);
+            self.device.write_at(at, &data[start..end])?;
+        }
+
+        // Then the record: logicalSize, and the two timestamps a content change
+        // touches. One clock read for both, so the record does not disagree with
+        // itself across a second boundary.
+        let mut record = record;
+        record.data_fork.logical_size = data.len() as u64;
+        let now = crate::timestamp::now_hfs(expanded).map_err(|e| Error::Io {
+            message: e.to_string(),
+        })?;
+        record.content_mod_date = now;
+        record.attribute_mod_date = now;
+        self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Read a file's catalog record.
+    ///
+    /// A plain read through the B-tree. The record is *parsed*, not the raw
+    /// bytes: a mutation changes fields, and a mutation that rewrote untouched
+    /// fields from raw bytes would depend on every reserved byte round-tripping.
+    fn read_file_record(&self, cnid: u32) -> Result<crate::catalog::record::FileRecord> {
+        use crate::catalog::record::FileRecord;
+        match self.find_catalog_record(cnid)? {
+            CatalogHit::Record { bytes, .. } => Ok(FileRecord::parse(&bytes)?),
+            CatalogHit::Thread => Err(Error::NotFound {
+                what: "file record",
+            }),
+        }
+    }
+
+    /// Replace one file record in place, leaving its key alone.
+    ///
+    /// The record is located by walking the leaf chain rather than by offset, so
+    /// this works regardless of the tree's shape -- and so it does not depend on
+    /// the tree having one leaf, which is not a property HFS+ guarantees.
+    ///
+    /// The replacement is written only when it is the same length as what it
+    /// replaces. A length change moves every later record in the node and needs
+    /// the offset array rebuilt, which is a B-tree mutation rather than a record
+    /// replacement; refusing is honest about which this is.
+    ///
+    /// Note the borrow: the node is located and its bytes are patched inside a
+    /// scope that holds a *shared* reborrow of the device, and the write happens
+    /// after that scope ends. Keeping `BTreeFile` alive across `write_at` would
+    /// need two borrows of the same bytes at once.
+    fn replace_catalog_record(
+        &mut self,
+        cnid: u32,
+        record: &crate::catalog::record::FileRecord,
+    ) -> Result<()> {
+        let body = record.to_bytes();
+        let hit = match self.find_catalog_record(cnid)? {
+            CatalogHit::Record {
+                node_num,
+                offset,
+                len,
+                ..
+            } => {
+                if len != body.len() {
+                    return Err(Error::invalid(
+                        "write",
+                        format!(
+                            "the replacement record is {} bytes and the one it replaces \
+                             is {}; a length change moves every later record in the node",
+                            body.len(),
+                            len
+                        ),
+                    ));
+                }
+                (node_num, offset, len)
+            }
+            CatalogHit::Thread => {
+                return Err(Error::NotFound {
+                    what: "file record",
+                })
+            }
+        };
+        let (node_num, offset, len) = hit;
+
+        // Patch inside the scope that still holds the shared reborrow, and write
+        // after it ends: keeping a `BTreeFile` alive across `write_at` would need
+        // two borrows of the same bytes at once.
+        let (at, patched) = {
+            use crate::btree::io::BTreeFile;
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let mut buf = bt.read_node_bytes(node_num)?;
+            if buf.len() < offset + len {
+                return Err(Error::OutOfRange {
+                    what: "catalog record end offset",
+                    value: (offset + len) as u64,
+                    limit: buf.len() as u64,
+                });
+            }
+            buf[offset..offset + len].copy_from_slice(&body);
+            // `node_offset`, not `node_num * node_size`: a node's byte address is
+            // wherever the fork's extents put it, which is only the same as that
+            // product when the fork is contiguous from block 0. A catalog that
+            // starts elsewhere -- or that overflows into the extents tree -- would
+            // be written to the wrong place, silently.
+            (bt.node_offset(node_num)?, buf)
+        };
+        self.device.write_at(at, &patched)
+    }
+
+    /// Locate a catalog record by CNID, walking the leaf chain.
+    ///
+    /// Returns which record matched, because a thread record has the file's CNID
+    /// as its key parent and a file record has the *parent folder's* CNID -- so
+    /// "a record whose key names this CNID" finds both, and only the caller knows
+    /// which one it wanted.
+    fn find_catalog_record(&self, cnid: u32) -> Result<CatalogHit> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let mut node_num = btree_header.first_leaf_node;
+        // Bounded by the node count, so a corrupted `fLink` cycle terminates
+        // instead of spinning. `next <= 0` can never happen for a u32, so the
+        // bound is the only exit a cycle has.
+        let mut budget = btree_header.total_nodes;
+
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            for index in 0..node.num_records() {
+                let (key, body) = match crate::catalog::lookup::split_record(node.record(index)?) {
+                    Some(parts) => parts,
+                    None => continue,
+                };
+                // A *file* record does not key on the file: its key parentID is the
+                // containing folder, and the file's own CNID is `fileID` inside the
+                // body. So matching a file by CNID means reading the body, and the
+                // record type has to be checked first -- a folder record is 88
+                // bytes and lives at the same key.
+                if body.len() == crate::catalog::record::FILE_RECORD_SIZE
+                    && i16::from_be_bytes([body[0], body[1]]) == CATALOG_FILE_RECORD
+                    && u32::from_be_bytes([body[8], body[9], body[10], body[11]]) == cnid
+                {
+                    return Ok(CatalogHit::Record {
+                        node_num,
+                        offset: node.record_offset(index)? + 2 + key.key_length,
+                        len: body.len(),
+                        bytes: body.to_vec(),
+                    });
+                }
+                // A *thread* record does key on the object, which is what makes it
+                // the reverse-lookup index. Matching one here means the caller asked
+                // for a file and found only its thread.
+                if key.key_length == 0 && key.parent_id.0 == cnid {
+                    return Ok(CatalogHit::Thread);
+                }
+            }
+            if node_num == btree_header.last_leaf_node {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            if node_num == 0 || node_num >= btree_header.total_nodes {
+                break;
+            }
+        }
+        Err(Error::NotFound {
+            what: "file record",
+        })
+    }
+}
+
+/// `kHFSPlusCatalogFile`, the catalog record type for a file.
+const CATALOG_FILE_RECORD: i16 = 2;
+
+/// What a search of the catalog found for a CNID.
+enum CatalogHit {
+    /// A file or folder record, with its node, its offset *within the node* and
+    /// its length.
+    Record {
+        node_num: u32,
+        offset: usize,
+        len: usize,
+        bytes: Vec<u8>,
+    },
+    /// A thread record. Its key parentID is the object's own CNID, so a search
+    /// by CNID finds it, and it carries no fields worth writing back.
+    Thread,
 }
 
 /// The CNID a fork's overflow extents are keyed on.

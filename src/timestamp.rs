@@ -199,6 +199,34 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// The current time, as an HFS timestamp.
+///
+/// A mutation has to set `contentModDate` and `attributeModDate`, and the only
+/// honest source for those is the clock. It is read once per mutation and passed
+/// to [`to_hfs_time`], so a single write carries one timestamp in both fields --
+/// Apple sets both from the same `c_touch_*` call, and two separate reads would
+/// make a record differ from itself across a second boundary.
+///
+/// # Why the failure is an error
+///
+/// A clock that has gone backwards since the epoch yields a negative time, which
+/// [`to_hfs_time`] clips to 0 -- and 0 is not "unset" on an expanded-time volume.
+/// Silently writing 0 would stamp a file with the HFS epoch, so this refuses
+/// instead. Images are untrusted, and so is the host's clock.
+pub fn now_hfs(expanded: bool) -> std::io::Result<u32> {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?
+        .as_secs();
+    let secs = i64::try_from(secs).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "the clock is past year 292 billion",
+        )
+    })?;
+    Ok(to_hfs_time(secs, expanded))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

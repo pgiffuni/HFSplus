@@ -215,24 +215,27 @@ fn a_writable_view_records_whether_a_journal_was_replayed() {
     // journal lives on another device or there is none. A writer needs to know
     // which, and needs it told rather than inferred -- so the fact is part of the
     // type rather than something a caller re-derives.
-    use hfsplus::volume::WritableVolume;
 
     let path = common::image("journal-with-attributes");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
-    let dev = FileDevice::open(&path).expect("open");
+    // This volume *is* journaled, and `WritableVolume::open` refuses one -- so the
+    // fact that a journal was replayed can now only be observed on the read-only
+    // path. The refusal is asserted in `opening_for_mutation_does_not_bypass_
+    // the_journal_check`; what matters here is that the fact is still reachable.
+    let mut dev = FileDevice::open(&path).expect("open");
     let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
-    let writable = WritableVolume::from_validated(&vol).expect("validate for mutation");
     assert!(
-        writable.journal_was_replayed(),
+        vol.journal().expect("journal").is_some(),
         "this volume is journaled and the journal replays, so a writer must know"
     );
-    assert_eq!(
-        writable.volume().header().total_blocks,
-        vol.header().total_blocks,
-        "and the writable view must be the same volume, not a second reading of it"
+    drop(vol);
+    assert!(
+        hfsplus::volume::WritableVolume::open(&mut dev).is_err(),
+        "a journaled volume must be refused for mutation rather than written \
+         without a journal entry"
     );
 }
 
@@ -245,9 +248,8 @@ fn a_volume_with_no_journal_says_so_rather_than_claiming_a_replay() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
-    let dev = FileDevice::open(&path).expect("open");
-    let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
-    let writable = WritableVolume::from_validated(&vol).expect("validate");
+    let mut dev = FileDevice::open(&path).expect("open");
+    let writable = WritableVolume::open(&mut dev).expect("validate");
     assert!(
         !writable.journal_was_replayed(),
         "a volume with no journal has nothing to replay, and saying otherwise \\
@@ -260,20 +262,29 @@ fn opening_for_mutation_does_not_bypass_the_journal_check() {
     // The point of a separate type. `Volume::open` already refuses a journal it
     // cannot replay, because the filesystem it would serve is stale -- so the
     // writable path, which is built on that same open, inherits the refusal rather
-    // than needing to repeat the check. That is why `from_validated` takes an
-    // already-validated volume rather than a device.
+    // than needing to repeat the check. That is why `WritableVolume::open` opens a
+    // `Volume` over a shared reborrow rather than having checks of its own.
 
     let path = common::image("journal-bad-max-blocks");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
-    let dev = FileDevice::open(&path).expect("open");
+    let mut dev = FileDevice::open(&path).expect("open");
 
     // Refused at mount, before any question of writing arises.
     let vol = hfsplus::volume::Volume::open(&dev);
     assert!(
         vol.is_err(),
         "a volume whose journal cannot be replayed must not mount at all"
+    );
+    // And refused again for mutation, over the same validation path. This is the
+    // property that owning the device had to preserve: there is still exactly one
+    // validation path, it is `Volume::open`, and asking for write access does not
+    // get past it.
+    drop(vol);
+    assert!(
+        hfsplus::volume::WritableVolume::open(&mut dev).is_err(),
+        "the journal check must not be bypassed by asking for write access"
     );
 }
