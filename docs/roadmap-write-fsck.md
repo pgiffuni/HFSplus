@@ -124,6 +124,24 @@ Two corollaries:
   weakens: it becomes a consistency check rather than an independent judgement.
   Tests should say which they are.
 
+## A guard on the guards
+
+Sixty-odd tests open with `if !path.exists() { return; }`, because a developer may
+not have run the generators. That is a reasonable convenience and a serious hole
+in a suite that exists to prove things: a broken recipe would leave every
+dependent test skipping, the run green, and the coverage silently gone. Absence
+reads as success.
+
+The guards stay and `tests/corpus_completeness.rs` asserts they have nothing to
+skip -- naming every fixture the suite depends on, so a missing one fails there by
+name rather than passing everywhere else. It also checks that the fixtures carry
+the signature they should, which catches a generator writing the right filename
+and the wrong bytes, and that the derived fixtures regenerate byte-identically.
+
+The same discipline the checker needed, for the same reason: a check that fires
+when it should not trains you to ignore it, and a test that skips when it should
+not is worse than no test.
+
 ## The one gap no checker here can close
 
 Producing a genuinely *crash-consistent* image — a volume whose journal is newer
