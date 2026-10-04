@@ -26,7 +26,7 @@
 use crate::blockdev::{BlockDevice, BlockDeviceMut};
 use crate::btree::node::NODE_DESCRIPTOR_SIZE;
 use crate::btree::ExtentKey;
-use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID};
+use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID, ROOT_PARENT_ID};
 use crate::catalog::lookup::Catalog;
 use crate::catalog::record::{BsdInfo, CatalogRecord, FileRecord, FolderRecord};
 use crate::error::{Error, Result};
@@ -949,10 +949,20 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 format!("CNID {cnid} is reserved, so it cannot identify a deletable object"),
             ));
         }
-        if parent_cnid.0 == ROOT_FOLDER_ID.0 && parent == ROOT_FOLDER_ID.0 && is_folder {
+        // `cat_delete`'s preflight, verbatim in effect: a CNID below the first user
+        // one is reserved, and that test is what refuses the root folder -- its CNID
+        // is 2, and the reserved range ends at 15. A second clause refuses an entry
+        // whose *parent* is the root's own parent, CNID 1, which only the root's own
+        // catalog entry has.
+        //
+        // Note what is deliberately not here: a test on the parent's CNID. The root
+        // folder's name is keyed by parentID 1, not by its own CNID, so a check like
+        // "parent is 2 and the entry is a folder" refuses an ordinary directory
+        // instead -- which is exactly what an earlier version of this did.
+        if parent == ROOT_PARENT_ID.0 {
             return Err(Error::invalid(
                 "remove",
-                "the root folder cannot be deleted",
+                "an entry directly under parent 1 is the root folder's own entry",
             ));
         }
         if blocked {
@@ -1032,6 +1042,277 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             })?;
         let body = record.to_bytes();
         self.replace_catalog_body(cnid, &body)
+    }
+
+    /// Create an empty folder called `name` in `parent`, and return its CNID.
+    ///
+    /// The same shape as [`Self::create_file`] with a folder record and a folder
+    /// thread record in place of the file ones, and the same all-or-nothing
+    /// guarantee: the CNID counter advances first and is not rolled back, and
+    /// everything after it is undone if a later step fails.
+    ///
+    /// `folderCount` in the volume header counts folders and, unlike `fileCount`,
+    /// **excludes the root** -- so a volume holding one folder and nothing else
+    /// reports 1, not 2. `fsck.hfsplus` normalises a reported 1 to 0, and counting
+    /// the root here is the kind of plausible value only an independent checker
+    /// catches.
+    pub fn create_folder(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::record::{FolderRecord, THREAD_RECORD_NAME_LEN_OFFSET};
+
+        if name.is_empty() {
+            return Err(Error::invalid(
+                "create",
+                "a folder cannot have an empty name",
+            ));
+        }
+        // Validated before anything is written, so a bad parent costs nothing.
+        self.read_folder_record(parent)?;
+
+        let cnid = self.header.next_catalog_id;
+        if cnid <= ROOT_FOLDER_ID.0 {
+            return Err(Error::invalid(
+                "volume_header.nextCatalogID",
+                format!("{cnid} is at or below the reserved CNID range"),
+            ));
+        }
+        let now =
+            crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+
+        let folder = FolderRecord {
+            folder_id: Cnid(cnid),
+            create_date: now,
+            content_mod_date: now,
+            attribute_mod_date: now,
+            access_date: now,
+            backup_date: now,
+            ..FolderRecord::EMPTY
+        };
+        let mut thread = vec![0u8; THREAD_RECORD_NAME_LEN_OFFSET + 2 + name.len() * 2];
+        thread[0..2].copy_from_slice(
+            &crate::catalog::record::K_HFS_PLUS_FOLDER_THREAD_RECORD.to_be_bytes(),
+        );
+        thread[4..8].copy_from_slice(&Cnid(parent).0.to_be_bytes());
+        thread[THREAD_RECORD_NAME_LEN_OFFSET..THREAD_RECORD_NAME_LEN_OFFSET + 2]
+            .copy_from_slice(&(name.len() as u16).to_be_bytes());
+        for (i, unit) in name.iter().enumerate() {
+            let at = THREAD_RECORD_NAME_LEN_OFFSET + 2 + i * 2;
+            thread[at..at + 2].copy_from_slice(&unit.to_be_bytes());
+        }
+
+        let child_key = CatalogKey::for_child(Cnid(parent), name);
+        let thread_key = CatalogKey::for_child(Cnid(cnid), &[]);
+        let mut child = child_key.to_record();
+        child.extend_from_slice(&folder.to_bytes());
+        let mut thread_record = thread_key.to_record();
+        thread_record.extend_from_slice(&thread);
+
+        self.write_header_u32(64, cnid + 1)?;
+        let undo = |w: &mut Self| {
+            let _ = w.remove_catalog_record(&thread_key);
+            let _ = w.remove_catalog_record(&child_key);
+        };
+
+        self.insert_catalog_record(&child)?;
+        if let Err(e) = self.insert_catalog_record(&thread_record) {
+            undo(self);
+            return Err(e);
+        }
+        if let Err(e) = self.change_folder_valence(parent, 1) {
+            undo(self);
+            return Err(e);
+        }
+        let folder_count = self
+            .header
+            .folder_count
+            .checked_add(1)
+            .ok_or_else(|| Error::overflow("volume_header.folderCount"))?;
+        if let Err(e) = self.write_header_u32(36, folder_count) {
+            let _ = self.change_folder_valence(parent, -1);
+            undo(self);
+            return Err(e);
+        }
+        self.header.folder_count = folder_count;
+        self.header.next_catalog_id = cnid + 1;
+        Ok(cnid)
+    }
+
+    /// Rename, or move, the object at `(from_parent, from_name)` to
+    /// `(to_parent, to_name)`, and return its CNID.
+    ///
+    /// The object keeps its CNID and its forks -- a move is a change to the catalog,
+    /// not to the data -- so the CNID is returned rather than newly allocated, and
+    /// neither `fileCount` nor `folderCount` moves.
+    ///
+    /// # The four steps, and why in that order
+    ///
+    /// 1. **Insert** the record under the new key. First, because the new record
+    ///    carries the old one's body, so nothing has to be reconstructed if the
+    ///    insert fails.
+    /// 2. **Remove** the record from the old key. If that fails the new one is
+    ///    removed again -- the destination is then untouched, and a caller that
+    ///    retries sees the original name.
+    /// 3. **Replace** the thread record. Its key is `(cnid, "")` either way, so this
+    ///    is a remove and an insert under one key rather than a move, and the thread
+    ///    record's *body* is where an object's name is written down. A reader
+    ///    resolves a name through it, so leaving it stale is what makes a renamed
+    ///    file reachable by the old name and not the new one.
+    /// 4. **Adjust the two folders' child counts**, and only if the folder changed.
+    ///
+    /// Mining reference: `core/hfs_catalog.c` `cat_rename`, whose steps are
+    /// "insert cnode at new location", "remove cnode from old location",
+    /// "remove cnode's old thread record", "insert cnode's new thread record" --
+    /// and which refuses a destination name already in use with `EEXIST` unless the
+    /// parents are the same.
+    pub fn rename(
+        &mut self,
+        from_parent: u32,
+        from_name: &[u16],
+        to_parent: u32,
+        to_name: &[u16],
+    ) -> Result<u32> {
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::record::{
+            CatalogRecord, FolderRecord, THREAD_RECORD_FIXED_SIZE, THREAD_RECORD_NAME_LEN_OFFSET,
+        };
+
+        if from_name.is_empty() || to_name.is_empty() {
+            return Err(Error::invalid("rename", "a name cannot be empty"));
+        }
+        let from_parent_cnid = Cnid(from_parent);
+        let to_parent_cnid = Cnid(to_parent);
+
+        let object = {
+            use crate::catalog::lookup::Catalog;
+            let catalog = Catalog::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            catalog
+                .lookup(from_parent_cnid, from_name)?
+                .ok_or(Error::NotFound {
+                    what: "catalog entry",
+                })?
+        };
+        let is_folder = matches!(object, CatalogRecord::Folder(_));
+        let cnid = match &object {
+            CatalogRecord::File(f) => f.file_id.0,
+            CatalogRecord::Folder(fo) => fo.folder_id.0,
+            CatalogRecord::Thread(_) => {
+                return Err(Error::invalid(
+                    "rename",
+                    "a thread record has no name to rename",
+                ))
+            }
+        };
+
+        // A destination that is already taken is `EEXIST`, not an overwrite. Apple
+        // only allows the same-parent case, where it becomes an exchange.
+        if (from_parent != to_parent || from_name != to_name)
+            && self
+                .catalog_record_bytes(&CatalogKey::for_child(to_parent_cnid, to_name))?
+                .is_some()
+        {
+            return Err(Error::invalid(
+                "rename",
+                format!(
+                    "CNID {to_parent} already has a child named {:?}",
+                    String::from_utf16_lossy(to_name)
+                ),
+            ));
+        }
+        // Reading the destination folder validates it before anything is written.
+        self.read_folder_record(to_parent)?;
+
+        let old_key = CatalogKey::for_child(from_parent_cnid, from_name);
+        let new_key = CatalogKey::for_child(to_parent_cnid, to_name);
+        let now =
+            crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+
+        // Rebuild the record under the new key: same object, same CNID, same
+        // forks, with the modification time moved.
+        let mut new_record = new_key.to_record();
+        match &object {
+            CatalogRecord::File(f) => {
+                let mut f = *f.as_ref();
+                f.content_mod_date = now;
+                f.attribute_mod_date = now;
+                new_record.extend_from_slice(&f.to_bytes());
+            }
+            CatalogRecord::Folder(fo) => {
+                let mut fo = *fo;
+                fo.content_mod_date = now;
+                fo.attribute_mod_date = now;
+                new_record.extend_from_slice(&fo.to_bytes());
+            }
+            CatalogRecord::Thread(_) => unreachable!("checked above"),
+        }
+
+        // The thread record, whose body carries the object's new name.
+        let mut thread = vec![0u8; THREAD_RECORD_NAME_LEN_OFFSET + 2 + to_name.len() * 2];
+        thread[0..2].copy_from_slice(
+            &(if is_folder {
+                crate::catalog::record::K_HFS_PLUS_FOLDER_THREAD_RECORD
+            } else {
+                crate::catalog::record::K_HFS_PLUS_FILE_THREAD_RECORD
+            })
+            .to_be_bytes(),
+        );
+        thread[4..8].copy_from_slice(&to_parent_cnid.0.to_be_bytes());
+        thread[THREAD_RECORD_NAME_LEN_OFFSET..THREAD_RECORD_NAME_LEN_OFFSET + 2]
+            .copy_from_slice(&(to_name.len() as u16).to_be_bytes());
+        for (i, unit) in to_name.iter().enumerate() {
+            let at = THREAD_RECORD_NAME_LEN_OFFSET + 2 + i * 2;
+            thread[at..at + 2].copy_from_slice(&unit.to_be_bytes());
+        }
+        let thread_key = CatalogKey::for_child(Cnid(cnid), &[]);
+        let mut new_thread = thread_key.to_record();
+        new_thread.extend_from_slice(&thread);
+
+        let old_record = self
+            .catalog_record_bytes(&old_key)?
+            .ok_or(Error::NotFound {
+                what: "catalog record",
+            })?;
+        let old_thread = self
+            .catalog_record_bytes(&thread_key)?
+            .ok_or(Error::NotFound {
+                what: "thread record",
+            })?;
+
+        // Step 1.
+        self.insert_catalog_record(&new_record)?;
+        // Step 2.
+        if let Err(e) = self.remove_catalog_record(&old_key) {
+            let _ = self.remove_catalog_record(&new_key);
+            return Err(e);
+        }
+        // Step 3.
+        self.remove_catalog_record(&thread_key)?;
+        if let Err(e) = self.insert_catalog_record(&new_thread) {
+            let _ = self.insert_catalog_record(&old_thread);
+            let _ = self.insert_catalog_record(&old_record);
+            return Err(e);
+        }
+        // Step 4.
+        if from_parent != to_parent {
+            self.change_folder_valence(from_parent, -1)?;
+            if let Err(e) = self.change_folder_valence(to_parent, 1) {
+                let _ = self.change_folder_valence(from_parent, 1);
+                let _ = self.remove_catalog_record(&new_key);
+                let _ = self.insert_catalog_record(&old_thread);
+                let _ = self.insert_catalog_record(&old_record);
+                return Err(e);
+            }
+        }
+        let _ = (FolderRecord::EMPTY, THREAD_RECORD_FIXED_SIZE);
+        Ok(cnid)
     }
 
     /// The bytes of the catalog record under exactly this key, if it is there.

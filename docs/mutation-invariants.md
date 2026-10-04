@@ -163,10 +163,14 @@ from Apple's own code agrees with.
 
 # Coverage, as of this writing
 
-One mutation entry point exists, `WritableVolume`, with four operations on it:
+One mutation entry point exists, `WritableVolume`, with seven operations on it:
 `write_file_contents` (overwrite, grow or truncate in place), `truncate_file`,
-`create_file`, and the node splitting that `create_file` needs once a catalog leaf
-fills.
+`create_file`, `create_folder`, `rename`, `remove`, and the node splitting and
+catalog growth that `create_file` needs once a catalog leaf fills.
+
+`remove` returns the CNID it deleted, and `rename` returns the CNID it moved -- the
+same one, because a rename is a change to the catalog and not to the object. Neither
+allocates a CNID, and neither touches `fileCount` or `folderCount`.
 
 | Invariant | Holds because | Tested by |
 | --- | --- | --- |

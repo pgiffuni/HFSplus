@@ -927,6 +927,238 @@ fn the_root_folder_and_reserved_cnids_cannot_be_removed() {
     assert_untouched(&path, &before, "a refused remove");
 }
 
+// --- Renaming and folders --------------------------------------------------
+
+#[test]
+fn renaming_keeps_the_object_and_moves_it_between_folders() {
+    // A rename is a change to the catalog, not to the data: the CNID and the forks
+    // stay, so the file is still found by the CNID it always had, and its contents
+    // are still readable. Both are asserted, because a rename that quietly
+    // reallocated the file would satisfy a lookup by name and nothing else.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let dir;
+    let file_cnid;
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let f = writable
+                .create_file(parent, &units("a.bin"))
+                .expect("create a.bin");
+            writable
+                .write_file_contents(f, &[3u8; 100])
+                .expect("give it contents");
+            dir = writable
+                .create_folder(parent, &units("sub"))
+                .expect("mkdir");
+
+            writable
+                .rename(parent, &units("a.bin"), parent, &units("b.bin"))
+                .expect("rename in place");
+            writable
+                .rename(parent, &units("b.bin"), dir, &units("moved.bin"))
+                .expect("rename into the folder");
+            file_cnid = f;
+        }
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("a.bin"))
+            .expect("lookup")
+            .is_none(),
+        "the old name must not still resolve"
+    );
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("b.bin"))
+            .expect("lookup")
+            .is_none(),
+        "nor the intermediate one"
+    );
+
+    let object = vol
+        .lookup(hfsplus::catalog::cnid::Cnid(dir), &units("moved.bin"))
+        .expect("lookup")
+        .expect("the new name must resolve in the new folder");
+    assert_eq!(
+        object.as_file().expect("a file").cnid.0,
+        file_cnid,
+        "a rename must not reallocate: the CNID is the object's identity"
+    );
+    assert_eq!(vol.read(&object, 0, 100).expect("read"), vec![3u8; 100]);
+    assert!(
+        vol.lookup_cnid(hfsplus::catalog::cnid::Cnid(file_cnid))
+            .expect("lookup by CNID")
+            .is_some(),
+        "and it must still be reachable by CNID, which is what the thread record \
+         is for -- a rename that left the thread record stale would resolve the old \
+         name here"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a file renamed into a subfolder");
+}
+
+#[test]
+fn renaming_onto_a_name_that_is_taken_is_refused() {
+    // `EEXIST`, not an overwrite. Apple allows the same-parent case, where it
+    // becomes an exchange; a cross-parent collision is refused outright.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_file(parent, &units("one.bin"))
+                .expect("create");
+            writable
+                .create_file(parent, &units("two.bin"))
+                .expect("create");
+            let err = writable
+                .rename(parent, &units("one.bin"), parent, &units("two.bin"))
+                .expect_err("two.bin is already there");
+            assert!(
+                format!("{err}").contains("two.bin"),
+                "the refusal must name the conflict; got: {err}"
+            );
+            dev.sync().expect("flush");
+        }
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    for n in ["one.bin", "two.bin"] {
+        assert!(
+            vol.lookup(vol.root_cnid(), &units(n))
+                .expect("lookup")
+                .is_some(),
+            "{n} must be untouched by the refused rename"
+        );
+    }
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a refused rename");
+}
+
+#[test]
+fn a_folder_is_created_and_counted() {
+    // `folderCount` excludes the root, which is the kind of off-by-one that only
+    // an independent checker notices: a volume with one folder and nothing else
+    // reports 1, not 2.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let folders_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().folder_count
+    };
+
+    let folder_cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_folder(parent, &units("docs"))
+                .expect("mkdir")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert_eq!(
+        vol.header().folder_count,
+        folders_before + 1,
+        "folderCount must move by one, and must exclude the root"
+    );
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("docs"))
+            .expect("lookup")
+            .is_some(),
+        "the folder must be findable by name"
+    );
+    assert!(
+        vol.lookup_cnid(hfsplus::catalog::cnid::Cnid(folder_cnid))
+            .expect("lookup by CNID")
+            .is_some(),
+        "and by CNID, which is the thread record doing its job"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a created folder");
+}
+
+#[test]
+fn a_folder_with_children_cannot_be_removed() {
+    // The same rule as a file with contents, one level up: a folder's `valence` is
+    // its child count, and one that claims children it does not have is what fsck
+    // reports as "Invalid directory item count".
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let dir = writable
+                .create_folder(parent, &units("sub"))
+                .expect("mkdir");
+            writable
+                .create_file(dir, &units("inside.bin"))
+                .expect("a file inside it");
+            let err = writable
+                .remove(parent, &units("sub"))
+                .expect_err("the folder has a child");
+            assert!(
+                format!("{err}").contains("not empty"),
+                "the refusal must say why; got: {err}"
+            );
+
+            // Empty it, and then it goes.
+            writable
+                .remove(dir, &units("inside.bin"))
+                .expect("remove the child");
+            writable
+                .remove(parent, &units("sub"))
+                .expect("remove the folder");
+            dev.sync().expect("flush");
+        }
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(vol
+        .lookup(vol.root_cnid(), &units("sub"))
+        .expect("lookup")
+        .is_none());
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a folder emptied and then removed");
+}
+
 // --- Truncation, which frees -----------------------------------------------
 
 /// Grow `payload.bin` to 8192 bytes so there is a block to give back.

@@ -355,7 +355,10 @@ compression metadata (7B.2) are done and appear above.
 
 | Area | Apple | Will become |
 | --- | --- | --- |
-| Catalog mutation beyond create | `core/hfs_catalog.c` `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildrecord` | Milestone 9 |
+| Catalog record updates | `core/hfs_catalog.c` `cat_update`, `catrec_update`, `buildrecord`; `core/hfs_xattr.c` | Milestone 9B |
+| Same-parent rename as an exchange | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | Milestone 9B |
+| Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | Milestone 9B |
+| Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
 | Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
@@ -365,11 +368,19 @@ compression metadata (7B.2) are done and appear above.
 
 ## What Milestone 8 has and has not reached
 
-Done and `fsck`-verified: overwrite, grow and truncate a file's contents within
-its eight inline extents; create an empty file, keeping the file record, its
-thread record, the parent folder's child count and `nextCatalogID` in step; insert
-and remove a record in a node; and split a leaf, which is what lets a catalog grow
-past one node and is where three separate reader bugs were found.
+**Milestone 9 is complete.** Done and `fsck`-verified: overwrite, grow and truncate
+a file's contents within its eight inline extents; create a file, create a folder,
+rename or move either, and remove either -- each keeping the file record, its
+thread record, the containing folder's child count and the volume header's counters
+in step, and each all-or-nothing; insert, remove and split a node; grow the catalog
+when a split runs out of nodes.
+
+Four things that were true only of the first of those, and are now true of all of
+them: a create writes its CNID counter first and does not roll it back, so a
+failure can never hand the same CNID out twice; the catalog records go in or out
+together, so a file record with no thread record is unreachable rather than merely
+inconsistent; and the volume header's backup copy at the end of the image moves
+with the primary, because `fsck.hfsplus` compares them and repairs the stale one.
 
 Three limits are structural rather than unfinished, and each is refused by name
 rather than approximated:
