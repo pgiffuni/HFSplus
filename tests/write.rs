@@ -283,51 +283,214 @@ fn writing_an_empty_file_leaves_no_trailing_bytes() {
 
 // --- What it refuses -------------------------------------------------------
 
+// --- Growing, which allocates ----------------------------------------------
+
+/// The CNID of `payload.bin` in a fresh copy of the fixture.
+fn payload_cnid(path: &std::path::Path) -> u32 {
+    let dev = FileDevice::open(path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    vol.lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin exists")
+        .as_file()
+        .expect("a file")
+        .cnid
+        .0
+}
+
+/// The number of allocation blocks the bitmap says are allocated.
+fn allocated_blocks(path: &std::path::Path) -> u64 {
+    let dev = FileDevice::open(path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let fork = vol.header().allocation_file;
+    let limit = usize::try_from(fork.logical_size).expect("allocation file fits usize");
+    let bytes = vol.read_fork(&fork, limit).expect("read bitmap");
+    let map = hfsplus::alloc::AllocationMap::from_bytes(&bytes, vol.header().total_blocks)
+        .expect("bitmap matches totalBlocks");
+    map.count_allocated()
+}
+
 #[test]
-fn growing_a_file_is_refused_by_name_rather_than_truncated() {
-    // The alternative -- writing what fits and quietly reporting success --
-    // would hand back a file whose contents are not what was asked for, with no
-    // indication that anything was dropped. The error names the shortfall so the
-    // caller can tell an allocator from an i/o problem.
+fn growing_a_file_allocates_exactly_the_blocks_it_needs() {
+    // 4096 -> 8192 bytes is one more block, and `howmany` is what says so. The
+    // interesting assertions are the ones about the *volume*: the bitmap must have
+    // grown by exactly one block and the header's free count by exactly one fewer.
+    // A writer that updated one and not the other would produce a volume this
+    // crate's own checker rejects.
     let Some(path) = copy_fixture(IMAGE) else {
         return;
     };
-    let cnid = {
+    let cnid = payload_cnid(&path);
+
+    let (blocks_before, free_before) = {
         let dev = FileDevice::open(&path).expect("open");
         let vol = Volume::open(&dev).expect("mount");
-        vol.lookup(vol.root_cnid(), &units("payload.bin"))
-            .expect("lookup")
-            .expect("payload.bin exists")
+        (allocated_blocks(&path), vol.header().free_blocks)
+    };
+
+    let new_data: Vec<u8> = (0..8192u32).map(|i| i as u8).collect();
+    write(&path, cnid, &new_data);
+
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before + 1,
+        "8192 bytes is two blocks and the file had one, so exactly one more must \
+         be marked allocated"
+    );
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert_eq!(
+        vol.header().free_blocks,
+        free_before - 1,
+        "and the header's free count must agree with the bitmap, or fsck.hfsplus \
+         recomputes it and reports a disagreement"
+    );
+
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup after write")
+        .expect("payload.bin still exists");
+    let f = object.as_file().expect("a file");
+    assert_eq!(f.record.data_fork.logical_size, 8192);
+    assert_eq!(f.record.data_fork.total_blocks, 2);
+    assert_eq!(
+        vol.read(&object, 0, 8192).expect("read back"),
+        new_data,
+        "both blocks must read back, including the newly allocated one"
+    );
+
+    // This crate's own checker, which is a *different* check from fsck's: it
+    // compares the bitmap against every extent the catalog describes, so it sees
+    // a block marked allocated with nothing pointing at it (an orphan) or an
+    // extent pointing at a block the bitmap calls free (missing). A writer that
+    // updated the bitmap and the record in the wrong order passes fsck -- which
+    // repairs orphans -- and fails here.
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(
+        report.is_clean(),
+        "the volume must be internally consistent after allocating a block; \
+         orphaned {:?}, missing {:?}",
+        report.orphaned,
+        report.missing
+    );
+
+    assert_fsck_clean(&path, "a write that allocated a block");
+}
+
+#[test]
+fn a_write_that_fits_the_blocks_the_file_owns_allocates_nothing() {
+    // Apple's `peof` check. The file already owns one block and the write is
+    // shorter than that, so the only thing that should change is `logicalSize` --
+    // and if the bitmap moved, the volume would have a block allocated to nothing.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+    let (before, free_before) = (allocated_blocks(&path), header_free_blocks(&path));
+
+    write(&path, cnid, &[7u8; 100]);
+
+    assert_eq!(
+        allocated_blocks(&path),
+        before,
+        "a write within the file's own blocks must not allocate"
+    );
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert_eq!(
+        vol.header().free_blocks,
+        free_before,
+        "and the header's free count must be untouched too, not just the bitmap"
+    );
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin exists");
+    assert_eq!(
+        vol.read(&object, 0, 100).expect("read back"),
+        vec![7u8; 100]
+    );
+}
+
+/// The volume header's `freeBlocks`.
+fn header_free_blocks(path: &std::path::Path) -> u32 {
+    let dev = FileDevice::open(path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    vol.header().free_blocks
+}
+
+#[test]
+fn a_partial_trailing_block_is_read_back_as_the_tail_and_not_beyond() {
+    // 5000 bytes needs two blocks but only 5000 bytes exist. The last block's
+    // remaining 3096 bytes are whatever was there before -- so reading past the
+    // logical size must be refused or empty, never a stale byte from the old
+    // contents of the same block.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+
+    let new_data: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    write(&path, cnid, &new_data);
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let object = vol
+        .lookup(vol.root_cnid(), &units("payload.bin"))
+        .expect("lookup")
+        .expect("payload.bin exists");
+    assert_eq!(
+        object
             .as_file()
             .expect("a file")
-            .cnid
-            .0
+            .record
+            .data_fork
+            .total_blocks,
+        2
+    );
+    assert_eq!(vol.read(&object, 0, 5000).expect("read back"), new_data);
+    // A read of the whole two blocks is clamped to the logical size.
+    assert_eq!(
+        vol.read(&object, 0, 8192).expect("clamped read"),
+        new_data,
+        "a read past the logical size must stop at it rather than returning the \
+         rest of the block"
+    );
+
+    assert_fsck_clean(&path, "a write with a partial trailing block");
+}
+
+#[test]
+fn growing_into_a_full_volume_reports_no_space_and_writes_nothing() {
+    // `dskFulErr`, and the whole point is that nothing is written: a write that
+    // marked a block and then failed would leave the volume with an allocation it
+    // cannot account for.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
     };
+    let cnid = payload_cnid(&path);
     let before = std::fs::read(&path).expect("read image");
 
+    // Ask for more than the volume has blocks, so no run can exist.
+    let huge = vec![0u8; 64 * 1024 * 1024];
     let mut dev = FileDevice::open_writable(&path).expect("open writable");
     let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
     let err = writable
-        .write_file_contents(cnid, &vec![0u8; 8192])
-        .expect_err("4096 bytes cannot hold 8192");
-    let rendered = format!("{err}");
+        .write_file_contents(cnid, &huge)
+        .expect_err("a 1 MiB volume cannot hold 64 MiB");
     assert!(
-        rendered.contains("8192") && rendered.contains("4096"),
-        "the error must name both the request and the capacity, or a caller \\
-         cannot tell what to do about it; got: {rendered}"
-    );
-    assert!(
-        rendered.contains("allocator"),
-        "and it must say that growth needs an allocator, which is the actual \\
-         reason; got: {rendered}"
+        matches!(err, hfsplus::Error::NoSpace { .. }),
+        "a volume with nowhere to put the data is out of space, which is \
+         distinct from every other failure; got {err:?}"
     );
     dev.sync().expect("flush");
     drop(dev);
-
     assert_untouched(
         &path,
         &before,
-        "a write refused for capacity: the check happens before the first block",
+        "a write refused for want of space: nothing may be marked or written",
     );
 }
 

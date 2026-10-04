@@ -313,7 +313,7 @@ implemented, not of the volume.
 | Structures | none new. `FileRecord::write_to` and `BsdInfo::write_to` serialise what `parse` already deserialises; `ForkData::write_to` and `ExtentRecord::to_bytes` already existed |
 | Invariants | data blocks are written *before* the catalog record that names their length, so an interrupted write leaves a file that reads as its old contents rather than as torn new ones; the record is replaced only at the same length, because a length change moves every later record in the node |
 | Rust | `src/volume/mod.rs` `write_file_contents`, `replace_catalog_record`, `find_catalog_record`; `src/catalog/record.rs` `FileRecord::write_to` |
-| Differences | refuses growth, refuses a length change, and refuses a journaled volume. Each refusal names the reason rather than degrading |
+| Differences | refuses a length change, and refuses a journaled volume. Growth is implemented (see below) |
 
 Two things this got wrong before it was right, both found by asking what
 `fsck.hfsplus` says rather than by reading the code again:
@@ -358,10 +358,12 @@ Milestones 7 through 13 depend on all of these, and none has been translated:
 | Catalog mutation | `core/hfs_catalog.c` `cat_create`, `cat_delete`, `cat_rename`, `cat_update`, `catrec_update`, `buildkey`, `buildrecord`, `buildthread` | Milestone 9 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
 | Compression metadata | `core/hfs_attrlist.c`, `core/hfs_cnode.c` (`decmpfs`) | 7B.2 |
-| B-tree mutation | `core/BTreeWrapper.c` `InsertRecord`, `SplitRecord`, `BTUpdateRecord`; `core/hfs_btreeio.c` | Milestone 8C |
-| Fork allocation | `core/hfs_readwrite.c`; `core/VolumeAllocation.c` `BlockFindAny` | Milestone 8A, 8B |
+| B-tree mutation | `core/BTreeWrapper.c` `InsertRecord`, `SplitRecord`, `BTUpdateRecord`; `core/hfs_btreeio.c` `ExtendFile`, `BTAddNewBlock` | Milestone 8C |
+| The extents B-tree | `core/hfs_extents.c` `extents_search`, `AddExtents`; overflow records | Milestone 8D |
+| Truncation and freeing | `core/hfs_readwrite.c` `do_hfs_truncate`, `TruncateFile` | Milestone 8B |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
 
-Until those rows are filled, this crate can change a file's existing bytes and
-nothing else: it cannot grow a file, create or remove one, or write to a volume
-with a journal.
+Until those rows are filled, this crate can overwrite and grow a file's contents
+within its eight inline extents. It cannot create or remove a file, cannot shrink
+a file's allocation, cannot overflow a fork into the extents tree, and cannot
+write to a volume with a journal.

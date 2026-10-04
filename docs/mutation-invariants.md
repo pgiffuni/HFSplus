@@ -163,27 +163,45 @@ from Apple's own code agrees with.
 
 # Coverage, as of this writing
 
-One mutation exists: `WritableVolume::write_file_contents`, replacing a file's
-contents in place.
+One mutation exists: `WritableVolume::write_file_contents`, replacing or growing
+a file's contents in place.
 
 | Invariant | Holds because | Tested by |
 | --- | --- | --- |
 | Structure | `FileRecord::write_to` is the inverse of `parse`, so a record read and written back is the same bytes | `a_file_record_round_trips_through_the_same_bytes` -- byte equality against the input, not a re-parse |
-| Round trip | the data blocks and the record are written in the order that never exposes a torn file: blocks first, then the length that points at them | `writing_shorter_contents_keeps_the_volume_readable`, `writing_the_same_number_of_bytes_keeps_the_allocation`, `writing_an_empty_file_leaves_no_trailing_bytes` |
-| Independent | `fsck.hfsplus` accepts every written image | `assert_fsck_clean` in `tests/write.rs`, on all three writes above |
+| Round trip | the data blocks and the record are written in the order that never exposes a torn file: blocks first, then the length that points at them | `writing_shorter_contents_keeps_the_volume_readable`, `writing_the_same_number_of_bytes_keeps_the_allocation`, `writing_an_empty_file_leaves_no_trailing_bytes`, `a_partial_trailing_block_is_read_back_as_the_tail_and_not_beyond` |
+| Independent | `fsck.hfsplus` accepts every written image | `assert_fsck_clean` in `tests/write.rs`, on every write above |
+
+When a write *allocates*, the bitmap and the volume header's `freeBlocks` have to
+agree with each other and with the catalog's extents — three places, one fact.
+`growing_a_file_allocates_exactly_the_blocks_it_needs` asserts all three moved by
+one, and then runs this crate's own checker, which is a genuinely different check
+from `fsck.hfsplus`: it compares the bitmap against every extent the catalog
+describes, so it sees a block marked allocated with nothing pointing at it, or an
+extent pointing at a block the bitmap calls free. A writer that updated the bitmap
+and the record in the wrong order passes `fsck` — which repairs orphans — and
+fails there.
+
+That check has teeth, which was verified rather than assumed: marking one block
+allocated with nothing else changed makes it report that block as orphaned. A
+checker that returned "clean" unconditionally would make the assertion above
+worthless.
 
 What is *not* yet true of any mutation here:
 
-- **No allocation.** A write may not change how many blocks a file owns, so a
-  write past the file's capacity is refused with the shortfall named rather than
-  truncated. Nothing exercises `AllocationBitmap` as a *writer*.
+- **No freeing.** A write may shrink a file's *logical size*, but the blocks it
+  no longer needs stay allocated. There is no `release` on a mutation path, so a
+  volume that is written to repeatedly grows monotonically. `do_hfs_truncate` is
+  the reference and is unmapped.
 - **No structural change.** The record is replaced only at its original length,
   because a length change moves every later record in the node. No B-tree node
   has been created, split or deleted, so the extent mapper and the node
-  descriptor are exercised as readers only.
+  descriptor are exercised as readers only. Growth stays inside the eight inline
+  extent slots for the same reason: the record's size cannot change.
 - **No journal.** `WritableVolume::open` refuses a journaled volume, so every
   mutation above runs on a volume with no journal. The checker therefore never
   has to reason about a transaction it did not write.
+- **No creation.** Every mutation here needs a CNID that already exists.
 
 The gap these leave is specific: an invariant can be enforced by the checker and
 still be impossible for a mutation to maintain, because the checker sees only
