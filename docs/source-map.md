@@ -390,8 +390,10 @@ than a refusal. A catalog more than two levels deep, whose parent index node wou
 itself need splitting, is Milestone 8G; and a leaf split divides by bytes, so a
 tree that would end up three levels deep is refused rather than half-split.
 
-One unresolved disagreement is recorded in `docs/hfs-format.md`: above forty files
-in the `bootstrapped-with-file` fixture, `fsck.hfsplus` reports "Invalid index key"
-while every invariant this crate checks still holds. The boundary is exact and the
-only thing that changes across it is the catalog's last leaf, which takes every
-thread record and so grows without ever splitting. Not yet explained.
+One bug was found by a *boundary* rather than by reasoning, and is worth recording
+for that reason: a catalog was accepted at forty files and rejected at forty-one,
+with nothing else different about the tree. An index separator is the first key of
+the subtree it points at, so inserting a record at the front of a leaf moves it
+without any node changing hands -- and a stale separator is still a valid key, still
+in order, and still bounds keys that live in that leaf, so nothing local detects
+it. `fsck.hfsplus` reports "Invalid index key". See `docs/hfs-format.md`.

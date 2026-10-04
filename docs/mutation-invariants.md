@@ -218,6 +218,7 @@ bytes were wrong four times before they were right:
 | removal is the inverse of insertion | `removal_is_the_inverse_of_insertion`, at every index |
 | a split leaves a tree a reader can still search | `creating_enough_files_splits_the_catalog_and_leaves_it_consistent`, and `every_file_survives_a_split_findable_by_name_and_by_cnid` — every file, by both routes |
 | a split keeps the header's counts honest | `leafRecords` recounted against the leaves; one index record per leaf |
+| an index separator is still the first key of its subtree | `an_insert_at_the_front_of_a_leaf_refreshes_that_leaves_index_separator`, which walks every separator against its leaf's first key |
 
 That last one exists because a split that forgets to advance `leafRecords` for the
 record that *caused* it leaves the count short by one, and `fsck` recounts.
@@ -230,6 +231,10 @@ instead of descending, and `check::check` walking the leaf chain by `bLink`. All
 three are invisible on a one-leaf catalog, which is every image the corpus
 committed before this. That is the argument for a committed fixture with a split
 catalog, and it is the one gap in the corpus now.
+
+The separator test was checked for teeth before being trusted: with the refresh
+disabled it fails on exactly the property `fsck` reports — the separator's key
+length is the thread record's 6 where the leaf's real first key is 28.
 
 What is *not* yet true of any mutation here:
 

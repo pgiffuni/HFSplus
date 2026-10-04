@@ -1163,39 +1163,46 @@ Reading the header record as a bitmap hands out node 0, and node 0 is the header
 node: writing an index node over it produces a volume that still parses as a
 catalog and has simply lost its header record.
 
-## An open disagreement: `fsck` rejects a catalog above 40 files
+### A separator moves when a record is inserted at the front of its leaf
 
-`fsck.hfsplus` accepts a catalog this crate builds up to 40 files in the
-`bootstrapped-with-file` fixture, and reports
+An index record's key is the first key of the subtree it points at, so it is not a
+fixed property of the node it names — it moves whenever a record is inserted *before*
+the leaf's current first record. Nothing else changes: no node is allocated, no
+node splits, the separator is still a valid key and still in order among its
+neighbours, and every key it now bounds still happens to live in that leaf.
 
-```
-** Checking catalog file.
-   Invalid index key
-(4, 7)
-```
+That is what makes it worth stating. The tree is *almost* right in a way nothing
+local detects: the reader's upper-bound search still lands on a leaf that contains
+the key, because the stale separator is still inside the right subtree. The
+failure appears only when a key falls between the stale separator and the leaf's
+real first key — and `fsck.hfsplus` reports it as "Invalid index key", while every
+other property of the tree checks out.
 
-at 41 and above. This crate's own checker reports the volume clean at every size,
-and every invariant it checks still holds: key order within each leaf, ascending
-index keys, one index record per leaf, `leafRecords` matching the records present,
-the sibling chain, and the node heights.
+So an insertion that changes a leaf's first record has to refresh that leaf's
+separator, and the cheapest correct way to do it is to rebuild the index from the
+leaf chain rather than to find the one record that moved: the new key need not be
+the same *length* as the old one, so it is not an in-place replacement.
 
-The boundary is exact, and the only thing that differs between 40 and 41 is the
-catalog's **last leaf**. It holds `payload.bin`, the file records that sort after
-it, and *every* thread record -- thread keys carry the file's CNID as their
-parentID, so they all sort past every parentID-2 key -- which means that leaf grows
-without ever splitting and without any of its records moving. Nothing else about
-the tree changes.
+This was found by a boundary rather than a reasoning. A catalog was accepted at 40
+files and rejected at 41, with nothing else different about the tree — and the only
+thing that changed across the boundary was the last leaf, which takes every thread
+record and so grows without ever splitting. A boundary that sharp is a fact about
+one structure, and the way to find which is to compare the two images.
 
-Not yet explained. Recorded rather than resolved because the two authorities
-disagree and neither has been shown wrong; the test for node exhaustion therefore
-does not assert `fsck` cleanliness, with a comment saying why.
+## Checklist for any new structure
 
-Worth separating from this: `check::check`'s own height rule *was* wrong, in the
-same area, and fixing it is what brought the two into agreement below the threshold.
-Its formula read `tree_depth - level + 1` where the answer is `level`, and it
-appeared three times in that file. On a one-leaf catalog the two agree, which is
-why nothing noticed.
+Before adding a parser:
 
+1. Find the struct in `core/hfs_format.h`. Copy field order and widths exactly.
+2. Find the corresponding swap routine in `core/hfs_endian.c` to confirm the
+   field order and to see how Apple handles wide integers.
+3. Check the field arithmetic. Sum the widths. If it does not land on a sensible
+   boundary, a field is missing or misplaced — this is how the phantom volume
+   name was caught.
+4. Find where Apple validates it. Match the validation order so a corrupt image
+   fails at the same point.
+5. Never `unsafe`-cast a buffer over image bytes. Use the checked accessors in
+   `src/endian/`.
 ## Checklist for any new structure
 
 Before adding a parser:

@@ -1431,7 +1431,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // Everything that reads the device happens inside this one scope, because
         // `BTreeFile` and `Catalog` both borrow it and the write below needs it
         // mutably. The only things that cross the boundary are owned values.
-        let (at_node_offset, patched) = {
+        let (at_node_offset, patched, first_changed) = {
             let bt = BTreeFile::open(
                 &*self.device,
                 &self.header.catalog_file,
@@ -1496,11 +1496,16 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 ));
             }
 
-            let mut buf = bytes;
+            let mut buf = bytes.clone();
             let fits = insert_record(&mut buf, usize::from(at), record).is_ok();
+            // Whether the insertion moved this leaf's first record, which is the
+            // only thing an in-place insert can change that the index cares about.
+            let first_changed =
+                !fits || Self::record_at(&bytes, 0).ok() != Self::record_at(&buf, 0).ok();
             (
                 bt.node_offset(node_num)?,
                 if fits { Some(buf) } else { None },
+                first_changed,
             )
         };
         // The index the record would have taken, needed only by the split, which
@@ -1514,7 +1519,21 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         };
         match patched {
             Some(buf) => {
+                // Did this insertion change the leaf's *first* record? If so, the
+                // index separator pointing at this leaf is now stale, and it has to
+                // be refreshed even though nothing split.
+                //
+                // A separator is the first key of the subtree it points at, so an
+                // in-place insert at the front of a leaf moves it without any node
+                // changing hands. Nothing else notices: the stale separator is still
+                // a valid key, still in order relative to its neighbours, and the
+                // keys it now bounds still live in that leaf -- until one of them
+                // does not, at which point `fsck.hfsplus` reports "Invalid index
+                // key" on a tree whose every other property is right.
                 self.device.write_at(at_node_offset, &buf)?;
+                if first_changed {
+                    self.refresh_index()?;
+                }
                 // `leafRecords` in the B-tree header counts the records in *all*
                 // leaf nodes. Leaving it alone is not a cosmetic omission: fsck
                 // counts the records it finds and reports "Invalid leaf record
@@ -1541,6 +1560,30 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 )
             }
         }
+    }
+
+    /// Rebuild the index from the leaf chain.
+    ///
+    /// Cheap, and deliberately the blunt instrument: the chain is the truth about
+    /// which keys each leaf holds, and an index built from it cannot disagree. The
+    /// alternative -- finding the one separator that moved and rewriting it in
+    /// place -- needs the same walk to find it, plus a length-changing record
+    /// replacement underneath, since the new first record's key need not be the
+    /// same length as the old one's.
+    ///
+    /// Does nothing while the tree is one level deep, where there is no index to
+    /// refresh: the leaf is the root.
+    fn refresh_index(&mut self) -> Result<()> {
+        let tree_depth = self.btree_header_u16(crate::btree::header::TREE_DEPTH_OFFSET)?;
+        if tree_depth < 2 {
+            return Ok(());
+        }
+        let root_node = self.btree_header_u32(crate::btree::header::ROOT_NODE_OFFSET)?;
+        let node_size = self.catalog_node_size()?;
+        let records = self.index_records_for_chain()?;
+        let root = self.read_catalog_node(root_node)?;
+        let node = Self::build_node(node_size, 0x00, root[9], 0, 0, &records)?;
+        self.write_catalog_node(root_node, &node)
     }
 
     /// The leaf that should receive `record`.

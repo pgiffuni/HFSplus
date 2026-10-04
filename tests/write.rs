@@ -724,18 +724,77 @@ fn running_out_of_catalog_nodes_is_reported_rather_than_written_anyway() {
     );
     let report = hfsplus::check::check(&vol, None).expect("check");
     assert!(report.is_clean(), "{:?}", report.describe());
-    // Deliberately *not* asserted against `fsck.hfsplus`, and that is an open
-    // defect rather than an oversight. Below 41 files in this fixture fsck accepts
-    // the volume; at 41 and above it reports "Invalid index key", while every
-    // invariant this crate checks -- key order within every leaf, the index keys
-    // ascending, one index record per leaf, `leafRecords`, the sibling chain, the
-    // node heights -- still holds. Two checkers disagreeing about a structure is
-    // exactly the situation `docs/hfs-format.md` records a disagreement for rather
-    // than picking a winner in a test.
+    assert_fsck_clean(&path, "a catalog filled to its last node");
+}
+
+#[test]
+fn an_insert_at_the_front_of_a_leaf_refreshes_that_leaves_index_separator() {
+    // A separator is the first key of the subtree it points at, so inserting at the
+    // front of a leaf moves it without any node changing hands -- and nothing else
+    // notices. The stale separator is still a valid key, still in order among its
+    // neighbours, and the keys it now bounds still live in that leaf, right up until
+    // one of them does not. `fsck.hfsplus` reports "Invalid index key"; every other
+    // property of the tree is right.
     //
-    // The disagreement is about the catalog's *last* leaf, which takes every thread
-    // record and so grows without ever splitting; that is the only thing that
-    // differs between 40 and 41. Not yet explained.
+    // This is why the boundary in this test is a file count and not "some files":
+    // it is the *first* file that sorts after a leaf's existing first key, so the
+    // number depends on the names and would drift silently if the test picked
+    // arbitrarily.
+    let path = create_many(41);
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let bt = hfsplus::btree::io::BTreeFile::open(
+        &dev,
+        &vol.header().catalog_file,
+        vol.header().block_size,
+        vol.header().is_hfsx(),
+    )
+    .expect("open the catalog");
+    let header = *bt.header();
+    let root_bytes = bt.read_node_bytes(header.root_node).expect("read root");
+    let root_node = bt.parse_node(&root_bytes).expect("parse root");
+
+    // Every separator must be the first key of the leaf it points at.
+    for i in 0..root_node.num_records() {
+        let record = root_node.record(i).expect("index record");
+        let separator = hfsplus::catalog::lookup::split_record(record)
+            .expect("an index record decodes")
+            .0;
+        let body = hfsplus::catalog::lookup::split_record(record)
+            .expect("an index record decodes")
+            .1;
+        let child = u32::from_be_bytes([
+            body[body.len() - 4],
+            body[body.len() - 3],
+            body[body.len() - 2],
+            body[body.len() - 1],
+        ]);
+        let leaf_bytes = bt.read_node_bytes(child).expect("read leaf");
+        let leaf = bt.parse_node(&leaf_bytes).expect("parse leaf");
+        let first = hfsplus::catalog::lookup::split_record(leaf.record(0).expect("first record"))
+            .expect("a leaf record decodes")
+            .0;
+        assert_eq!(
+            separator.key_length, first.key_length,
+            "index record {i} and the first key of leaf {child} have different key \
+             lengths, so one of them is stale"
+        );
+        assert_eq!(
+            separator.parent_id, first.parent_id,
+            "index record {i} does not name the same parent as the first key of \
+             leaf {child}"
+        );
+        assert_eq!(
+            separator.name, first.name,
+            "index record {i} is not the first key of leaf {child}, so the subtree \
+             it points at no longer starts where the index says it does"
+        );
+    }
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "an insert at the front of a leaf");
 }
 
 // --- Truncation, which frees -----------------------------------------------
