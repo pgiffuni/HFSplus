@@ -791,16 +791,18 @@ fn removing_a_file_takes_both_its_records_and_fixes_the_counts() {
     };
     let victim_cnid = {
         let mut dev = FileDevice::open_writable(&path).expect("open writable");
-        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
-        let cnid = writable
-            .create_file(parent, &units("doomed.bin"))
-            .expect("create");
-        writable
-            .remove(parent, &units("doomed.bin"))
-            .expect("remove the file just created");
-        // The writer borrows the device, so it has to go before the device can be
-        // synced.
-        drop(writable);
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let cnid = writable
+                .create_file(parent, &units("doomed.bin"))
+                .expect("create");
+            writable
+                .remove(parent, &units("doomed.bin"))
+                .expect("remove the file just created");
+            cnid
+        };
+        // A scope, not `drop`: `WritableVolume` has no destructor, so dropping it
+        // explicitly would only end its borrow -- which a block does just as well.
         dev.sync().expect("flush");
         cnid
     };
