@@ -106,6 +106,16 @@ pub struct ExtentRecord {
     pub raw: [ExtentDescriptor; INLINE_EXTENT_COUNT],
 }
 
+/// The descriptor a freed or unused extent slot holds.
+///
+/// Both fields zero. A zeroed descriptor *is* the terminator that
+/// [`ExtentRecord::iter`] stops at, so "freeing" an extent means writing this and
+/// not compacting the record. Mining reference: `TruncateFileC` in
+/// `core/FileExtentMapping.c` sets `startBlock = 0` and `blockCount = 0` on every
+/// descriptor it releases, rather than shifting the survivors down -- which is
+/// what keeps a catalog record the same length across a truncation.
+pub const EMPTY_DESCRIPTOR: ExtentDescriptor = ExtentDescriptor::EMPTY;
+
 /// Byte size of an on-disk inline extent record.
 pub const EXTENT_RECORD_SIZE: usize = INLINE_EXTENT_COUNT * EXTENT_DESCRIPTOR_SIZE;
 

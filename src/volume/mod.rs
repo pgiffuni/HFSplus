@@ -716,6 +716,194 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.replace_catalog_record(cnid, &record)
     }
 
+    /// Free a file's blocks beyond `new_len`, shrinking its allocation.
+    ///
+    /// Truncation in the sense Apple means it: the file keeps
+    /// `howmany(new_len, blockSize)` blocks, and every block past that is released
+    /// to the volume. Setting `logicalSize` alone is *not* truncation — a file
+    /// whose length shrank while its blocks stayed allocated is a volume slowly
+    /// filling up, which is the failure this method exists to prevent.
+    ///
+    /// # The rounding, and why it is up
+    ///
+    /// The new size is rounded **up** to a block boundary, so truncating 5000
+    /// bytes leaves two blocks, not one. Truncating to 4097 therefore frees
+    /// nothing, and a caller cannot use it to shave the tail of a partial block.
+    /// That is Apple's behaviour and it follows from the format: a block is the
+    /// unit of allocation, so the only sizes a file can have are multiples of it.
+    ///
+    /// # Zero is special
+    ///
+    /// A zero length frees *every* block, including the last extent. The
+    /// `truncateToExtent` option means "round out to the end of the containing
+    /// extent" and has no meaning at zero — there is no containing extent, and
+    /// keeping one would leave a zero-length file holding storage.
+    ///
+    /// # Why this needs no B-tree mutation
+    ///
+    /// A freed extent is not removed from the record; its `startBlock` and
+    /// `blockCount` are both set to zero, and a zeroed descriptor *is* the
+    /// terminator. So the record keeps its length, which is the same property that
+    /// lets [`Self::grow_fork`] append extents without touching the extents tree.
+    /// The two are the same fact seen from opposite ends, and it is the reason
+    /// allocation and deallocation are both testable before Milestone 8C.
+    ///
+    /// # Order of operations
+    ///
+    /// The bitmap is freed and flushed *before* the catalog record is rewritten —
+    /// the same order as [`Self::grow_fork`], and the same reason. A crash in
+    /// between leaves a file whose record claims fewer blocks than it has: the
+    /// extra blocks are orphans, which is recoverable. The reverse order would
+    /// leave a record claiming blocks the bitmap has handed to something else.
+    ///
+    /// Mining reference: `core/FileExtentMapping.c` `TruncateFileC`, which rounds
+    /// with `howmany`, shortens the containing extent by
+    /// `extentNextBlock - nextBlock`, zeroes the descriptors of every following
+    /// extent, and takes the `peof == 0` path first.
+    pub fn truncate_file(&mut self, cnid: u32, new_len: u64) -> Result<()> {
+        let block_size = self.header.block_size;
+        let mut record = self.read_file_record(cnid)?;
+        let keep = (new_len as usize + block_size as usize - 1) / block_size as usize;
+
+        // A request that both keeps every block *and* does not shorten the file
+        // changes nothing at all, so it is refused rather than answered by
+        // rewriting the record with the same numbers and moving the modification
+        // time -- which would look like a successful truncate of nothing.
+        //
+        // Keeping the blocks while shortening the length is *not* refused: that is
+        // how a file gives up the tail of its last partial block without releasing
+        // it, and Apple allows it -- `TruncateFileC` shortens by
+        // `extentNextBlock - nextBlock` blocks and writes the new length
+        // regardless of whether that count was zero.
+        if keep >= record.data_fork.total_blocks as usize
+            && new_len >= record.data_fork.logical_size
+        {
+            return Err(Error::invalid(
+                "truncate",
+                format!(
+                    "{new_len} bytes keeps all {} of the file's block(s) and does \
+                     not shorten it; that is not a truncation",
+                    record.data_fork.total_blocks
+                ),
+            ));
+        }
+        if keep == 0 {
+            // Every block goes, and every descriptor is zeroed, so the record's
+            // length is unchanged and there is nothing left to describe.
+            self.release_blocks(&mut record, 0)?;
+            record.data_fork.logical_size = 0;
+        } else {
+            self.release_blocks(&mut record, keep)?;
+            record.data_fork.logical_size = new_len;
+        }
+        self.touch_record(&mut record)?;
+        self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Release every block of `record`'s data fork past `keep` blocks.
+    ///
+    /// Walks the descriptors rather than trusting `totalBlocks`, because the two
+    /// can disagree on a damaged volume and the descriptors are what both the
+    /// bitmap and the reader believe.
+    ///
+    /// Ranges are collected first and released afterwards, because the map has to
+    /// be loaded from the device -- which needs a shared borrow -- and mutating it
+    /// happens in memory. Releasing one range at a time would reload it per
+    /// extent for no benefit: the writes are coalesced when the bitmap goes out.
+    fn release_blocks(&mut self, record: &mut FileRecord, keep: usize) -> Result<()> {
+        use crate::format::extents::{ExtentDescriptor, EMPTY_DESCRIPTOR};
+
+        let mut file_block = 0usize;
+        let mut freed = 0u32;
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+
+        let descriptors: Vec<(usize, u32, u32)> = record
+            .data_fork
+            .extents
+            .raw
+            .iter()
+            .enumerate()
+            .take_while(|(_, d)| !d.is_terminator())
+            .map(|(i, d)| (i, d.start_block, d.block_count))
+            .collect();
+
+        for (slot, start_block, block_count) in descriptors {
+            // How many of this descriptor's blocks lie before the new end.
+            let keep_here = keep.saturating_sub(file_block);
+
+            if keep_here == 0 {
+                // Wholly past the new end: release all of it and zero the
+                // descriptor, which is what makes it a terminator. Apple does
+                // exactly this -- `startBlock = 0; blockCount = 0` -- rather than
+                // compacting the record, because the record's length must not
+                // change.
+                ranges.push((start_block, block_count));
+                freed += block_count;
+                record.data_fork.extents.set(slot, EMPTY_DESCRIPTOR)?;
+            } else if (keep_here as u32) < block_count {
+                // Partly kept: release the tail and shorten. The start block is
+                // unchanged, so the kept prefix stays where it was.
+                let drop_from = start_block + keep_here as u32;
+                let drop_count = block_count - keep_here as u32;
+                ranges.push((drop_from, drop_count));
+                freed += drop_count;
+                record.data_fork.extents.set(
+                    slot,
+                    ExtentDescriptor {
+                        start_block,
+                        block_count: keep_here as u32,
+                    },
+                )?;
+            }
+            // Fully kept: leave the descriptor exactly as it is.
+            file_block += block_count as usize;
+        }
+
+        record.data_fork.total_blocks = keep as u32;
+        if freed == 0 {
+            return Ok(());
+        }
+
+        let mut map = self.load_allocation_map()?;
+        for (start, count) in ranges {
+            map.release(start, count)?;
+        }
+        let free_blocks = self
+            .header
+            .free_blocks
+            .checked_add(freed)
+            .ok_or_else(|| Error::overflow("volume_header.freeBlocks"))?;
+        self.write_allocation_bitmap(&map, free_blocks)
+    }
+
+    /// Read the allocation bitmap as a mutable map.
+    fn load_allocation_map(&self) -> Result<crate::alloc::AllocationMap> {
+        use crate::alloc::AllocationMap;
+        let fork = &self.header.allocation_file;
+        // The allocation file is read whole, using its own declared length: it is
+        // a full allocation block on every volume, not merely the bytes the bitmap
+        // needs. The same rule the checker uses, so the two cannot disagree about
+        // which bits are set.
+        let limit = usize::try_from(fork.logical_size).unwrap_or(1 << 20);
+        let bytes = {
+            let reader = ForkReader::new(&*self.device, fork, self.header.block_size);
+            reader.read(0, limit)?
+        };
+        Ok(AllocationMap::from_bytes(&bytes, self.header.total_blocks)?
+            .with_alloc_limit(self.header.total_blocks))
+    }
+
+    /// Set both modification timestamps from one clock read.
+    fn touch_record(&mut self, record: &mut FileRecord) -> Result<()> {
+        let now =
+            crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+        record.content_mod_date = now;
+        record.attribute_mod_date = now;
+        Ok(())
+    }
+
     /// Give `record`'s data fork `extra` more blocks, and put them on disk.
     ///
     /// Order of operations, and why each step is where it is:
