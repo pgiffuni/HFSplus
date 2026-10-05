@@ -942,6 +942,45 @@ agree -- which means a link is being counted twice, most likely once by
 catalog pass, or the chain is being entered under two references. That is one
 function and one call site.
 
+### The last comparison, and where it is
+
+What remains is emitted from the inode walk, after `CheckHardLinkList` passes:
+
+```c
+linkCount = isdir ? rec.hfsPlusFolder.bsdInfo.special.linkCount
+                  : rec.hfsPlusFile.bsdInfo.special.linkCount;
+if (linkCount != li->linkCount) {
+        RecordBadLinkCount(gp, inodeID, linkCount, li->linkCount);
+}
+```
+
+so it is the inode's `special` against the number the checker counted into the hash
+for that reference. Both should be 1 here:
+
+- the inode is written with `special = 1`, and reads back as 1;
+- the link is bucketed once. `CaptureHardLink` calls
+  `hardlink_add_bucket(fileBucket, file->hl_linkReference, file->fileID)` for a
+  record that passes the FinderInfo test, and `hash_insert` "initializes linkCount
+  to 1"; the per-link loop only does `li->linkCount++` when the bucket already
+  exists, which for one link it never does.
+
+`CheckHardLinkList`, called immediately before with the same count, would have
+reported anything wrong with the chain itself -- `list[0].prev` non-zero, the
+inode's `hl_firstLinkID` not matching the first link, or the last link's `next`
+non-zero -- and says nothing, so the chain fields are right.
+
+Which leaves two possibilities, both one call site: the link is being bucketed twice
+(the catalog pass and the metadata pass both see it), or the inode's `special` is
+not what the check reads. The first is the more likely, because `hl_linkReference`
+for the link and the reference parsed out of the inode's *name* both have to land on
+the same bucket, and this crate's inode name encodes the CNID as the reference --
+which is what `lib_fsck_hfs` assumes for post-Tiger file links but which TN1150
+says is a separate number.
+
+**That is the one thing to check next**, and it is a one-function question: does the
+metadata pass see the link as well as the catalog pass? If it does, the chain is
+being walked twice for a single link and the counting follows.
+
 **What this round is worth beyond the fix.** Two of the four failed attempts were
 not chasing the format at all. One was reading the wrong field for the link's
 identity, and one was a mistyped constant. Both presented as "the checker disagrees
