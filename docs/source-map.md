@@ -671,6 +671,68 @@ And the bug the written order caught: the earlier attempt removed the target's
 record **twice**, once in the rename half and once in the link half, and reported
 "catalog record to remove not present" for a record it had just deleted itself.
 
+### The contradiction, resolved in `lib_fsck_hfs`
+
+The last measurements produced a contradiction that no amount of reading `core/`
+could settle: `createindirectlink` sets `ca_linkref` and `cat_createlink` stores it
+as `hl_linkReference`, yet `fsck.hfsplus` wanted `1` there. The answer is in
+`lib_fsck_hfs/dfalib/HardLinkCheck.c`, which is in the same repository -- it was
+simply not in the sparse checkout, which had pulled `core/` alone.
+
+Two comments settle it, and both are the checker explaining itself:
+
+```c
+/* For directory hard links, hash using inodeID.  For
+ * file hard links, hash using link reference number
+ * (which is same as inode ID for file hard links
+ * created post-Tiger).  For each inodeID, add the
+ * <prev, id, next> triad.
+ */
+li = hash_search(inodeID, slots, slotsUsed, linkInfo);
+```
+
+and, for the inode's own record:
+
+```c
+inodeID = rec.hfsPlusFile.fileID;
+ref_num = atol((char*)&filename[prefixlen]);
+link_ref_num = (UInt32)ref_num;
+```
+
+with `prefixlen = strlen(HFS_INODE_PREFIX)` -- five characters, so `iNode17` parses
+as `17`.
+
+So the rule is precise:
+
+| | |
+| --- | --- |
+| The link's `hl_linkReference` | **the inode's CNID** -- "same as inode ID for file hard links created post-Tiger" |
+| The inode's `linkCount` | the number of links the checker found pointing at it, so 1 for one link |
+| The inode's name | `HFS_INODE_PREFIX` + that reference in decimal, which is what the checker parses |
+| The chain flag | the checker **sets** it on an inode that lacks it: `record_inode_badflags(gp, inodeID, isdir, flags, flags \| kHFSHasLinkChainMask, true)` |
+
+The checker's own classification rule also explains the quiet repair. A file
+record is treated as a *pre-Leopard* link -- ignored, and its flag cleared -- when
+it has no chain flag **and** no prev and no next pointer:
+
+```c
+if ((info->fileBucket == NULL) ||
+    (((file->flags & kHFSHasLinkChainMask) == 0) &&
+     (file->hl_prevLinkID == 0) &&
+     (file->hl_nextLinkID == 0))) {
+        filelink_hash_link(file->hl_linkReference);
+}
+```
+
+So the last measurement -- `hl_linkReference` set to 1 to silence a count complaint
+-- made the link hash under reference 1 instead of 17, which is a *different inode*.
+It silenced the symptom and broke the structure, which is the worst of both. The
+value there is the CNID; the count complaint came from reading the wrong record's
+field.
+
+**The next implementation has both values right**: `special` = the inode's CNID on
+the link, and `special` = 1 on the inode.
+
 ### The one byte that is left
 
 `fsck.hfsplus` still repairs, and the repair is one byte:
