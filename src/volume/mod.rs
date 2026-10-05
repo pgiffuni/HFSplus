@@ -802,6 +802,10 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             backup_date: now,
             bsd_info: crate::catalog::record::BsdInfo {
                 file_mode: S_IFREG | 0o644,
+                // `special` is `hl_linkCount` on a record that is not a link, and
+                // Apple sets it to 1 for a regular file. Zero is not "no links" so
+                // much as "never counted".
+                special: 1,
                 ..FileRecord::EMPTY.bsd_info
             },
             ..FileRecord::EMPTY

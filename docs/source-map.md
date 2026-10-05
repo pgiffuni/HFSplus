@@ -360,7 +360,7 @@ compression metadata (7B.2) are done and appear above.
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | **The private hardlinks folder** | `core/hfs_link.c` `hfs_private_names`, `HFSPLUSMETADATAFOLDER` in `core/hfs_format.h` | Milestone 10, first |
-| **Creating** a hard link | `core/hfs_catalog.c` `cat_createlink`; `core/hfs_link.c` `hfs_makelink` | blocked -- see below |
+| **Creating** a hard link | `core/hfs_catalog.c` `cat_createlink`; `core/hfs_link.c` `hfs_makelink` | blocked -- `fsck` clears the chain flag |
 | **Threading** a second link | `cat_lookup_lastlink`, `cat_lookup_siblinglinks`, `hl_firstLinkID` | blocked -- see below |
 | **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | Milestone 10 |
 | **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
