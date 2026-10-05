@@ -944,6 +944,68 @@ function and one call site.
 
 ### The last comparison, and where it is
 
+### The message, and where it actually comes from
+
+`"Incorrect number of file hard links"` is `SFileHardLinkChain`, printed by
+`record_link_badchain`, which has **four** call sites -- not the
+`RecordBadLinkCount` comparison I first assumed, and not only the one inside
+`CaptureHardLink`:
+
+| Call site | Raised when |
+| --- | --- |
+| `HardLinkCheck.c:499`, in `CaptureHardLink` | a link record has the chain bit clear -- a "pre-Leopard" link, which the checker declines to count |
+| `HardLinkCheck.c:999`, after `compare_prime_buckets(catBucket, info->fileBucket)` | **the two hash tables of links disagree** |
+| `HardLinkCheck.c:1034`, over the `filelink_hash` | a pre-Leopard entry's `found_link_count` and `calc_link_count` differ, or either is zero |
+| `dirhardlink.c:664,692`, in `inode_check` | a private-directory inode has `linkCount == 0` |
+
+The second is the one this volume hits, and it is a structural comparison rather
+than a field value:
+
+> "If we've reached this point, and result is clean, then we need to compare the
+> two hard link buckets: if they don't match, then we have a hard link chain error"
+
+The two buckets are built differently. `info->fileBucket` comes from
+`CaptureHardLink`, keyed by **`hl_linkReference`**. `catBucket` comes from
+`inode_check` -- called for every record found in the private directory -- and is
+keyed by walking the chain from `hl_firstLinkID`, where `inode_id` is the record's
+own `fileID` and the chain head is `reserved1`.
+
+So the two agree only when every link in the chain is reachable by walking
+`hl_firstLinkID` -> `hl_nextLinkID`, and the reference the checker buckets under is
+the same number the walk reaches. With one link, the inode's `reserved1` names it and
+the link's `next` is 0, which is the shape here -- so the mismatch is in *which*
+records enter the buckets, not in the chain fields, which `CheckHardLinkList`
+already validated.
+
+### The reference-range experiment: a negative result
+
+TN1150 says a link reference is "randomly chosen from the range 100 to 1073741923"
+and "not related to catalog node IDs", while `lib_fsck_hfs` assumes it equals the
+inode ID for post-Tiger file links. Every link this crate had made used a CNID
+below 100, because the corpus fixture starts allocating at 17.
+
+So the test: write enough files to reach **CNID 107** before linking, and see whether
+the message goes away. It does not:
+
+```
+target cnid = Some(107)
+(2,   "alias.bin")  file 118  ref=107  count=107  flags=0x22
+(117, "iNode107")   file 107  count=1    flags=0x2
+** Checking multi-linked files.
+   Incorrect number of file hard links
+```
+
+The reference is in range, the chain fields are right, the counts read correctly,
+and the message stands. **The reference range is not the cause**, and an earlier
+measurement in this file that "`iNode17` is accepted" was fsck tolerating a volume
+it could not reconcile rather than agreeing with it.
+
+One further observation from the same run: with the link present, `fsck.hfsplus`
+ends with **"could not be repaired"** rather than repairing. That is a change in kind
+from every earlier failure, and it means the checker now believes the inconsistency
+is not the kind it can fix by rewriting a field -- consistent with a bucket
+comparison failing rather than a single wrong value.
+
 ### The message is not the count check -- corrected
 
 I previously mapped "Incorrect number of file hard links" to `RecordBadLinkCount`,
