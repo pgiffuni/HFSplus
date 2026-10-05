@@ -359,7 +359,9 @@ compression metadata (7B.2) are done and appear above.
 | A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | done |
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
-| Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
+| **Creating** a hard link | `core/hfs_catalog.c` `cat_createlink`; the private hardlinks directory | blocked -- see below |
+| **Threading** a second link | `cat_lookup_lastlink`, `cat_lookup_siblinglinks`, `hl_firstLinkID` | blocked -- see below |
+| **Unlinking** through a link | `cat_delete` refusing a record with siblings | Milestone 10 |
 | Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
@@ -433,6 +435,75 @@ is about to leave and refuses it as a duplicate. The bytes are already read for 
 rollback, so that ordering is safe. `a_case_variant_rename_is_a_rekey_rather_than_a_move`
 exercises it both ways, and asserts the record *count* as well -- a re-key done as a
 move would leave four entries where there should be three.
+
+## Hard links: what `fsck` says, and why writing one is blocked
+
+Hard links are the next milestone and they are **not started**. The reading side is
+already in place from an earlier milestone -- `is_hard_link()`, `link_count()`,
+`link_reference()`, `first_link_id()`, and a `BsdInfo` whose fields already
+document that `ownerID` is "`ownerID`, or `prevLinkID` for a hard link". What is
+missing is the private hardlinks directory, and a first attempt at the writing side
+established exactly why.
+
+### What was built and measured
+
+A `create_hard_link` following `cat_createlink` -- a new CNID, the thread record
+inserted **first**, a file record carrying the target's forks and permissions with
+`kHFSHasLinkChainMask` set and `hl_linkReference` naming the indirect node -- and a
+refusal for a second link, since threading a chain needs the head that lives in the
+private directory.
+
+`fsck.hfsplus` on the result, first run on a genuinely fresh image:
+
+```
+File record has hard link chain flag (id = 18)
+File has incorrect number of links (id = 18)  (It should be 1 instead of 17)
+File has incorrect number of links (id = 17)  (It should be 1 instead of 2)
+```
+
+### One bug found, and fixed
+
+The first run also said:
+
+```
+Overlapped extent allocation (id = 17, /orig.bin)
+Overlapped extent allocation (id = 18, /alias.bin)
+Invalid volume free block count  (It should be 218 instead of 219)
+```
+
+The overlap is a real bug and an instructive one: the link's file record was built
+from the target's, **extents included**, so two catalog records described the same
+blocks -- allocated once, claimed twice, with nothing on the way back to say which
+claim to believe. **A file hard link is a name, not a second owner of the data.**
+Both forks on the link's record must be empty. Fixing that removed the overlap *and*
+the free-block-count complaint, and is worth keeping whatever else happens.
+
+### The finding that blocks it
+
+The two count complaints say something specific. `fsck` reads a link count out of
+`special` for *every* record, and for the link it read **17** -- which is what this
+crate put there as `hl_linkReference`. And `fsck` expects **1** for the indirect
+node too, even though it now has itself plus one link.
+
+So both records should be reading 1, which means `hl_linkReference` is **not** in the
+link's own record for a file link. The reference lives in the private hardlinks
+directory, keyed by the indirect node's CNID -- and that is precisely what the
+directory is *for*. The reasoning that had said a chain of one needs nothing else,
+because `cat_lookup_siblinglinks` reads `hl_prevLinkID`/`hl_nextLinkID` straight out
+of an ordinary link, was right about the *chain* and wrong about the *reference*.
+
+So a hard link cannot be expressed in a form `fsck` accepts until the private
+directory exists, and creating that directory is the first thing Milestone 10 has to
+do. Everything measured above is recorded so the next attempt starts from it.
+
+### A trap worth naming
+
+`fsck.hfsplus` **modifies the image it checks** -- `AGENTS.md` says so, and it cost
+two rounds of false confidence here. A probe that ran the checker on its own output
+and then diffed a copy of the *repaired* image reported "appears to be OK" with zero
+differences, which read as success for a volume the checker had just rewritten. The
+only trustworthy measurement is a checker run against an image nothing has touched,
+and the diff has to come from a copy made *before* that run.
 
 ## What Milestone 8 has and has not reached
 
