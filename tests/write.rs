@@ -70,14 +70,60 @@ fn assert_fsck_clean(path: &std::path::Path, what: &str) {
         eprintln!("skipping fsck.hfsplus check: not installed");
         return;
     };
-    let out = common::run_fsck(&fsck, path);
+    // fsck.hfsplus **modifies the image it checks** -- `AGENTS.md` says so -- and on
+    // its first run over an image it writes its own "fsc.k" signature into
+    // `lastMountedVersion`, then reports "was repaired successfully" for that alone.
+    //
+    // So the verdict text cannot be the whole test. What is checked is the *image*:
+    // a copy is checked, and every byte that differs from ours must be one of those
+    // eight signature bytes -- four in the primary header and four in the copy at
+    // the end of the volume. Anything else is a repair, and is named by offset.
+    //
+    // This is strictly stronger than reading the verdict. A checker that repaired
+    // something and reported it would fail on the text; one that repaired
+    // something *quietly* would fail here and pass there.
+    let before = std::fs::read(path).expect("read image");
+    let mut probe = path.to_path_buf();
+    let stamp = std::process::id();
+    probe.set_file_name(format!(
+        "{}.fsckprobe{stamp}",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    std::fs::copy(path, &probe).expect("copy for fsck");
+    let out = common::run_fsck(&fsck, &probe);
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let after = std::fs::read(&probe).expect("read the checked image");
+    let _ = std::fs::remove_file(&probe);
+
+    // `lastMountedVersion` is at offset 8 of the volume header, and the backup
+    // header sits in the last kilobyte.
+    let signature_at = |i: usize| -> bool {
+        i == 1024 + 8
+            || (1024 + 9..=1024 + 12).contains(&i)
+            || i == before.len() - 1024 + 8
+            || (before.len() - 1024 + 9..=before.len() - 1024 + 12).contains(&i)
+    };
+    let repaired: Vec<usize> = before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .filter(|(i, (a, b))| a != b && !signature_at(*i))
+        .map(|(i, _)| i)
+        .take(8)
+        .collect();
     assert!(
-        text.contains("appears to be OK") || text.contains("File system is clean"),
+        repaired.is_empty(),
+        "fsck.hfsplus modified {what} at offsets {repaired:?} -- that is a repair, \
+         not a signature. Its output:\n{text}"
+    );
+    assert!(
+        text.contains("appears to be OK")
+            || text.contains("File system is clean")
+            || text.contains("was repaired successfully"),
         "fsck.hfsplus rejected {what}:\n{text}"
     );
 }

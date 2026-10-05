@@ -3578,6 +3578,28 @@ pub const FILE_HARDLINKS_FOLDER: &str = "\u{2500}\u{2500}\u{2500}\u{2500}HFS+ Pr
 /// is in Apple's definition and is easy to lose when transcribing it.
 pub const DIR_HARDLINKS_FOLDER: &str = ".HFS+ Private Directory Data\r";
 
+/// `kHFSThreadExistsMask` -- the record's flags say its thread record exists.
+/// `createindirectlink` sets it alongside `kHFSHasLinkChainMask`, and a link record
+/// without it is one `fsck.hfsplus` does not expect.
+pub const K_HFS_THREAD_EXISTS_MASK: u16 = 0x0002;
+
+/// `UF_IMMUTABLE`, which `createindirectlink` sets on a hard link: a link is not
+/// something to write through, only a second name to read by.
+pub const UF_IMMUTABLE: u8 = 0x0002;
+
+/// `kHardLinkFileType` -- `'hlnk'`, in a hard link's FinderInfo.
+pub const K_HARD_LINK_FILE_TYPE: u32 = 0x686C_6C6E;
+
+/// `kHFSPlusCreator` -- `'hfs+'`, in a hard link's FinderInfo.
+pub const K_HFS_PLUS_CREATOR: u32 = 0x6866_732B;
+
+/// `kHasBeenInited`, in a hard link's FinderInfo flags.
+pub const K_HAS_BEEN_INITED: u16 = 0x0100;
+
+/// `kTextEncodingMacUnicode`, which `cat_createlink` passes to `buildrecord` for a
+/// link.
+pub const K_TEXT_ENCODING_MAC_UNICODE: u32 = 0;
+
 /// The prefix Apple gives an indirect node's name in the private folder.
 ///
 /// `HFS_INODE_PREFIX` in `core/hfs_format.h`, used by `MAKE_INODE_NAME` in
