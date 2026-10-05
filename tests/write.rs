@@ -1405,6 +1405,80 @@ fn a_folder_with_children_cannot_be_removed() {
     assert_fsck_clean(&path, "a folder emptied and then removed");
 }
 
+// --- Hard links ---------------------------------------------------------------
+
+#[test]
+fn the_private_file_hardlinks_folder_is_created_with_apples_exact_name() {
+    // Every hard link's catalog record belongs *inside* this folder, named by
+    // the link's own CNID. A volume with a link and no such folder is one where
+    // the chain cannot be found, which is what `fsck` complained about when this
+    // crate first tried to write a link.
+    //
+    // The name is four U+2500 BOX DRAWINGS LIGHT HORIZONTAL then "HFS+ Private
+    // Data". Not decoration: the folder is found *by name*.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let folder = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let folder = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let folder = writable
+                .ensure_file_hardlinks_folder()
+                .expect("create the private folder");
+            assert_eq!(
+                writable
+                    .ensure_file_hardlinks_folder()
+                    .expect("second call"),
+                folder,
+                "creating it twice must not produce two folders"
+            );
+            folder
+        };
+        dev.sync().expect("flush");
+        folder
+    };
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let name: Vec<u16> = hfsplus::volume::FILE_HARDLINKS_FOLDER
+        .encode_utf16()
+        .collect();
+    assert_eq!(
+        name.len(),
+        21,
+        "four box-drawing characters plus \"HFS+ Private Data\" -- 21 UTF-16 \
+         units, 29 UTF-8 bytes. An earlier draft of this test said 65, having \
+         measured the *escaped* text rather than the decoded string"
+    );
+    assert!(
+        vol.lookup(vol.root_cnid(), &name)
+            .expect("lookup")
+            .is_some(),
+        "the private folder must be findable by name"
+    );
+    assert!(
+        vol.lookup_cnid(hfsplus::catalog::cnid::Cnid(folder))
+            .expect("lookup by CNID")
+            .is_some(),
+        "and its CNID must resolve to it, which is what makes it a catalog entry \
+         rather than a block that happens to contain one"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a created private hardlinks folder");
+}
+
+#[test]
+fn the_directory_hardlinks_name_keeps_its_trailing_carriage_return() {
+    // `.HFS+ Private Directory Data` followed by CR. The CR is in Apple's
+    // definition and is exactly what gets lost transcribing a `#define` into a doc
+    // comment and back. Asserted directly so it cannot be.
+    let name = hfsplus::volume::DIR_HARDLINKS_FOLDER;
+    assert!(name.ends_with('\r'), "the name ends with CR: {name:?}");
+    assert_eq!(name.encode_utf16().count(), 29, "29 UTF-16 units");
+    assert!(name.starts_with(".HFS+ Private Directory Data"));
+}
+
 // --- Truncation, which frees -----------------------------------------------
 
 /// Grow `payload.bin` to 8192 bytes so there is a block to give back.

@@ -1089,6 +1089,46 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         Ok(false)
     }
 
+    /// Find the private folder for file hard links, creating it if it is not there.
+    ///
+    /// Every hard link's record belongs *inside* it, named by the link's own CNID --
+    /// `hfs_makelink` renames the link inode in there rather than leaving it where
+    /// the user asked for it. So a volume with a link but no such folder is not a
+    /// volume `fsck` can find the chain in, which is what the count complaints were
+    /// about.
+    ///
+    /// Idempotent: a second call finds the existing folder rather than making a
+    /// second one, because two folders with the same name is a catalog with two
+    /// answers to every question about it.
+    pub fn ensure_file_hardlinks_folder(&mut self) -> Result<u32> {
+        use crate::catalog::lookup::Catalog;
+
+        let root = ROOT_FOLDER_ID;
+        let name: Vec<u16> = FILE_HARDLINKS_FOLDER.encode_utf16().collect();
+        // The lookup and the create are separate borrows: `Catalog` holds a shared
+        // reborrow of the device, and `create_folder` needs it mutably.
+        let existing = {
+            let catalog = Catalog::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            catalog.lookup(root, &name)?
+        };
+        match existing {
+            Some(crate::catalog::record::CatalogRecord::Folder(f)) => Ok(f.folder_id.0),
+            Some(other) => Err(Error::invalid(
+                "catalog",
+                format!(
+                    "{FILE_HARDLINKS_FOLDER} exists but is a {other:?}, not a \
+                     folder, so it cannot hold hard link records"
+                ),
+            )),
+            None => self.create_folder(root.0, &name),
+        }
+    }
+
     /// Create an empty folder called `name` in `parent`, and return its CNID.
     ///
     /// The same shape as [`Self::create_file`] with a folder record and a folder
@@ -3516,6 +3556,23 @@ fn map_record_len(node: &[u8], index: usize, records: usize) -> Result<usize> {
 
 /// A no-op kept for the symmetry of the map-node loop.
 fn map_rec_size_check(_node_size: usize) {}
+
+/// The name Apple's private folder for **file** hard links carries.
+///
+/// Four U+2500 BOX DRAWINGS LIGHT HORIZONTAL, then "HFS+ Private Data" -- 65
+/// UTF-16 units. The box-drawing prefix is what makes it sort before anything a
+/// user would name, and it is not decoration: a volume's private folders are
+/// found *by name*, so the name has to be exactly this.
+///
+/// Mining reference: `HFSPLUSMETADATAFOLDER` in `core/hfs_format.h`, used as
+/// `hfs_private_names[FILE_HARDLINKS]` in `core/hfs_link.c`.
+pub const FILE_HARDLINKS_FOLDER: &str = "\u{2500}\u{2500}\u{2500}\u{2500}HFS+ Private Data";
+
+/// The name Apple's private folder for **directory** hard links carries.
+///
+/// ".HFS+ Private Directory Data" followed by CR -- 29 units. The trailing CR
+/// is in Apple's definition and is easy to lose when transcribing it.
+pub const DIR_HARDLINKS_FOLDER: &str = ".HFS+ Private Directory Data\r";
 
 /// One half of a divided leaf.
 ///
