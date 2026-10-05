@@ -841,6 +841,58 @@ head is marked on the indirect node rather than on a self-referential link, then
 before writing anything else, because it predicts exactly what `fsck` is objecting
 to.
 
+### Where the hard link stands, and the one contradiction left
+
+A fourth implementation was written against every authority mined so far and is
+**still not committed**. It produces the shape all of them agree on:
+
+```
+(2,  "alias.bin")   file 19  ref=17  count=1  flags=0x22  mode=0444
+(18, "iNode17")     file 17  count=1    flags=0x02  forks=1/700
+```
+
+and `check::check` calls it clean. What was settled this round:
+
+- **`userInfo`, not `finderInfo`, for the link's type and creator.** TN1150: "The
+  fileType and fileCreator fields of the **userInfo** in the catalog record of a hard
+  link file". `userInfo` is the `FileInfo` at offset 48; `finderInfo` is the
+  `ExtendedFileInfo` at 64 and has no such fields. Three earlier attempts wrote them
+  into `finderInfo`, producing a record with the right bytes in a place nothing
+  reads, so nothing recognised it as a link.
+- **`kHFSHasLinkChainMask` goes on the link and not on the inode.** `createindirectlink`
+  sets `ca_recflags` on the link it creates; the inode is the original record moved
+  by `cat_rename`, which does not touch flags. Setting it on both makes fsck clear it
+  again on both -- with the bit set and no prev/next, the checker's classification
+  treats the record as a chain member and buckets it under `special`, which on an
+  inode is the link *count* rather than a reference, so it lands in a bucket nothing
+  else joins. Leaving the inode with just `kHFSThreadExistsMask` removed that half of
+  the complaint entirely.
+- The remaining complaint is one record: the link, and it is **"It should be 1
+  instead of 17"** -- fsck reads the link's `special` as a count where this crate
+  writes the indirect node's CNID.
+
+That last one is a genuine contradiction between two authorities, and it is worth
+stating as one rather than choosing:
+
+| Source | What a link's `special` holds |
+| --- | --- |
+| TN1150, HFS Plus Permissions | "**iNodeNum** -- For hard link files, this field contains the link reference number." |
+| `core/hfs_format.h` | `#define hl_linkReference bsdInfo.special.iNodeNum` |
+| `lib_fsck_hfs`, bucketing | `hardlink_add_bucket(info->fileBucket, file->hl_linkReference, file->fileID)` |
+| `lib_fsck_hfs`, counting | reads the same union member as `linkCount` and wants **1** |
+
+The same four bytes cannot be a reference and a count. Setting it to 1 silences the
+count check and breaks the bucketing, which is the trade this crate made two rounds
+ago and reverted; setting it to the CNID satisfies the bucketing and the count check
+complains. **Both values were measured, in both directions.**
+
+The one step that would finish it is small: read the function in
+`lib_fsck_hfs/dfalib/HardLinkCheck.c` that emits "File has incorrect number of links"
+and see which record and which field it reads for a record it has already decided is
+a link. That is one function, and it is not in the part of the file this crate has
+needed so far. Everything else -- the model, the ordering, every field value, and the
+two corrections above -- is settled and recorded.
+
 ### Every attempt rolled back
 
 Worth saying plainly, because it is why six wrong attempts cost documentation and
