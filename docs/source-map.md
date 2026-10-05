@@ -944,7 +944,68 @@ function and one call site.
 
 ### The last comparison, and where it is
 
-What remains is emitted from the inode walk, after `CheckHardLinkList` passes:
+### The message is not the count check -- corrected
+
+I previously mapped "Incorrect number of file hard links" to `RecordBadLinkCount`,
+the inode's `special` against the links found. **That is the wrong function.** The
+string comes from `SFileHardLinkChain`, emitted by one place:
+
+```c
+void record_link_badchain(SGlobPtr gptr, Boolean isdir)
+{
+        int err = (isdir ? E_DirHardLinkChain : E_FileHardLinkChain);
+        if ((gptr->CatStat & fval) == 0) {
+                fsckPrintFormat(gptr->context, err);
+```
+
+and the only caller is inside `CaptureHardLink`:
+
+```c
+hardlink_add_bucket(info->fileBucket, file->hl_linkReference, file->fileID);
+if ((file->flags & kHFSHasLinkChainMask) == 0) {
+        record_link_badchain(info->globals, false);
+}
+```
+
+So it is not a count at all. It means: **a record that this checker has already
+decided is a link -- it passed the `userInfo.fdType`/`fdCreator` test -- has
+`kHFSHasLinkChainMask` clear.** A file hard link written without the chain bit is
+"a file hard link created on pre-Leopard", which the checker declines to count and
+flags instead.
+
+Which is a much better fit for what is observed. The link this crate writes is
+`flags = 0x22`, which has the bit -- so either the bit is being cleared *before* the
+checker reaches this test, or the record being flagged is not the one the probe
+reads. The former is what the byte diff shows: fsck's repair turns `0x22` into
+`0x02` on one record.
+
+So the shape of the remaining problem is narrower and different from the one
+recorded above it: **fsck is clearing the chain bit on a record it recognises as a
+link**, and then reporting the consequence. That is a self-inconsistent repair --
+it flags the record for the bit and then removes the bit -- which points at the
+bucket rather than at the record: the link is being bucketed under a reference
+that does not match the inode's, so the chain walk does not find it, and the
+repair concludes the bit is wrong.
+
+And that puts the question back where the format says it belongs: the link's
+`hl_linkReference` is 17 (the CNID) and the inode's name encodes 17, and those must
+be the same bucket. TN1150 says the reference is a separate number in the range
+100 to 1073741923 while `lib_fsck_hfs` assumes it equals the CNID for post-Tiger
+file links. This crate's inode is CNID 17 -- **below 100**, and therefore below the
+range the format specifies, and its `iNode17` name is what the checker parses back
+as the reference.
+
+So the next experiment is not a code change at all: give a file a link whose CNID
+is **inside** the documented range -- write enough files to reach CNID 100 before
+linking -- and see whether the message disappears. If it does, the reference range
+is not a formality, and the earlier measurement (`iNode17` accepted by an earlier
+build) was only fsck tolerating a reference it could not match.
+
+### What was believed before this correction
+
+For the record, since it was believed for a round:
+
+(The comparison that was believed to be failing:)
 
 ```c
 linkCount = isdir ? rec.hfsPlusFolder.bsdInfo.special.linkCount
