@@ -622,10 +622,53 @@ So the shape is now settled from the source:
 | `hl_firstLinkID` | on the head link, pointing at itself |
 | Threading | `hl_prevLinkID`/`hl_nextLinkID` in the link records; `ca_linkcount` counts the indirect node too |
 
-What remains is to implement it: rename the file's record into the private folder,
-put a link record where its name was, and thread. `rename` already does the first
-half -- it is `cat_rename` with a different destination -- so this is closer than it
-looked.
+### One more fact from `hfs.h`, and it was the missing piece
+
+The indirect node's name is not the bare CNID:
+
+```c
+#define MAKE_INODE_NAME(name, size, linkno) \
+            (void) snprintf((name), size, "%s%d", HFS_INODE_PREFIX, (linkno))
+#define MAKE_DIRINODE_NAME(name, size, linkno) \
+            (void) snprintf((name), size, "%s%d", HFS_DIRINODE_PREFIX, (linkno))
+```
+
+`HFS_INODE_PREFIX` is `"iNode"` and `HFS_DIRINODE_PREFIX` is `"dir_"`. So the name
+is `iNode17`, not `17` -- and **that is how `fsck.hfsplus` recognises an indirect
+node**. The earlier attempt named the record with the bare CNID, which is why the
+checker cleared its link-chain flag with nothing to show for it.
+
+### Where the implementation stands
+
+An implementation of the corrected model was written and **not committed**: four
+things came out of trying it, and the fourth is an unresolved sequencing bug rather
+than a wrong idea.
+
+Fixed along the way, and kept:
+
+- The link's name in the private folder is `iNode<cnid>`.
+- The target's key comes from **its thread record**, not from the `name` argument --
+  `name` is the link being created, which may be anywhere, and the file being linked
+  is wherever it already is. Reading it from `name` made the code look for
+  `alias.bin` where `orig.bin` was, which is how a very confusing "record not
+  present" turned out to be an API misunderstanding rather than a corruption.
+- A thread record's body starts **after its key**. A node record is key-then-body,
+  and a thread key is eight bytes, so reading the body from offset 0 reads the key
+  and yields a parentID that is a length and a name that is empty.
+- A thread's key is `(cnid, "")` whatever it names, so the target's thread is
+  **replaced**, not inserted: `cat_rename` expresses that as two steps because the
+  body is a different length and a node record cannot change length in place.
+
+Still wrong: the order of the record operations. The implementation reached
+"catalog record to remove not present" after the thread replacement was fixed, and
+the next key in the sequence was not identified before the attempt was abandoned in
+favour of a smaller, verifiable step. Every attempt so far has rolled back cleanly --
+the volume came back byte-for-byte and `fsck.hfsplus` accepted it -- which is the
+rollback discipline earning its keep.
+
+The next attempt should establish the order **by reading `cat_rename`'s four steps
+as a list and writing them down before any code**, since every bug so far has been
+in the sequencing rather than in the model.
 
 So `create_hard_link` is **not** written. The folder it needs is, and the link-count
 fix that came out of the attempt is, but a writer whose records `fsck` quietly

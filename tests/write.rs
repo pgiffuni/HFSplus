@@ -1469,6 +1469,30 @@ fn the_private_file_hardlinks_folder_is_created_with_apples_exact_name() {
 }
 
 #[test]
+fn the_indirect_node_name_is_the_prefix_and_the_cnid() {
+    // An indirect node's name in the private folder is `HFS_INODE_PREFIX` followed
+    // by its CNID in decimal -- `MAKE_INODE_NAME` is `"%s%d"`. Directory hard links
+    // use `dir_` (`HFS_DIRINODE_PREFIX`).
+    //
+    // Not decoration: the name is how `fsck.hfsplus` recognises an indirect node.
+    // A record named with the bare CNID is not recognised, and the checker clears its
+    // link-chain flag *without saying why* -- which is how this crate spent a round
+    // of measurements learning that its arrangement was backwards.
+    assert_eq!(hfsplus::volume::INODE_NAME_PREFIX, "iNode");
+    assert_eq!(hfsplus::volume::DIR_INODE_NAME_PREFIX, "dir_");
+    assert_eq!(
+        format!("{}{}", hfsplus::volume::INODE_NAME_PREFIX, 17),
+        "iNode17"
+    );
+    // A directory hard link's name is never confused with a file's, which matters
+    // because both live in private folders and are told apart by this prefix.
+    assert_ne!(
+        hfsplus::volume::INODE_NAME_PREFIX,
+        hfsplus::volume::DIR_INODE_NAME_PREFIX
+    );
+}
+
+#[test]
 fn the_directory_hardlinks_name_keeps_its_trailing_carriage_return() {
     // `.HFS+ Private Directory Data` followed by CR. The CR is in Apple's
     // definition and is exactly what gets lost transcribing a `#define` into a doc

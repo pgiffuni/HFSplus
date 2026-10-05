@@ -3578,6 +3578,20 @@ pub const FILE_HARDLINKS_FOLDER: &str = "\u{2500}\u{2500}\u{2500}\u{2500}HFS+ Pr
 /// is in Apple's definition and is easy to lose when transcribing it.
 pub const DIR_HARDLINKS_FOLDER: &str = ".HFS+ Private Directory Data\r";
 
+/// The prefix Apple gives an indirect node's name in the private folder.
+///
+/// `HFS_INODE_PREFIX` in `core/hfs_format.h`, used by `MAKE_INODE_NAME` in
+/// `core/hfs.h` as `"%s%d"` -- so the name is `iNode` followed by the CNID in
+/// decimal. Directory hard links use `dir_` instead (`HFS_DIRINODE_PREFIX`).
+///
+/// Not decoration, and not a detail: the name is how `fsck.hfsplus` recognises an
+/// indirect node. A record named with the bare CNID is not recognised, and the
+/// checker clears its link-chain flag without saying why.
+pub const INODE_NAME_PREFIX: &str = "iNode";
+
+/// The prefix Apple gives a directory indirect node's name.
+pub const DIR_INODE_NAME_PREFIX: &str = "dir_";
+
 /// One half of a divided leaf.
 ///
 /// A newtype so the signature reads as two halves rather than as
