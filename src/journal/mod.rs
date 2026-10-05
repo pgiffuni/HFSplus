@@ -84,4 +84,6 @@ pub mod replay;
 
 pub use checksum::{calc_checksum, BLHDR_CHECKSUM_SIZE, JOURNAL_HEADER_CKSUM_SIZE};
 pub use info::{JournalFlags, JournalHeader, JournalInfoBlock, END_BLK_NUM};
-pub use replay::{Journal, ReplayedBlock, Transaction};
+pub use replay::{
+    encode_block_list, Journal, RecordedWrite, ReplayedBlock, Transaction, MAX_BLOCKS_PER_LIST,
+};

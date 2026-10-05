@@ -371,8 +371,10 @@ compression metadata (7B.2) are done and appear above.
 | Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | Milestone 10D |
 | Opened-but-deleted files in the metadata directory | `HFS_DELETE_PREFIX "temp"`; TN1150's Hard Links section | Milestone 10D |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
-| **Writing** a journal transaction | `core/hfs_vfsutils.c` `hfs_start_transaction`/`hfs_end_transaction`; `core/hfs_journal.c` `end_transaction`, `journal_open` | Milestone 12, **now first** |
-| The block list a transaction accumulates | `core/hfs_journal.c` the transaction's block-list array and its checksum | Milestone 12 |
+| **Writing** a journal transaction -- ordering, space, header advance | `core/hfs_vfsutils.c` `hfs_start_transaction`/`hfs_end_transaction`; `core/hfs_journal.c` `check_free_space`, `journal_open` | Milestone 12, **now first** |
+| The transaction's in-memory block buffer | `core/hfs_journal.c` the `block_list_header_in_memory` buffers a dirty block is copied into | Milestone 12 |
+| `binfo[]` capacity and multi-list splitting | `MAX_BLISTHDR_BLKS` | Milestone 12 |
+| Deferred journal-header writes | `tr->delayed_header_write`, `write_header_thread` | Milestone 12, later |
 | The syncer and `nextAllocation` interactions | `hfs_syncer`, `HFS_SKIP_UPDATE_NEXT_ALLOCATION` | Milestone 12 |
 
 ### The "exchange" is not an exchange

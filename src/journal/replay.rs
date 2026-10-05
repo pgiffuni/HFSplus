@@ -1365,3 +1365,200 @@ mod tests {
         );
     }
 }
+
+/// One block recorded by a transaction, as a writer supplies it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedWrite {
+    /// Block number on the filesystem device.
+    pub bnum: u64,
+    /// The block's new contents.
+    pub data: Vec<u8>,
+}
+
+impl RecordedWrite {
+    /// A record for a block that is being *released*, rather than written.
+    ///
+    /// A killed block is `bnum == 0xFFFF_FFFF_FFFF_FFFF`, which the write loop in
+    /// `end_transaction` skips and replay skips too. So freeing a block is something
+    /// the journal records -- the *absence* of a record would be indistinguishable
+    /// from never having changed. That is the shape a future unlink-through-a-link
+    /// has to take, and it is why the sentinel is a block number rather than a flag.
+    pub fn killed() -> Self {
+        RecordedWrite {
+            bnum: 0xFFFF_FFFF_FFFF_FFFF,
+            data: Vec::new(),
+        }
+    }
+}
+
+/// The maximum blocks one block list can describe.
+///
+/// Apple's `MAX_BLISTHDR_BLKS`, and the reason a transaction is split into several
+/// block lists rather than growing one without limit: a list lives in a single
+/// journal block, so the number of entries it can hold is bounded by that block's
+/// size.
+pub const MAX_BLOCKS_PER_LIST: usize = 127;
+
+/// Build the bytes of one block list header, plus the blocks it describes.
+///
+/// The inverse of [`BlockListHeader::parse`], and written to be checked by it --
+/// a writer verified only against its own encoder proves nothing.
+///
+/// # Layout, all offsets from the start of the header
+///
+/// | Offset | Size | Field |
+/// | --- | --- | --- |
+/// | 0 | 2 | `max_blocks` -- capacity of the `binfo` array |
+/// | 2 | 2 | `num_blocks` -- how many `binfo` entries are valid |
+/// | 4 | 4 | `bytes_used` -- transaction-buffer bytes this header accounts for |
+/// | 8 | 4 | `checksum` over the first [`BLHDR_CHECKSUM_SIZE`] bytes, itself zeroed |
+/// | 12 | 4 | `flags` |
+/// | 16 | 16 | `binfo[0]` -- the sequence-number slot, **not a block** |
+/// | 32 | 16 each | `binfo[1..]` -- `bnum: u64`, `bsize: u32`, `cksum: u32` |
+///
+/// `binfo[0]` is the detail that is easiest to get wrong, and it is the same one
+/// `end_transaction`'s write loop encodes: it iterates `for (i = 1; ...)`, because
+/// index 0 is the sequence slot and the header's own journal block is not one of the
+/// blocks the list describes.
+pub fn encode_block_list(
+    sequence_num: u32,
+    flags: u32,
+    max_blocks: u16,
+    blocks: &[RecordedWrite],
+    check_blocks: bool,
+) -> Result<Vec<u8>> {
+    use crate::error::Error;
+    use crate::journal::checksum::{calc_checksum, BLHDR_CHECKSUM_SIZE};
+
+    if blocks.len() + FIRST_BLOCK_INDEX > usize::from(max_blocks) {
+        return Err(Error::invalid(
+            "block_list_header",
+            format!(
+                "{} block(s) plus the sequence slot exceeds max_blocks {max_blocks}",
+                blocks.len()
+            ),
+        ));
+    }
+
+    let num_blocks = (FIRST_BLOCK_INDEX + blocks.len()) as u16;
+    let bytes_used: u32 = blocks.iter().fold(0u32, |a, b| a + b.data.len() as u32);
+
+    let need = BLHDR_PREFIX_SIZE + num_blocks as usize * BLOCK_INFO_SIZE;
+    let mut out = vec![0u8; need];
+    out[0..2].copy_from_slice(&max_blocks.to_be_bytes());
+    out[2..4].copy_from_slice(&num_blocks.to_be_bytes());
+    out[4..8].copy_from_slice(&bytes_used.to_be_bytes());
+    // 8..12 is the checksum, zero for now and filled in below.
+    out[12..16].copy_from_slice(&flags.to_be_bytes());
+    out[BLHDR_PREFIX_SIZE + 12..BLHDR_PREFIX_SIZE + 16]
+        .copy_from_slice(&sequence_num.to_be_bytes());
+    for (i, b) in blocks.iter().enumerate() {
+        let off = BLHDR_PREFIX_SIZE + (i + FIRST_BLOCK_INDEX) * BLOCK_INFO_SIZE;
+        out[off..off + 8].copy_from_slice(&b.bnum.to_be_bytes());
+        out[off + 8..off + 12].copy_from_slice(&(b.data.len() as u32).to_be_bytes());
+        // With `checks_blocks` clear the word at `+12` is the sequence slot's
+        // checksum rather than a block checksum, and replay says so -- so the writer
+        // must not put a block checksum there.
+        let cksum = if check_blocks {
+            calc_checksum(&b.data)
+        } else {
+            sequence_num
+        };
+        out[off + 12..off + 16].copy_from_slice(&cksum.to_be_bytes());
+    }
+
+    // The checksum covers the header fields and the first `binfo` entry, and the
+    // checksum field itself is zeroed while hashing -- the same convention the
+    // reader's `checksum_matches` uses, so a mismatch here would be the reader's
+    // bug rather than a tolerated difference.
+    if out.len() < BLHDR_CHECKSUM_SIZE {
+        return Err(Error::Truncated {
+            what: "block list header",
+            needed: BLHDR_CHECKSUM_SIZE,
+            available: out.len(),
+        });
+    }
+    let sum = calc_checksum(&out[..BLHDR_CHECKSUM_SIZE]);
+    out[8..12].copy_from_slice(&sum.to_be_bytes());
+    Ok(out)
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+
+    fn block(n: u8) -> RecordedWrite {
+        RecordedWrite {
+            bnum: u64::from(n) + 26,
+            data: vec![n; 512],
+        }
+    }
+
+    #[test]
+    fn a_written_block_list_reads_back_as_itself() {
+        // The point of this test is that it goes through `parse`, not through a
+        // second copy of the encoder's own logic. An encoder checked against itself
+        // proves nothing; this one is checked by the code that has to accept it.
+        let blocks = [block(1), block(2), block(3)];
+        let raw = encode_block_list(0x2a, BLHDR_FIRST_HEADER, 127, &blocks, true).expect("encode");
+
+        let parsed = BlockListHeader::parse(&raw).expect("parse");
+        assert_eq!(parsed.sequence_num, 0x2a);
+        assert_eq!(parsed.num_blocks as usize, FIRST_BLOCK_INDEX + blocks.len());
+        assert_eq!(parsed.flags, BLHDR_FIRST_HEADER);
+        assert_eq!(
+            parsed.blocks.len(),
+            blocks.len(),
+            "and every block survives -- binfo[0] is the sequence slot, not a block"
+        );
+        for (got, want) in parsed.blocks.iter().zip(blocks.iter()) {
+            assert_eq!(got.bnum, want.bnum);
+            assert_eq!(got.bsize as usize, want.data.len());
+            assert_eq!(
+                got.cksum,
+                crate::journal::checksum::calc_checksum(&want.data),
+                "a block recorded with checks_blocks set carries the checksum of \\
+                 its contents"
+            );
+        }
+        assert!(
+            parsed.checksum_matches(&raw),
+            "the header's own checksum must verify against the bytes written"
+        );
+    }
+
+    #[test]
+    fn without_block_checksums_the_slot_carries_the_sequence_number() {
+        // The word at `binfo[i] + 12` is two things depending on a flag, which is
+        // the sort of overlap that gets transcribed into the wrong field once. With
+        // the flag clear it is the sequence slot's checksum, and replay reads it as
+        // the sequence number -- so the writer must put the sequence number there,
+        // not a block checksum.
+        let blocks = [block(7)];
+        let raw = encode_block_list(0x5b, 0, 127, &blocks, false).expect("encode");
+        let parsed = BlockListHeader::parse(&raw).expect("parse");
+        assert_eq!(parsed.blocks[0].cksum, 0x5b, "not a checksum of the data");
+    }
+
+    #[test]
+    fn a_list_too_big_for_its_capacity_is_refused() {
+        // The capacity is `max_blocks`, and the sequence slot counts against it.
+        let blocks: Vec<RecordedWrite> = (0..4).map(block).collect();
+        let err = encode_block_list(1, 0, 4, &blocks, true).expect_err("4 blocks + slot > 4");
+        assert!(
+            format!("{err}").contains("max_blocks"),
+            "the refusal must name the capacity; got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_killed_block_round_trips_as_the_sentinel() {
+        // Freeing a block is recorded, not omitted: an absent record would be
+        // indistinguishable from a block that never changed.
+        let raw = encode_block_list(1, BLHDR_FIRST_HEADER, 127, &[RecordedWrite::killed()], true)
+            .expect("encode");
+        let parsed = BlockListHeader::parse(&raw).expect("parse");
+        assert_eq!(parsed.blocks[0].bnum, 0xFFFF_FFFF_FFFF_FFFF);
+        assert_eq!(parsed.blocks[0].bsize, 0);
+    }
+}
