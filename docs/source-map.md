@@ -356,7 +356,7 @@ compression metadata (7B.2) are done and appear above.
 | Area | Apple | Will become |
 | --- | --- | --- |
 | Catalog record updates | `core/hfs_catalog.c` `cat_update`, `catrec_update`, `buildrecord`; `core/hfs_xattr.c` | Milestone 9B |
-| A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | Milestone 9B |
+| A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | done |
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | Milestone 9B |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
@@ -394,45 +394,34 @@ a re-key the insert finds the very record that is about to leave and refuses it 
 duplicate, so this case has to remove first, and the bytes are already read so a
 failure puts them straight back.
 
-Not implemented, after two attempts, both reverted. What they showed is worth more
-than a third attempt without the two facts below.
+**Implemented**, after two attempts that were reverted and a third that worked. What
+the three established, in the order they were learned:
 
-- **The committed tree already refuses the case-folded collision, and loses
-  nothing.** `renaming_onto_a_name_that_folds_onto_an_existing_one_is_refused` pins
-  that, so the hazard is a property to keep rather than a bug to chase.
-- **A key survives being encoded and decoded again.**
-  `a_key_survives_being_encoded_and_decoded_again` settles it: `parentID`, the name
-  and `keyLength` all come back identical, for an empty name, one of odd and even
-  code-unit length, CJK, and an astral character.
+- **The committed tree already refused the case-folded collision and lost nothing**,
+  which is now a test. That was worth knowing first: it said the hazard was a
+  property to keep rather than a bug to chase.
+- **A key survives the on-disk encoding.** This was the *suspected* cause -- a folded
+  lookup builds its search key through the same bytes the tree stores, so a lossy
+  round trip would explain a search for a key that is not the one asked for. It is
+  exact, so the hypothesis was wrong, and ruling it out is worth as much as having
+  had it.
+- **The actual cause was a double removal.** The re-key branch removed the old record
+  and then step 2 removed it *again*, which correctly reports `NotFound` -- for a
+  record the branch had just deleted itself. The error named the remove, and pointed
+  at the remove, and the bug was in the remove.
 
-That second fact was the *suspected* cause — a folded lookup builds its search key
-by going through the on-disk encoding, and if that round trip changed anything the
-lookup would be searching for a key that is not the one it was asked for. It does
-not change anything. The hypothesis is wrong, and ruling it out is worth as much as
-having had it. (It also settles a smaller thing: `to_record`'s pad byte never
-appears, because a UTF-16 name is a whole number of two-byte units and the prefix is
-even, so an encoded key is always an even number of bytes.)
+That last one is the lesson worth keeping: two attempts failed with an error that
+looked like a lookup problem, and the answer was one line of control flow that a
+careful read of the diff would have found immediately. Two failed attempts produced a
+*sharper* hypothesis than either, and it was the control flow -- but the cheapest
+next step after the first failure was to read what had just been written.
 
-So the remaining explanation is in the *lookup*, not the key. Two observations
-constrain it, from the same run:
-
-- The removal failed with "catalog record to remove" for a record the folded lookup
-  had just found under the *other* spelling. `remove_catalog_record` looks a record
-  up twice — once by exact key, then again after `leaf_for` re-locates the leaf — and
-  reports `NotFound` if either fails. So either the exact lookup missed, which
-  contradicts the record being there, or `leaf_for` returned a leaf whose contents do
-  not hold it. The second is the more interesting one: a folded search landing on the
-  wrong leaf is exactly the failure mode that made `lookup_cnid` miss files, and the
-  fix there was in the bound rather than in the key.
-- A rename onto the same case-folded name was then *accepted*, producing a second
-  record under a key the tree considers equal to an existing one. It did not
-  reproduce on the committed tree, so it is not evidence of a live bug — but it was
-  observed, and an observation that did not reproduce should be recorded rather than
-  forgotten.
-
-A third attempt should instrument `remove_catalog_record`'s two lookups rather than
-change anything, and only then decide whether `leaf_for` can return a leaf that does
-not contain the record it was asked for.
+A re-key also needs the steps the other way round, because the two spellings are one
+key to the tree: inserting the new one before removing the old finds the record that
+is about to leave and refuses it as a duplicate. The bytes are already read for the
+rollback, so that ordering is safe. `a_case_variant_rename_is_a_rekey_rather_than_a_move`
+exercises it both ways, and asserts the record *count* as well -- a re-key done as a
+move would leave four entries where there should be three.
 
 ## What Milestone 8 has and has not reached
 

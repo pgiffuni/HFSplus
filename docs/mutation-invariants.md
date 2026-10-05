@@ -324,11 +324,6 @@ What is *not* yet true of any mutation here:
   That is why growth and shrinking stay inside the eight inline extent slots, and
   why a rename *removes and re-inserts* rather than rewriting a key in place: a new
   name is a different length.
-- **A rename between two spellings of one name is refused.** On a case-insensitive
-  volume `Readme.txt` and `README.TXT` are one key to the tree, so this is a re-key
-  rather than a move, and it needs the remove to happen first -- which is not the
-  order the general case uses. See `docs/source-map.md` for why, and for what is
-  still unexplained about it.
 - **A folder is never moved beneath itself or one of its own descendants.** The
   check walks the destination path back to the root looking for the source
   directory; nothing here does.

@@ -1210,13 +1210,42 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             }
         };
 
-        // A destination that is already taken is `EEXIST`, not an overwrite. Apple
-        // only allows the same-parent case, where it becomes an exchange.
-        if (from_parent != to_parent || from_name != to_name)
-            && self
-                .catalog_record_bytes(&CatalogKey::for_child(to_parent_cnid, to_name))?
-                .is_some()
-        {
+        let old_key = CatalogKey::for_child(from_parent_cnid, from_name);
+        let new_key = CatalogKey::for_child(to_parent_cnid, to_name);
+        let old_record = self
+            .catalog_record_bytes(&old_key)?
+            .ok_or(Error::NotFound {
+                what: "catalog record",
+            })?;
+
+        // A destination that is already taken is `EEXIST`, not an overwrite -- with
+        // one exception that looks like an overwrite and is not.
+        //
+        // On a case-insensitive volume `Readme.txt` and `README.TXT` are *one key* to
+        // the tree. `cat_rename` allows that collision only after confirming the
+        // record it found has the same record type and the same CNID, and refuses
+        // everything else with `EEXIST`; Apple's comment on the branch is "the old
+        // name is a case variant and must be removed". So this is one object under
+        // two spellings -- a re-key, not a move -- and it is decided here with the
+        // tree's comparator, because the insert below runs *before* the remove and
+        // would refuse it as a duplicate before anything could notice.
+        //
+        // A record's identity is its CNID, at offset 8 of the body in both a file
+        // record and a folder record; the body's length says which type it is.
+        let identity = |record: &[u8]| -> Option<u32> {
+            let key_len = usize::from(u16::from_be_bytes([record[0], record[1]]));
+            let body = record.get(2 + key_len..)?;
+            if body.len() != crate::catalog::record::FILE_RECORD_SIZE
+                && body.len() != crate::catalog::record::FOLDER_RECORD_SIZE
+            {
+                return None;
+            }
+            Some(u32::from_be_bytes([body[8], body[9], body[10], body[11]]))
+        };
+        let folded = self.catalog_record_bytes_folded(&new_key)?;
+        let rekey = from_parent == to_parent
+            && folded.as_deref().and_then(identity) == identity(&old_record);
+        if folded.is_some() && !rekey {
             return Err(Error::invalid(
                 "rename",
                 format!(
@@ -1286,12 +1315,33 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 what: "thread record",
             })?;
 
-        // Step 1.
-        self.insert_catalog_record(&new_record)?;
-        // Step 2.
-        if let Err(e) = self.remove_catalog_record(&old_key) {
-            let _ = self.remove_catalog_record(&new_key);
-            return Err(e);
+        // Steps 1 and 2, in one order or the other.
+        //
+        // Normally: insert the new key, then remove the old one. The insert first
+        // because the new record carries the old body, so nothing has to be
+        // reconstructed if it fails.
+        //
+        // For a re-key the other way round. The two spellings are one key to the
+        // tree, so inserting before removing finds the very record that is about to
+        // leave and refuses it as a duplicate. The bytes are already read, so a
+        // failure puts them straight back.
+        //
+        // And for a re-key there is only *one* removal: removing in the branch above
+        // and again here is a second attempt at a record that is gone, which is what
+        // made the first attempt at this report "catalog record to remove" for a
+        // record it had just deleted itself.
+        if rekey {
+            self.remove_catalog_record(&old_key)?;
+            if let Err(e) = self.insert_catalog_record(&new_record) {
+                let _ = self.insert_catalog_record(&old_record);
+                return Err(e);
+            }
+        } else {
+            self.insert_catalog_record(&new_record)?;
+            if let Err(e) = self.remove_catalog_record(&old_key) {
+                let _ = self.remove_catalog_record(&new_key);
+                return Err(e);
+            }
         }
         // Step 3.
         self.remove_catalog_record(&thread_key)?;
@@ -1313,6 +1363,73 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         }
         let _ = (FolderRecord::EMPTY, THREAD_RECORD_FIXED_SIZE);
         Ok(cnid)
+    }
+
+    /// The bytes of the catalog record whose key *compares equal* to this one.
+    ///
+    /// Exact keys are what removal and rollback need -- they name one specific
+    /// record. This is for the one place that needs the tree's own notion of
+    /// equality, which on a case-insensitive volume is not string equality: a name
+    /// differing only in case is the same key to the tree, so a rename between two
+    /// spellings is a re-key rather than a move, and no amount of comparing names
+    /// as strings can tell it from a genuine collision.
+    ///
+    /// `CatalogKey::from_record(&key.to_record(), max)` is deliberate: it goes
+    /// through the same bytes the tree stores, so the search key is the key the
+    /// caller asked for rather than a reconstruction of it. That the round trip is
+    /// exact is asserted by `a_key_survives_being_encoded_and_decoded_again`.
+    fn catalog_record_bytes_folded(
+        &self,
+        key: &crate::catalog::key::CatalogKey,
+    ) -> Result<Option<Vec<u8>>> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let incoming =
+            CatalogKey::from_record(&key.to_record(), usize::from(bt.header().max_key_length))?;
+        let catalog = crate::catalog::lookup::Catalog::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let mut node_num = btree_header.first_leaf_node;
+        let mut budget = btree_header.total_nodes;
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            for index in 0..node.num_records() {
+                let record = node.record(index)?;
+                let Some((existing, _)) = split_record(record) else {
+                    continue;
+                };
+                if catalog.compare_keys(&existing, &incoming) == Ordering::Equal {
+                    return Ok(Some(record.to_vec()));
+                }
+            }
+            if node_num == btree_header.last_leaf_node {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            if node_num == 0 || node_num >= btree_header.total_nodes {
+                break;
+            }
+        }
+        Ok(None)
     }
 
     /// The bytes of the catalog record under exactly this key, if it is there.

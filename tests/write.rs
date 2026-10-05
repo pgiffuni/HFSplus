@@ -1009,6 +1009,89 @@ fn renaming_keeps_the_object_and_moves_it_between_folders() {
 }
 
 #[test]
+fn a_case_variant_rename_is_a_rekey_rather_than_a_move() {
+    // On this volume `keyCompareType` is `kHFSCaseFolding`, so `README.TXT` and
+    // `Readme.txt` are *one key to the tree*. Renaming between them is therefore a
+    // re-key -- the same record under a different spelling -- not a move, and it
+    // needs the two steps the other way round.
+    //
+    // Both spellings resolving afterwards is correct, not a duplicate: on a
+    // case-insensitive volume they name one record. What would not be correct is
+    // two records, so the count is asserted too.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let cnid = writable
+                .create_file(parent, &units("Readme.txt"))
+                .expect("create");
+            writable
+                .write_file_contents(cnid, &[9u8; 300])
+                .expect("contents");
+
+            let got = writable
+                .rename(parent, &units("Readme.txt"), parent, &units("README.TXT"))
+                .expect("re-key to the other spelling");
+            assert_eq!(got, cnid, "a re-key must not change the CNID");
+
+            // And back again, so the path is exercised in both directions.
+            writable
+                .rename(parent, &units("README.TXT"), parent, &units("Readme.txt"))
+                .expect("re-key back");
+
+            // A *different* file must still be refused onto the same spelling.
+            writable
+                .create_file(parent, &units("other.bin"))
+                .expect("create a second file");
+            let err = writable
+                .rename(parent, &units("other.bin"), parent, &units("README.TXT"))
+                .expect_err("a different object is still a collision");
+            assert!(
+                format!("{err}").contains("README.TXT"),
+                "the refusal must name the destination; got: {err}"
+            );
+            dev.sync().expect("flush");
+        }
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let object = vol
+        .lookup(vol.root_cnid(), &units("Readme.txt"))
+        .expect("lookup")
+        .expect("the file must be there");
+    assert_eq!(vol.read(&object, 0, 300).expect("read"), vec![9u8; 300]);
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("other.bin"))
+            .expect("lookup")
+            .is_some(),
+        "the second file must have survived the refused rename"
+    );
+    let under_parent = vol
+        .catalog()
+        .all_records()
+        .expect("walk the catalog")
+        .into_iter()
+        .filter(|(k, _)| k.parent_id.0 == parent)
+        .count();
+    assert_eq!(
+        under_parent, 3,
+        "the root's own entry and two files -- not four, which is what a re-key \
+         done as a move would leave behind"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a case-variant rename, both ways");
+}
+
+#[test]
 fn renaming_onto_a_name_that_is_taken_is_refused() {
     // `EEXIST`, not an overwrite. Apple allows the same-parent case, where it
     // becomes an exchange; a cross-parent collision is refused outright.
