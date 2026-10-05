@@ -565,13 +565,67 @@ quietly, which is worse than a complaint. (The other eight differing bytes are
 `fsck` writing its own "fsc.k" signature into the primary and backup volume headers,
 which is not a repair at all.)
 
+### The arrangement was inverted, and `hfs_makelink` says so
+
+A web summary of HFS+ hard links was offered alongside this work. It is not evidence
+-- `AGENTS.md` makes Apple's source the authority, and the summary was used only as a
+pointer to the question. The question is answered by `hfs_makelink`, and the answer
+is that this crate had it **backwards**:
+
+```c
+/*
+ * If this is a new hardlink then we need to create the inode
+ * and replace the original file/dir object with a link node.
+ */
+if ((cp->c_linkcount == 2) && !(cp->c_flag & C_HARDLINK)) {
+        newlink = 1;
+        to_desc.cd_parentcnid = hfsmp->hfs_private_desc[type].cd_cnid;
+        to_desc.cd_cnid = cp->c_fileid;
+        ...
+        /* Move original file/dir to data node directory */
+        retval = cat_rename(hfsmp, &cp->c_desc, &hfsmp->hfs_private_desc[type], &to_desc, NULL);
+        ...
+        /*
+         * Replace original file/dir with a link record.
+         */
+        link_desc.cd_nameptr = cp->c_desc.cd_nameptr;   /* the user's name */
+        link_desc.cd_parentcnid = cp->c_parentcnid;     /* the user's folder */
+        retval = createindirectlink(hfsmp, indnodeno, &link_desc, 0, &linkcnid, true);
+```
+
+So, for the **first** hard link of a file:
+
+1. The existing record is **renamed into the private folder**, under a name built
+   from its own CNID (`MAKE_INODE_NAME`). It keeps its CNID and its data, and it is
+   now the **indirect node**.
+2. The name the user typed stays in the user's folder, and that entry is replaced by
+   a **link record** whose `hl_linkReference` is the indirect node.
+
+This crate had it the other way round: the *link* in the private folder, the data
+owner left in the user's folder. That is why `fsck` cleared the chain flag -- the
+record carrying it was not where a link goes, so `fsck` did not treat it as one.
+
+It also explains the count complaints better than the guesses that preceded it. The
+guard is `cp->c_linkcount == 2`, so at the moment of linking the file counts
+**itself plus the new link**; and a plain file is 1. Which is what this crate now
+writes for a regular file, and why fsck's earlier "should be 1 instead of 2" was an
+artifact of the link being in the wrong folder rather than a rule about counts.
+
+So the shape is now settled from the source:
+
 | | |
 | --- | --- |
 | The private folder | created, Apple's exact name, `fsck` accepts it with **zero** differences |
-| The link's location | inside the private folder, named by its own CNID in decimal |
-| Its forks | empty |
-| `hl_firstLinkID` | the head link points at itself |
-| `hl_linkReference` | `special` per `hfs_format.h`, but `fsck` reads `1` there -- **unresolved** |
+| The **indirect node** | the file's own record, *moved* in there and renamed to its CNID; keeps its CNID and its data |
+| The **link record** | in the user's folder, under the user's name, `hl_linkReference` = the indirect node |
+| A link's forks | empty |
+| `hl_firstLinkID` | on the head link, pointing at itself |
+| Threading | `hl_prevLinkID`/`hl_nextLinkID` in the link records; `ca_linkcount` counts the indirect node too |
+
+What remains is to implement it: rename the file's record into the private folder,
+put a link record where its name was, and thread. `rename` already does the first
+half -- it is `cat_rename` with a different destination -- so this is closer than it
+looked.
 
 So `create_hard_link` is **not** written. The folder it needs is, and the link-count
 fix that came out of the attempt is, but a writer whose records `fsck` quietly
