@@ -671,6 +671,85 @@ And the bug the written order caught: the earlier attempt removed the target's
 record **twice**, once in the rename half and once in the link half, and reported
 "catalog record to remove not present" for a record it had just deleted itself.
 
+### What TN1150 says, and where it disagrees with the code
+
+TN1150 is the format specification, second only to Apple's source in authority.
+It settles several things and contradicts the code in one place worth recording.
+
+**The link reference is not the CNID.** "The link reference is not related to
+catalog node IDs. When a new indirect node file is created, it is assigned a new link
+reference randomly chosen from the range **100 to 1073741923**." And: "A hard link
+with a link reference equal to 0 is invalid."
+
+The code disagrees, benignly. `hfs_makelink` does `indnodeno = cp->c_fileid` for a
+file link, and `HardLinkCheck.c` explains why: "which is same as inode ID for file
+hard links created post-Tiger". So Apple's *implementation* reuses the CNID while
+the *format* permits any value in that range -- and the implementation is what other
+tools interoperate with, so reusing the CNID is right.
+
+But the range is not advisory for this crate: a reference of 17 is outside it. A
+`first_link` reference below 100 is a volume the specification does not describe.
+Not a hard error, and `fsck.hfsplus` accepted this crate's volume with `iNode17`, but
+it is a deviation and the next implementation should allocate a reference from the
+documented range rather than from the CNID.
+
+**`linkCount` is on the indirect node, and it is an estimate.** "The linkCount field
+in the permissions is an estimate of the number of links referring to this indirect
+node file. An implementation that understands hard links should increment this value
+when creating an additional link, and decrement the value when removing a link...
+When removing a link, an implementation should not allow the linkCount to
+underflow; if it is already zero, do not change it."
+
+That last clause is a rule this crate does not implement and should: the guard in
+`remove` and in any future unlink must not decrement below zero.
+
+**`special` is exactly what the union says.** "**iNodeNum** -- For hard link files,
+this field contains the link reference number. **linkCount** -- For indirect node
+files, this field contains the number of hard links that point at this indirect node
+file." Which is the reading `lib_fsck_hfs` confirmed, and the reading this crate's
+`link_reference`/`link_count` already implement.
+
+**Directory hard links do not exist in this revision of the format.** "An indirect
+node file must be a file, not a directory. Hard links to directories are not allowed
+because they could cause cycles in the directory hierarchy if a hard link pointed to
+one of its ancestor directories."
+
+The code is full of them -- `DIR_HARDLINKS`, `HFSPLUS_DIR_METADATA_FOLDER`,
+`CD_ISDIR` branches, the `dir_` prefix, a `com.apple.system.hfs.firstlink` attribute
+that exists only for them. So the technote describes what the format was specified to
+be and the code describes what shipped; directory hard links shipped and are used.
+A note about *why* they are needed: they cannot be done as file hard links, because
+an indirect node must be a file, so a directory link needs its own reference and its
+own storage. That is the "half-truth" pattern in the comment I have not been able to
+reproduce, and this is the explanation.
+
+#### A real disagreement: the metadata directory's name
+
+| Source | The name |
+| --- | --- |
+| TN1150 | "four **null** characters followed by the string `HFS+ Private Data`" |
+| `core/hfs_format.h` | `"\xE2\x90\x80\xE2\x90\x80\xE2\x90\x80\xE2\x90\x80HFS+ Private Data"` |
+
+`\xE2\x90\x80` is the UTF-8 encoding of U+2500 BOX DRAWINGS LIGHT HORIZONTAL, so
+the code's name is four box-drawing characters, not four nulls. They are not
+interchangeable: a name containing NUL cannot be represented in `HFSUniStr255` at
+all, since the length is a count of UTF-16 units and a NUL is a legal code unit but
+a pathological name.
+
+**The code wins**, and this crate has evidence rather than an argument:
+`fsck.hfsplus` accepts a volume carrying the box-drawing name with **zero
+differences**, and `lib_fsck_hfs` computes `prefixlen = strlen(HFS_INODE_PREFIX)` from
+the same constant family. A volume using the technote's four nulls would not be
+recognised. Recorded because the technote is the document a new implementer reads
+first, and following it here produces a volume `fsck` does not accept.
+
+**Also from TN1150, and not yet mined:** opened-but-deleted files are moved into the
+metadata directory as `temp<cnid>` -- which is what `HFS_DELETE_PREFIX "temp"` in
+`core/hfs.h` is for, and which explains why a repair may find `temp*` files there.
+And the metadata directory's Finder info should set `kIsInvisible` and `kNameLocked`
+with the icon location at `(22460, 22460)`; the technote says these are "not
+mandatory, but they tend to reduce accidental changes".
+
 ### The contradiction, resolved in `lib_fsck_hfs`
 
 The last measurements produced a contradiction that no amount of reading `core/`
