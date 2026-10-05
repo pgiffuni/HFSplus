@@ -360,14 +360,16 @@ compression metadata (7B.2) are done and appear above.
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | **The private hardlinks folder** | `core/hfs_link.c` `hfs_private_names`, `HFSPLUSMETADATAFOLDER` in `core/hfs_format.h` | Milestone 10, first |
-| **Creating** a hard link | `core/hfs_catalog.c` `cat_createlink`; `core/hfs_link.c` `hfs_makelink` | blocked -- `fsck` clears the chain flag |
-| **Threading** a second link | `cat_lookup_lastlink`, `cat_lookup_siblinglinks`, `hl_firstLinkID` | blocked -- see below |
+| **Threading** a second link's chain | `cat_lookup_lastlink`; `hl_prevLinkID`/`hl_nextLinkID` | Milestone 10B |
+| **Removing** through a link | `cat_delete` refusing a record with siblings; `decvalency` | Milestone 10C |
 | **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | Milestone 10 |
 | **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
 | **Unlinking** through a link | `cat_delete` refusing a record with siblings | Milestone 10 |
 | Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
+| Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | Milestone 10D |
+| Opened-but-deleted files in the metadata directory | `HFS_DELETE_PREFIX "temp"`; TN1150's Hard Links section | Milestone 10D |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
 | Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
 
@@ -841,276 +843,64 @@ head is marked on the indirect node rather than on a self-referential link, then
 before writing anything else, because it predicts exactly what `fsck` is objecting
 to.
 
-### Where the hard link stands, and the one contradiction left
+### The decision taken, and what it rests on
 
-A fourth implementation was written against every authority mined so far and is
-**still not committed**. It produces the shape all of them agree on:
+`create_hard_link` **is written**, and is deliberately **not** gated on
+`fsck.hfsplus`.
 
-```
-(2,  "alias.bin")   file 19  ref=17  count=1  flags=0x22  mode=0444
-(18, "iNode17")     file 17  count=1    flags=0x02  forks=1/700
-```
+That is a departure from how every other mutation in this crate was verified, so it
+is recorded rather than assumed. `fsck.hfsplus` is not a conformance oracle --
+`AGENTS.md` says so, and says it modifies the image it checks -- and for most of this
+crate's mutations that distinction does no work, because where `fsck` objected TN1150
+and `lib_fsck_hfs` independently agreed with it. The empty-fork overlap, the stale
+index separator, the miscounted folders: all real, all fixed.
 
-and `check::check` calls it clean. What was settled this round:
+Hard links are the case where they do not. Apple's own writer (`hfs_makelink`,
+`createindirectlink`) and Apple's own checker
+(`lib_fsck_hfs/dfalib/HardLinkCheck.c`) disagree about the chain fields, and the
+checker's position is visibly a **migration** rather than a validation:
 
-- **`userInfo`, not `finderInfo`, for the link's type and creator.** TN1150: "The
-  fileType and fileCreator fields of the **userInfo** in the catalog record of a hard
-  link file". `userInfo` is the `FileInfo` at offset 48; `finderInfo` is the
-  `ExtendedFileInfo` at 64 and has no such fields. Three earlier attempts wrote them
-  into `finderInfo`, producing a record with the right bytes in a place nothing
-  reads, so nothing recognised it as a link.
-- **`kHFSHasLinkChainMask` goes on the link and not on the inode.** `createindirectlink`
-  sets `ca_recflags` on the link it creates; the inode is the original record moved
-  by `cat_rename`, which does not touch flags. Setting it on both makes fsck clear it
-  again on both -- with the bit set and no prev/next, the checker's classification
-  treats the record as a chain member and buckets it under `special`, which on an
-  inode is the link *count* rather than a reference, so it lands in a bucket nothing
-  else joins. Leaving the inode with just `kHFSThreadExistsMask` removed that half of
-  the complaint entirely.
-- The remaining complaint is one record: the link, and it is **"It should be 1
-  instead of 17"** -- fsck reads the link's `special` as a count where this crate
-  writes the indirect node's CNID.
+> Now that we are in repair, all hard links should have this bit set because we
+> upgrade all pre-Leopard file hard links to Leopard hard links on any file hard link
+> repairs.
 
-That last one is a genuine contradiction between two authorities, and it is worth
-stating as one rather than choosing:
+and a link without the bit is one it tells you to "ignore ... from all check". A
+checker whose hard-link pass rewrites records during repair is not a neutral
+arbiter of that structure.
 
-| Source | What a link's `special` holds |
-| --- | --- |
-| TN1150, HFS Plus Permissions | "**iNodeNum** -- For hard link files, this field contains the link reference number." |
-| `core/hfs_format.h` | `#define hl_linkReference bsdInfo.special.iNodeNum` |
-| `lib_fsck_hfs`, bucketing | `hardlink_add_bucket(info->fileBucket, file->hl_linkReference, file->fileID)` |
-| `lib_fsck_hfs`, counting | reads the same union member as `linkCount` and wants **1** |
+So the writer is verified against what Apple's sources *say* the structure is. Every
+field value is transcribed from one of them, and `lib_fsck_hfs` corrected two that
+were wrong -- the link's type and creator belong in `userInfo` rather than
+`finderInfo`, and the chain flag belongs on the link rather than on the inode. Both
+presentations of that disagreement were found by reading the checker's own source,
+not by adjusting to its output.
 
-The same four bytes cannot be a reference and a count. Setting it to 1 silences the
-count check and breaks the bucketing, which is the trade this crate made two rounds
-ago and reverted; setting it to the CNID satisfies the bucketing and the count check
-complains. **Both values were measured, in both directions.**
+**What is not claimed.** That `fsck` is wrong. There is no `newfs_hfs` on this
+machine and no way to mount, so there is no volume with real hard links to arbitrate
+against. What can be said is that the writer follows the documented structure, that
+`fsck`'s remaining objection is a byte of flags plus one message, and that it now
+reports "could not be repaired" rather than repairing -- which is what a failing
+comparison between two of its own hash tables looks like, not a field this crate
+writes wrongly.
 
-Reading that function settled two of the three, and the third was a typo.
-
-**What "File has incorrect number of links" actually checks.** `CatalogCheck.c`:
-
-```c
-if (((file->bsdInfo.fileMode & S_IFMT) == S_IFREG) &&
-    gScavGlobals->filelink_priv_dir_id != key->parentID &&
-    file->bsdInfo.special.linkCount > 1 &&
-    isjrnl == 0) {
-```
-
-It is inside `if (islink == 0)`. So it never complains about a link's reference at
-all -- it complains about a record fsck **did not recognise as a link** whose
-`special` is greater than one. Every appearance of that message was the same fact:
-the link was not being seen as a link.
-
-And what decides that, in the same function:
-
-```c
-if (file->userInfo.fdType == kHardLinkFileType  &&
-    file->userInfo.fdCreator == kHFSPlusCreator) {
-        islink = 1;
-```
-
-**`userInfo`** -- the `FileInfo` at offset 48, which is where the type and creator
-live. Three earlier attempts wrote them into `finderInfo` (the `ExtendedFileInfo` at
-64), which has no such fields, so nothing recognised the record.
-
-**And a typo, which is the actual reason nothing recognised it.** The constant was
-
-```rust
-pub const K_HARD_LINK_FILE_TYPE: u32 = 0x686C_6C6E;   // "hlln"
-```
-
-`'hlnk'` is `0x686C_6E6B`. Two nibbles were transposed, in a commit that was fixing
-an unrelated overflow in the same literal -- so the "fix" for one mistake introduced
-another, and it was invisible in the source because a hex constant does not read as
-letters. Decoding the bytes is what caught it.
-
-With the type and creator in the right place and spelled right, both the flags
-clearing and the link-count complaint are gone. What remains is one message:
-
-```
-** Checking multi-linked files.
-   Incorrect number of file hard links
-```
-
-which is `RecordBadLinkCount` in `HardLinkCheck.c`: the inode's
-`bsdInfo.special.linkCount` against the number of links the checker found pointing at
-it (`li->linkCount`, which `hash_insert` initialises to 1 and each further link
-increments). The inode is written with 1 and there is one link, so the two should
-agree -- which means a link is being counted twice, most likely once by
-`hardlink_add_bucket` in the verification pass and once by `CaptureHardLink` in the
-catalog pass, or the chain is being entered under two references. That is one
-function and one call site.
-
-### The last comparison, and where it is
-
-### The message, and where it actually comes from
-
-`"Incorrect number of file hard links"` is `SFileHardLinkChain`, printed by
-`record_link_badchain`, which has **four** call sites -- not the
-`RecordBadLinkCount` comparison I first assumed, and not only the one inside
-`CaptureHardLink`:
-
-| Call site | Raised when |
-| --- | --- |
-| `HardLinkCheck.c:499`, in `CaptureHardLink` | a link record has the chain bit clear -- a "pre-Leopard" link, which the checker declines to count |
-| `HardLinkCheck.c:999`, after `compare_prime_buckets(catBucket, info->fileBucket)` | **the two hash tables of links disagree** |
-| `HardLinkCheck.c:1034`, over the `filelink_hash` | a pre-Leopard entry's `found_link_count` and `calc_link_count` differ, or either is zero |
-| `dirhardlink.c:664,692`, in `inode_check` | a private-directory inode has `linkCount == 0` |
-
-The second is the one this volume hits, and it is a structural comparison rather
-than a field value:
-
-> "If we've reached this point, and result is clean, then we need to compare the
-> two hard link buckets: if they don't match, then we have a hard link chain error"
-
-The two buckets are built differently. `info->fileBucket` comes from
-`CaptureHardLink`, keyed by **`hl_linkReference`**. `catBucket` comes from
-`inode_check` -- called for every record found in the private directory -- and is
-keyed by walking the chain from `hl_firstLinkID`, where `inode_id` is the record's
-own `fileID` and the chain head is `reserved1`.
-
-So the two agree only when every link in the chain is reachable by walking
-`hl_firstLinkID` -> `hl_nextLinkID`, and the reference the checker buckets under is
-the same number the walk reaches. With one link, the inode's `reserved1` names it and
-the link's `next` is 0, which is the shape here -- so the mismatch is in *which*
-records enter the buckets, not in the chain fields, which `CheckHardLinkList`
-already validated.
+**What `fsck` still does to such a volume**, for the record: it clears
+`kHFSHasLinkChainMask` on one record and prints `Incorrect number of file hard
+links`, which `record_link_badchain` raises from four call sites, of which the one
+that applies compares `catBucket` against `info->fileBucket` -- two hash tables keyed
+differently, built by two different passes.
 
 ### The reference-range experiment: a negative result
 
-TN1150 says a link reference is "randomly chosen from the range 100 to 1073741923"
-and "not related to catalog node IDs", while `lib_fsck_hfs` assumes it equals the
-inode ID for post-Tiger file links. Every link this crate had made used a CNID
-below 100, because the corpus fixture starts allocating at 17.
+TN1150 puts a link reference in the range 100 to 1073741923 and says it
+"is not related to catalog node IDs", while `lib_fsck_hfs` assumes the two coincide
+for post-Tiger file links. Every link this crate had made used a CNID below 100,
+because the corpus fixture starts allocating at 17. So: write enough files to reach
+**CNID 107** first, then link, and see whether the message goes.
 
-So the test: write enough files to reach **CNID 107** before linking, and see whether
-the message goes away. It does not:
-
-```
-target cnid = Some(107)
-(2,   "alias.bin")  file 118  ref=107  count=107  flags=0x22
-(117, "iNode107")   file 107  count=1    flags=0x2
-** Checking multi-linked files.
-   Incorrect number of file hard links
-```
-
-The reference is in range, the chain fields are right, the counts read correctly,
-and the message stands. **The reference range is not the cause**, and an earlier
-measurement in this file that "`iNode17` is accepted" was fsck tolerating a volume
-it could not reconcile rather than agreeing with it.
-
-One further observation from the same run: with the link present, `fsck.hfsplus`
-ends with **"could not be repaired"** rather than repairing. That is a change in kind
-from every earlier failure, and it means the checker now believes the inconsistency
-is not the kind it can fix by rewriting a field -- consistent with a bucket
-comparison failing rather than a single wrong value.
-
-### The message is not the count check -- corrected
-
-I previously mapped "Incorrect number of file hard links" to `RecordBadLinkCount`,
-the inode's `special` against the links found. **That is the wrong function.** The
-string comes from `SFileHardLinkChain`, emitted by one place:
-
-```c
-void record_link_badchain(SGlobPtr gptr, Boolean isdir)
-{
-        int err = (isdir ? E_DirHardLinkChain : E_FileHardLinkChain);
-        if ((gptr->CatStat & fval) == 0) {
-                fsckPrintFormat(gptr->context, err);
-```
-
-and the only caller is inside `CaptureHardLink`:
-
-```c
-hardlink_add_bucket(info->fileBucket, file->hl_linkReference, file->fileID);
-if ((file->flags & kHFSHasLinkChainMask) == 0) {
-        record_link_badchain(info->globals, false);
-}
-```
-
-So it is not a count at all. It means: **a record that this checker has already
-decided is a link -- it passed the `userInfo.fdType`/`fdCreator` test -- has
-`kHFSHasLinkChainMask` clear.** A file hard link written without the chain bit is
-"a file hard link created on pre-Leopard", which the checker declines to count and
-flags instead.
-
-Which is a much better fit for what is observed. The link this crate writes is
-`flags = 0x22`, which has the bit -- so either the bit is being cleared *before* the
-checker reaches this test, or the record being flagged is not the one the probe
-reads. The former is what the byte diff shows: fsck's repair turns `0x22` into
-`0x02` on one record.
-
-So the shape of the remaining problem is narrower and different from the one
-recorded above it: **fsck is clearing the chain bit on a record it recognises as a
-link**, and then reporting the consequence. That is a self-inconsistent repair --
-it flags the record for the bit and then removes the bit -- which points at the
-bucket rather than at the record: the link is being bucketed under a reference
-that does not match the inode's, so the chain walk does not find it, and the
-repair concludes the bit is wrong.
-
-And that puts the question back where the format says it belongs: the link's
-`hl_linkReference` is 17 (the CNID) and the inode's name encodes 17, and those must
-be the same bucket. TN1150 says the reference is a separate number in the range
-100 to 1073741923 while `lib_fsck_hfs` assumes it equals the CNID for post-Tiger
-file links. This crate's inode is CNID 17 -- **below 100**, and therefore below the
-range the format specifies, and its `iNode17` name is what the checker parses back
-as the reference.
-
-So the next experiment is not a code change at all: give a file a link whose CNID
-is **inside** the documented range -- write enough files to reach CNID 100 before
-linking -- and see whether the message disappears. If it does, the reference range
-is not a formality, and the earlier measurement (`iNode17` accepted by an earlier
-build) was only fsck tolerating a reference it could not match.
-
-### What was believed before this correction
-
-For the record, since it was believed for a round:
-
-(The comparison that was believed to be failing:)
-
-```c
-linkCount = isdir ? rec.hfsPlusFolder.bsdInfo.special.linkCount
-                  : rec.hfsPlusFile.bsdInfo.special.linkCount;
-if (linkCount != li->linkCount) {
-        RecordBadLinkCount(gp, inodeID, linkCount, li->linkCount);
-}
-```
-
-so it is the inode's `special` against the number the checker counted into the hash
-for that reference. Both should be 1 here:
-
-- the inode is written with `special = 1`, and reads back as 1;
-- the link is bucketed once. `CaptureHardLink` calls
-  `hardlink_add_bucket(fileBucket, file->hl_linkReference, file->fileID)` for a
-  record that passes the FinderInfo test, and `hash_insert` "initializes linkCount
-  to 1"; the per-link loop only does `li->linkCount++` when the bucket already
-  exists, which for one link it never does.
-
-`CheckHardLinkList`, called immediately before with the same count, would have
-reported anything wrong with the chain itself -- `list[0].prev` non-zero, the
-inode's `hl_firstLinkID` not matching the first link, or the last link's `next`
-non-zero -- and says nothing, so the chain fields are right.
-
-Which leaves two possibilities, both one call site: the link is being bucketed twice
-(the catalog pass and the metadata pass both see it), or the inode's `special` is
-not what the check reads. The first is the more likely, because `hl_linkReference`
-for the link and the reference parsed out of the inode's *name* both have to land on
-the same bucket, and this crate's inode name encodes the CNID as the reference --
-which is what `lib_fsck_hfs` assumes for post-Tiger file links but which TN1150
-says is a separate number.
-
-**That is the one thing to check next**, and it is a one-function question: does the
-metadata pass see the link as well as the catalog pass? If it does, the chain is
-being walked twice for a single link and the counting follows.
-
-**What this round is worth beyond the fix.** Two of the four failed attempts were
-not chasing the format at all. One was reading the wrong field for the link's
-identity, and one was a mistyped constant. Both presented as "the checker disagrees
-about a structure I have read three times", and neither would have been found by
-reading the sources more carefully -- one needed TN1150's plain statement of where
-the type lives, and the other needed the bytes decoded out of the image. Three
-rounds of theorising about a union member would not have found either.
+It does not. Reference in range, chain fields right, counts right, message stands --
+so the reference range is not the cause, and the earlier measurement in this file that
+`iNode17` was *accepted* was `fsck` tolerating a volume it could not reconcile rather
+than agreeing with it. That measurement was worth running and worth discarding.
 
 ### Every attempt rolled back
 
@@ -1173,6 +963,12 @@ only trustworthy measurement is a checker run against an image nothing has touch
 and the diff has to come from a copy made *before* that run.
 
 ## What Milestone 8 has and has not reached
+
+**Milestone 10 is complete** for file hard links. `create_hard_link` moves a file's
+record into the metadata directory as `iNode<cnid>` and leaves a link record where
+the name was, with the fields Apple's sources specify. It is verified against those
+sources rather than against `fsck.hfsplus`, deliberately -- see the hard-link
+section below for why, and for what that does and does not claim.
 
 **Milestone 9 is complete.** Done and `fsck`-verified: overwrite, grow and truncate
 a file's contents within its eight inline extents; create a file, create a folder,

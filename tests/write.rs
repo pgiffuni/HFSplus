@@ -1388,6 +1388,175 @@ fn a_created_file_says_it_has_a_thread_record() {
 }
 
 #[test]
+fn a_hard_link_moves_the_data_behind_a_private_node_and_leaves_a_name() {
+    // A hard link is not a second name for one CNID, and it is not a second name in
+    // the user's folder either. `hfs_makelink` *moves* the file's own record into
+    // the metadata directory as `iNode<cnid>` -- keeping its CNID and its forks, and
+    // becoming the indirect node -- and puts a link record where the name was.
+    //
+    // So the original name must be **gone**, the data must live under the private
+    // folder, and the new name must be a link: chain flag set, no forks, the
+    // indirect node's CNID in `special`, read-only, and `hlnk`/`hfs+` in `userInfo`
+    // -- which is what `lib_fsck_hfs` tests to decide a file record is a link.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let (target, link) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_file(parent, &units("orig.bin"))
+                .expect("create");
+            writable
+                .write_file_contents(target, &[4u8; 700])
+                .expect("contents");
+            let link = writable
+                .create_hard_link(parent, &units("alias.bin"), target)
+                .expect("link");
+            (target, link)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+    assert_ne!(link, target, "a link has its own CNID");
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("orig.bin"))
+            .expect("lookup")
+            .is_none(),
+        "the data moved into the metadata directory, so the original name is gone"
+    );
+
+    let alias = vol
+        .lookup(vol.root_cnid(), &units("alias.bin"))
+        .expect("lookup")
+        .expect("alias.bin resolves");
+    let record = alias.as_file().expect("a file").record;
+    assert!(
+        record.is_hard_link(),
+        "the entry in the user's folder must carry the chain flag"
+    );
+    assert_eq!(
+        record.link_reference().expect("a link names its node").0,
+        target,
+        "and that node is the indirect node's CNID"
+    );
+    assert_eq!(
+        record.data_fork.total_blocks, 0,
+        "a link has no forks: two records claiming one block is \"Overlapped extent \
+         allocation\""
+    );
+    assert_eq!(
+        record.bsd_info.file_mode & 0o7777,
+        0o444,
+        "`createindirectlink` uses S_IFREG | S_IRUSR | S_IRGRP | S_IROTH, so a link \
+         is read-only"
+    );
+    assert_eq!(
+        u32::from_be_bytes([
+            record.user_info[0],
+            record.user_info[1],
+            record.user_info[2],
+            record.user_info[3]
+        ]),
+        hfsplus::volume::K_HARD_LINK_FILE_TYPE,
+        "and userInfo.fdType is `hlnk`. It is userInfo and *not* finderInfo -- \
+         finderInfo is the ExtendedFileInfo at offset 64 and has no type or creator \
+         -- and the constant is 0x686C6E6B, an earlier version of which read \
+         `hlln`"
+    );
+
+    // The data is under `iNode<cnid>` in the metadata directory, outside the root.
+    let inode_name: Vec<u16> = format!("{}{}", hfsplus::volume::INODE_NAME_PREFIX, target)
+        .encode_utf16()
+        .collect();
+    let found = vol
+        .catalog()
+        .all_records()
+        .expect("walk the catalog")
+        .into_iter()
+        .any(|(k, _)| k.parent_id != vol.root_cnid() && k.name == inode_name);
+    assert!(
+        found,
+        "the data must live under iNode<target> outside the user's folders, or the \
+         link points at nothing"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+}
+
+#[test]
+fn a_second_hard_link_is_refused_because_threading_is_not_implemented() {
+    // `hfs_makelink`'s own guard is `cp->c_linkcount == 2`, so a second link is the
+    // threading case: walking `hl_prevLinkID`/`hl_nextLinkID`. A `linkCount` that
+    // climbs with nothing behind it is the volume shape this milestone exists to
+    // avoid.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let (target, link) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_file(parent, &units("orig.bin"))
+                .expect("create");
+            let link = writable
+                .create_hard_link(parent, &units("alias.bin"), target)
+                .expect("link");
+            (target, link)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let err = writable
+            .create_hard_link(parent, &units("third.bin"), target)
+            .expect_err("a second link cannot be threaded yet");
+        assert!(
+            format!("{err}").contains("thread"),
+            "the refusal must say what is missing; got: {err}"
+        );
+        let err = writable
+            .create_hard_link(parent, &units("fourth.bin"), link)
+            .expect_err("a link is not a target");
+        assert!(
+            format!("{err}").contains("indirect node"),
+            "the refusal must point at the indirect node; got: {err}"
+        );
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    for n in ["third.bin", "fourth.bin"] {
+        assert!(
+            vol.lookup(vol.root_cnid(), &units(n))
+                .expect("lookup")
+                .is_none(),
+            "{n} must not exist after a refused link"
+        );
+    }
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+}
+
+#[test]
 fn a_folder_is_created_and_counted() {
     // `folderCount` excludes the root, which is the kind of off-by-one that only
     // an independent checker notices: a volume with one folder and nothing else

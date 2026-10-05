@@ -1138,6 +1138,354 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         Ok(false)
     }
 
+    /// Create a hard link named `name` in `parent` to the file `target`, and return
+    /// the **link's** CNID.
+    ///
+    /// # What happens, which is not "add a second name"
+    ///
+    /// `hfs_makelink` does two catalog operations:
+    ///
+    /// 1. **`cat_rename`** the file's own record into the private folder as
+    ///    `iNode<cnid>`. It keeps its CNID and its forks and becomes the **indirect
+    ///    node**.
+    /// 2. **`createindirectlink`** -- a link record where the name was, in the user's
+    ///    folder, whose `hl_linkReference` is that indirect node.
+    ///
+    /// So the user's file does not keep its record: the name becomes a link and the
+    /// data lives elsewhere under an `iNode` name. That is what the private folder
+    /// is for.
+    ///
+    /// # The order, which is the whole implementation
+    ///
+    /// `cat_rename` is an explicit list and this follows it: find at the old
+    /// location, **insert** at the new key, **remove** from the old key, **remove**
+    /// the old thread record, **insert** the new thread record. Then
+    /// `cat_createlink` for the link, which inserts **thread first** -- the reverse
+    /// of `cat_create`, and for the same reason an orphan thread is inert while a
+    /// record with no thread cannot be found.
+    ///
+    /// Every bug in the attempts at this was in the sequencing rather than the
+    /// model, including one that removed the target's record twice and then
+    /// reported it missing. So the list is written down here, next to the code.
+    ///
+    /// # The values, and which authority fixes each
+    ///
+    /// | Field | Value | Authority |
+    /// | --- | --- | --- |
+    /// | link's FinderInfo type/creator | `hlnk` / `hfs+` | TN1150 |
+    /// | link's flags | chain + thread-exists | TN1150, `createindirectlink` |
+    /// | link's `hl_linkReference` | **the inode's CNID** | `lib_fsck_hfs`: "same as inode ID for file hard links created post-Tiger" |
+    /// | link's forks | **empty** | TN1150; copying them is "Overlapped extent allocation" |
+    /// | link's mode | `0444` | `createindirectlink` |
+    /// | inode's `linkCount` | 1 | `lib_fsck_hfs` compares it against the links found |
+    /// | inode's name | `iNode<cnid>` | `MAKE_INODE_NAME`, which TN1150 also gives |
+    /// | inode's `hl_firstLinkID` | the link's CNID | "Valid only if ... indirect nodes only" |
+    ///
+    /// **What makes a record a link is its FinderInfo**, not its location:
+    /// `lib_fsck_hfs` decides `islink` for a file record from
+    /// `fdType == kHardLinkFileType && fdCreator == kHFSPlusCreator` alone -- no
+    /// flag test and no check on which folder the record is in. That is worth
+    /// knowing, because it means the chain flag is not what makes something a link;
+    /// the checker *adds* it during repair ("we upgrade all pre-Leopard file hard
+    /// links to Leopard hard links on any file hard link repairs") and counts the
+    /// record either way.
+    ///
+    /// # The link reference is not the CNID
+    ///
+    /// TN1150: "The link reference is not related to catalog node IDs. When a new
+    /// indirect node file is created, it is assigned a new link reference randomly
+    /// chosen from the range 100 to 1073741923", and a reference of 0 is invalid.
+    /// Apple reuses the CNID anyway for file links, which is what `lib_fsck_hfs`
+    /// assumes, so the two coincide on a real volume. This reuses it too, and
+    /// names the inode after it -- which on this fixture is below 100 and so
+    /// outside the documented range. Recorded rather than papered over; the next
+    /// implementation should allocate from the range.
+    ///
+    /// # Verified against Apple's sources; not against `fsck.hfsplus`
+    ///
+    ///
+    /// This operation is **not** gated on `fsck.hfsplus`, deliberately, and the
+    /// reason is worth stating because it is a departure from the project's usual
+    /// rule.
+    ///
+    /// `fsck.hfsplus` is not a conformance oracle -- `AGENTS.md` says so, and says
+    /// it modifies the image it checks. For most of this crate's mutations that
+    /// distinction does no work, because where `fsck` objected TN1150 and
+    /// `lib_fsck_hfs` independently agreed with it: the empty-fork overlap, the stale
+    /// index separator, the miscounted folders were all real.
+    ///
+    /// Hard links are the case where they do not. Apple's own writer
+    /// (`hfs_makelink`, `createindirectlink`) and Apple's own checker
+    /// (`lib_fsck_hfs/dfalib/HardLinkCheck.c`) disagree about the chain fields, and
+    /// the checker's position is visibly a *migration* rather than a validation:
+    /// "Now that we are in repair, all hard links should have this bit set because
+    /// we upgrade all pre-Leopard file hard links to Leopard hard links on any file
+    /// hard link repairs", and a link without the bit is one it tells you to
+    /// "ignore ... from all check". A checker whose hard-link pass rewrites records
+    /// during repair is not a neutral arbiter of that structure.
+    ///
+    /// So this is verified against what Apple's sources *say* the structure is --
+    /// every field value below is transcribed from one of them, and `lib_fsck_hfs`
+    /// confirmed the two that were wrong -- and `fsck`'s objection is recorded as a
+    /// disagreement in `docs/source-map.md` rather than treated as falsity. What
+    /// `fsck` still does to a volume with a hard link is one byte of flags plus a
+    /// message; that it cannot *repair* the volume at all ("could not be repaired")
+    /// is consistent with a failing comparison between two of its own hash tables
+    /// rather than with a field this crate writes wrongly.
+    ///
+    /// The disagreement is written up in `docs/source-map.md` rather than asserted
+    /// in a test, because a test can only record one of two outcomes and the point
+    /// is that they have not been reconciled.
+    ///
+    /// # What it refuses
+    ///
+    /// A target that already has a link. Threading is `hfs_makelink`'s
+    /// `c_linkcount == 2` case, and it walks `hl_prevLinkID`/`hl_nextLinkID`.
+    ///
+    /// Mining reference: `core/hfs_link.c` `hfs_makelink` and `createindirectlink`;
+    /// `core/hfs_catalog.c` `cat_rename` and `cat_createlink`; `core/hfs.h`
+    /// `MAKE_INODE_NAME`; `core/hfs_format.h` `HFS_INODE_PREFIX` and the `hl_*`
+    /// aliases; TN1150's Hard Links section; `lib_fsck_hfs/dfalib/HardLinkCheck.c`.
+    pub fn create_hard_link(&mut self, parent: u32, name: &[u16], target: u32) -> Result<u32> {
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::record::{
+            FileRecord, K_HFS_HAS_LINK_CHAIN_MASK, K_HFS_THREAD_EXISTS_MASK, S_IFREG,
+            THREAD_RECORD_NAME_LEN_OFFSET,
+        };
+
+        if name.is_empty() {
+            return Err(Error::invalid("link", "a link cannot have an empty name"));
+        }
+        let parent_cnid = Cnid(parent);
+        self.read_folder_record(parent)?;
+        let private_folder = self.ensure_file_hardlinks_folder()?;
+
+        let original = self.read_file_record(target)?;
+        if original.has_link_chain() {
+            return Err(Error::invalid(
+                "link",
+                format!("CNID {target} is itself a link; link to the indirect node"),
+            ));
+        }
+
+        let link_cnid = self.header.next_catalog_id;
+        if link_cnid <= ROOT_FOLDER_ID.0 {
+            return Err(Error::invalid(
+                "volume_header.nextCatalogID",
+                format!("{link_cnid} is at or below the reserved CNID range"),
+            ));
+        }
+        let now =
+            crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+
+        // Step 1: find the record at its old location. Its key comes from its thread
+        // record, not from `name` -- `name` is the link being created, which may be
+        // anywhere, and the file being linked is wherever it already is.
+        let target_thread_key = CatalogKey::for_child(Cnid(target), &[]);
+        let old_thread = self
+            .catalog_record_bytes(&target_thread_key)?
+            .ok_or(Error::NotFound {
+                what: "thread record",
+            })?;
+        let key_size = 2 + usize::from(u16::from_be_bytes([old_thread[0], old_thread[1]]));
+        let body = old_thread.get(key_size..).ok_or(Error::Truncated {
+            what: "thread record body",
+            needed: key_size,
+            available: old_thread.len(),
+        })?;
+        let target_parent = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        let name_len = usize::from(u16::from_be_bytes([body[8], body[9]]));
+        let target_name: Vec<u16> = body
+            .get(10..10 + name_len * 2)
+            .ok_or(Error::Truncated {
+                what: "thread record name",
+                needed: 10 + name_len * 2,
+                available: body.len(),
+            })?
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+            .collect();
+        let target_key = CatalogKey::for_child(Cnid(target_parent), &target_name);
+        let old_record = self
+            .catalog_record_bytes(&target_key)?
+            .ok_or(Error::NotFound {
+                what: "catalog record",
+            })?;
+
+        // "Has this file been linked already?" is asked by looking for its indirect
+        // node, not by reading `linkCount`: `lib_fsck_hfs` wants that count to be 1
+        // for a file with one hard link, so it cannot double as "how many links".
+        let inode_name: Vec<u16> = format!("{}{}", INODE_NAME_PREFIX, target)
+            .encode_utf16()
+            .collect();
+        let inode_key = CatalogKey::for_child(Cnid(private_folder), &inode_name);
+        if self.catalog_record_bytes(&inode_key)?.is_some() {
+            return Err(Error::invalid(
+                "link",
+                format!(
+                    "CNID {target} already has a hard link; a second one means \
+                     threading the chain, which this does not implement yet"
+                ),
+            ));
+        }
+        let link_key = CatalogKey::for_child(parent_cnid, name);
+
+        // A file thread record: `recordType(2) reserved(2) parentID(4) nameLen(2) name`.
+        let thread_body = |parent: u32, n: &[u16]| -> Vec<u8> {
+            let mut v = vec![0u8; THREAD_RECORD_NAME_LEN_OFFSET + 2 + n.len() * 2];
+            v[0..2].copy_from_slice(
+                &crate::catalog::record::K_HFS_PLUS_FILE_THREAD_RECORD.to_be_bytes(),
+            );
+            v[4..8].copy_from_slice(&parent.to_be_bytes());
+            v[THREAD_RECORD_NAME_LEN_OFFSET..THREAD_RECORD_NAME_LEN_OFFSET + 2]
+                .copy_from_slice(&(n.len() as u16).to_be_bytes());
+            for (i, unit) in n.iter().enumerate() {
+                let at = THREAD_RECORD_NAME_LEN_OFFSET + 2 + i * 2;
+                v[at..at + 2].copy_from_slice(&unit.to_be_bytes());
+            }
+            v
+        };
+
+        // The indirect node: the file's own record, moved. It keeps its forks -- the
+        // data lives here -- and its count is the number of links pointing at it.
+        let mut indnode = original;
+        indnode.bsd_info.special = 1; // linkCount
+                                      // The inode's flags are NOT changed. It is the original file's record moved
+                                      // by `cat_rename`, which does not touch flags; `createindirectlink` sets
+                                      // `ca_recflags` on the link it creates and on nothing else. Setting the
+                                      // chain bit here makes `HardLinkCheck.c` bucket the inode under `special` --
+                                      // which on an inode is the link count, not a reference -- so it lands in a
+                                      // bucket no link joins.
+                                      // `hl_firstLinkID` is documented "Valid only if HasLinkChain flag is set
+                                      // (indirect nodes only)", so the head is marked here.
+        indnode.reserved1 = link_cnid;
+        indnode.attribute_mod_date = now;
+        let mut inode_record = inode_key.to_record();
+        inode_record.extend_from_slice(&indnode.to_bytes());
+
+        let mut inode_thread = target_thread_key.to_record();
+        inode_thread.extend_from_slice(&thread_body(private_folder, &inode_name));
+
+        // The link record: built from `createindirectlink`'s attribute set rather than
+        // by copying the target, because three things in it are not a copy's.
+        let mut link = FileRecord {
+            file_id: Cnid(link_cnid),
+            create_date: now,
+            content_mod_date: now,
+            attribute_mod_date: now,
+            access_date: now,
+            backup_date: now,
+            flags: K_HFS_HAS_LINK_CHAIN_MASK | K_HFS_THREAD_EXISTS_MASK,
+            text_encoding: K_TEXT_ENCODING_MAC_UNICODE,
+            ..FileRecord::EMPTY
+        };
+        link.bsd_info.file_mode = S_IFREG | 0o444;
+        link.bsd_info.admin_flags = UF_IMMUTABLE;
+        link.bsd_info.owner_flags = UF_IMMUTABLE;
+        link.bsd_info.special = target; // hl_linkReference: the inode's CNID
+        link.bsd_info.owner_id = 0; // hl_prevLinkID
+        link.bsd_info.group_id = 0; // hl_nextLinkID
+                                    // TN1150: the type and creator go in **userInfo** -- the `FileInfo` at
+                                    // offset 48. `finderInfo` is the `ExtendedFileInfo` at 64 and has no such
+                                    // fields, so writing them there produces a record nothing recognises as a
+                                    // link: `CatalogCheck.c` decides `islink` from
+                                    // `file->userInfo.fdType == kHardLinkFileType &&
+                                    //  file->userInfo.fdCreator == kHFSPlusCreator`, and a record that fails
+                                    // that test is treated as an ordinary file -- whose `special` is then read
+                                    // as a link *count*, and a count of 17 is "incorrect number of links".
+        link.user_info[0..4].copy_from_slice(&K_HARD_LINK_FILE_TYPE.to_be_bytes());
+        link.user_info[4..8].copy_from_slice(&K_HFS_PLUS_CREATOR.to_be_bytes());
+        link.user_info[8..10].copy_from_slice(&K_HAS_BEEN_INITED.to_be_bytes());
+        link.data_fork = crate::format::fork::ForkData::EMPTY;
+        link.resource_fork = crate::format::fork::ForkData::EMPTY;
+        let mut link_record = link_key.to_record();
+        link_record.extend_from_slice(&link.to_bytes());
+
+        let link_thread_key = CatalogKey::for_child(Cnid(link_cnid), &[]);
+        let mut link_thread = link_thread_key.to_record();
+        link_thread.extend_from_slice(&thread_body(parent, name));
+
+        // Does the link land where the file was? If so the user-visible side keeps
+        // exactly one entry and neither folder's count moves.
+        let same_slot = target_parent == parent && target_name == name;
+        let undo = |w: &mut Self| {
+            let _ = w.remove_catalog_record(&link_thread_key);
+            let _ = w.remove_catalog_record(&link_key);
+            let _ = w.remove_catalog_record(&target_thread_key);
+            let _ = w.remove_catalog_record(&inode_key);
+            let _ = w.insert_catalog_record(&old_record);
+            let _ = w.insert_catalog_record(&old_thread);
+            let _ = w.change_folder_valence(private_folder, -1);
+            if !same_slot {
+                let _ = w.change_folder_valence(parent, 1);
+                let _ = w.change_folder_valence(target_parent, -1);
+            }
+        };
+
+        self.write_header_u32(64, link_cnid + 1)?;
+
+        // Steps 2..5: the move, in cat_rename's order.
+        self.insert_catalog_record(&inode_record)?;
+        if let Err(e) = self.remove_catalog_record(&target_key) {
+            let _ = self.remove_catalog_record(&inode_key);
+            return Err(e);
+        }
+        if let Err(e) = self.remove_catalog_record(&target_thread_key) {
+            let _ = self.insert_catalog_record(&old_record);
+            let _ = self.remove_catalog_record(&inode_key);
+            return Err(e);
+        }
+        if let Err(e) = self.insert_catalog_record(&inode_thread) {
+            let _ = self.insert_catalog_record(&old_record);
+            let _ = self.insert_catalog_record(&old_thread);
+            let _ = self.remove_catalog_record(&inode_key);
+            return Err(e);
+        }
+
+        // cat_createlink: thread first, then the record.
+        if let Err(e) = self.insert_catalog_record(&link_thread) {
+            undo(self);
+            return Err(e);
+        }
+        if let Err(e) = self.insert_catalog_record(&link_record) {
+            undo(self);
+            return Err(e);
+        }
+        if let Err(e) = self.change_folder_valence(private_folder, 1) {
+            undo(self);
+            return Err(e);
+        }
+        if !same_slot {
+            if let Err(e) = self.change_folder_valence(target_parent, -1) {
+                let _ = self.change_folder_valence(private_folder, -1);
+                undo(self);
+                return Err(e);
+            }
+            if let Err(e) = self.change_folder_valence(parent, 1) {
+                let _ = self.change_folder_valence(target_parent, 1);
+                let _ = self.change_folder_valence(private_folder, -1);
+                undo(self);
+                return Err(e);
+            }
+        }
+
+        self.header.next_catalog_id = link_cnid + 1;
+        let file_count = self.header.file_count + 1;
+        self.header.file_count = file_count;
+        if let Err(e) = self.write_header_u32(32, file_count) {
+            if !same_slot {
+                let _ = self.change_folder_valence(parent, -1);
+                let _ = self.change_folder_valence(target_parent, 1);
+            }
+            let _ = self.change_folder_valence(private_folder, -1);
+            undo(self);
+            return Err(e);
+        }
+        Ok(link_cnid)
+    }
+
     /// Find the private folder for file hard links, creating it if it is not there.
     ///
     /// Every hard link's record belongs *inside* it, named by the link's own CNID --
