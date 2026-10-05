@@ -744,3 +744,257 @@ mod tests {
         assert_eq!(END_BLK_NUM, u32::MAX as u64);
     }
 }
+
+// --- Writing -----------------------------------------------------------------
+//
+// A second `impl` block rather than more methods on the first: everything above is
+// the *reader's* view of a journal header, parsed and validated, and these are the
+// writer's arithmetic on the same bytes.
+
+impl JournalHeader {
+    /// Free bytes in the journal, as `free_space` computes them.
+    ///
+    /// Three cases, and the middle one is the whole reason this is not
+    /// `size - (end - start)`:
+    ///
+    /// ```c
+    /// if (jnl->jhdr->start < jnl->jhdr->end) {
+    ///         free_space_offset = jnl->jhdr->size - (jnl->jhdr->end - jnl->jhdr->start) - jnl->jhdr->jhdr_size;
+    /// } else if (jnl->jhdr->start > jnl->jhdr->end) {
+    ///         free_space_offset = jnl->jhdr->start - jnl->jhdr->end;
+    /// } else {
+    ///         // journal is completely empty
+    ///         free_space_offset = jnl->jhdr->size - jnl->jhdr->jhdr_size;
+    /// }
+    /// ```
+    ///
+    /// **`start > end` is the wrap.** The journal is a ring, so the live region is
+    /// `[end, start)` and the free region is `[start, size)` *plus* `[0, end)`. Reading
+    /// the wrap as a huge live region -- or as corruption -- is the mistake this
+    /// shape invites, and `start > end` is ordinary on a journal that has wrapped.
+    ///
+    /// The header's own size is subtracted in the two non-wrapped cases and not in
+    /// the wrapped one: once wrapped, `end` is already past the header.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `free_space`.
+    pub fn free_space(&self) -> u64 {
+        let jhdr_size = u64::from(self.jhdr_size);
+        if self.start < self.end {
+            self.size
+                .saturating_sub(self.end - self.start)
+                .saturating_sub(jhdr_size)
+        } else if self.start > self.end {
+            self.start - self.end
+        } else {
+            self.size.saturating_sub(jhdr_size)
+        }
+    }
+
+    /// Whether a transaction of `desired` bytes can be written now.
+    ///
+    /// Apple's `check_free_space` has two conditions and **both** matter:
+    ///
+    /// ```c
+    /// if (free_space(jnl) > desired_size && jnl->old_start[0] == 0) {
+    ///         break;
+    /// }
+    /// ```
+    ///
+    /// - **Strictly greater.** `>`, not `>=`. A transaction that exactly fills the
+    ///   journal leaves no room for the next one, and the header's own size is
+    ///   already accounted for in [`Self::free_space`].
+    /// - **Nothing pending.** `old_start[0] == 0` is the empty ring: no transaction
+    ///   is waiting to be replayed. Apple's answer to a pending one is to flush it,
+    ///   advancing `start`, and look again -- up to 7500 times before `ENOSPC`.
+    ///
+    /// A library cannot flush on the caller's behalf. Replaying is a decision about
+    /// whether the volume is current, and doing it silently inside a write is how a
+    /// library ends up writing through a filesystem the caller never accepted. So the
+    /// two conditions are reported separately and the caller replays, then retries.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `check_free_space`.
+    pub fn check_free_space(&self, desired: u64, pending: usize) -> Result<()> {
+        let free = self.free_space();
+        if free <= desired {
+            return Err(Error::no_space(
+                u32::try_from(desired).unwrap_or(u32::MAX),
+                free,
+            ));
+        }
+        if pending > 0 {
+            return Err(Error::invalid(
+                "journal",
+                format!(
+                    "{pending} transaction(s) on the journal have not been replayed; \
+                     flush them so jhdr->start advances, then retry"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Advance `end` past a written transaction and assign it the next sequence
+    /// number.
+    ///
+    /// The journal is a ring, so `end` wraps at `size`, and a transaction crossing
+    /// the end is written across the wrap rather than refused. This moves only the
+    /// cursor; the bytes themselves are the assembler's.
+    pub fn commit_transaction(&mut self, transaction_bytes: u64) -> Result<()> {
+        let free = self.free_space();
+        if transaction_bytes > free {
+            return Err(Error::no_space(
+                u32::try_from(transaction_bytes).unwrap_or(u32::MAX),
+                free,
+            ));
+        }
+        self.end = (self.end + transaction_bytes) % self.size;
+        self.sequence_num = self.sequence_num.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Advance `start` past a transaction that has been replayed and consumed.
+    ///
+    /// The other half of `check_free_space`'s condition: replaying is what makes the
+    /// space a transaction was holding available again.
+    pub fn release_transaction(&mut self, transaction_bytes: u64) -> Result<()> {
+        let new_start = self.start + transaction_bytes;
+        if new_start > self.size {
+            return Err(Error::invalid(
+                "journal",
+                format!(
+                    "releasing {transaction_bytes} bytes from start {} would pass the \
+                     journal's {} bytes",
+                    self.start, self.size
+                ),
+            ));
+        }
+        self.start = new_start;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use crate::error::Error;
+
+    fn header(start: u64, end: u64, size: u64) -> JournalHeader {
+        JournalHeader {
+            magic: JOURNAL_HEADER_MAGIC,
+            endian: ENDIAN_MAGIC,
+            start,
+            end,
+            size,
+            blhdr_size: 512,
+            checksum: 0,
+            jhdr_size: 1024,
+            sequence_num: 7,
+        }
+    }
+
+    #[test]
+    fn free_space_is_the_empty_journal_when_start_equals_end() {
+        // The third branch. A journal that has never been written is `size`
+        // less its own header, and reading `size - (end - start)` here would
+        // claim the whole journal is used.
+        let h = header(2048, 2048, 16384);
+        assert_eq!(h.free_space(), 16384 - 1024);
+    }
+
+    #[test]
+    fn free_space_is_the_gap_when_start_precedes_end() {
+        // The ordinary case: live region [start, end), header excluded.
+        let h = header(2048, 6144, 16384);
+        assert_eq!(h.free_space(), 16384 - (6144 - 2048) - 1024);
+    }
+
+    #[test]
+    fn free_space_wraps_when_start_is_past_end() {
+        // The case that is not `size - (end - start)`. The live region is
+        // [end, start) and the free region is [start, size) *plus* [0, end), so
+        // the answer is the gap between them -- and no header is subtracted,
+        // because `end` is already past the header.
+        let h = header(12288, 4096, 16384);
+        assert_eq!(h.free_space(), 12288 - 4096);
+        // And it is *not* the non-wrapped reading. Applying the first branch's
+        // arithmetic to a wrapped header does not fail loudly -- `end - start` is
+        // negative, so it reports *more* free space than the journal has. That is
+        // the shape worth guarding: a journal that has wrapped reads as larger than
+        // it is, rather than as corrupt.
+        let naive = 16384i64 - (4096i64 - 12288) - 1024;
+        assert_eq!(h.free_space() as i64, 12288 - 4096);
+        assert_ne!(naive, h.free_space() as i64);
+        assert!(
+            naive > 16384,
+            "the naive reading claims more space than exists"
+        );
+    }
+
+    #[test]
+    fn space_must_be_strictly_greater_than_the_transaction() {
+        // `free_space(jnl) > desired_size`, not `>=`. A transaction that exactly
+        // fills the journal leaves nothing for the next one.
+        let h = header(2048, 4096, 16384);
+        let free = h.free_space();
+        h.check_free_space(free, 0)
+            .expect_err("exactly full is not enough");
+        h.check_free_space(free - 1, 0)
+            .expect("one byte spare is enough");
+    }
+
+    #[test]
+    fn an_unreplayed_transaction_blocks_a_write_even_with_room() {
+        // The second condition. Apple's answer is to flush and retry; a library
+        // reports it instead, because replaying is the caller's decision.
+        let h = header(2048, 4096, 16384);
+        let err = h
+            .check_free_space(512, 1)
+            .expect_err("a pending transaction blocks");
+        assert!(
+            matches!(err, Error::InvalidField { .. }),
+            "a pending transaction is not out of space; got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("replayed"),
+            "and the refusal must say what to do; got: {err}"
+        );
+    }
+
+    #[test]
+    fn committing_advances_end_and_the_sequence_number() {
+        let mut h = header(2048, 4096, 16384);
+        h.commit_transaction(512).expect("commit");
+        assert_eq!(h.end, 4608);
+        assert_eq!(h.sequence_num, 8);
+    }
+
+    #[test]
+    fn end_wraps_at_the_size_of_the_journal() {
+        // A ring, not a line: a transaction that runs past the end is written
+        // across the wrap rather than refused.
+        let mut h = header(15360, 15360, 16384);
+        h.commit_transaction(2048).expect("commit across the wrap");
+        assert_eq!(h.end, 1024, "wrapped past the end of the journal");
+    }
+
+    #[test]
+    fn a_transaction_bigger_than_the_journal_is_refused() {
+        let mut h = header(2048, 2048, 16384);
+        let err = h.commit_transaction(1 << 20).expect_err("does not fit");
+        assert!(matches!(err, Error::NoSpace { .. }), "got {err:?}");
+        assert_eq!(h.end, 2048, "and a refused commit moves nothing");
+    }
+
+    #[test]
+    fn releasing_past_the_end_of_the_journal_is_refused() {
+        let mut h = header(15360, 15360, 16384);
+        h.release_transaction(1024).expect("release");
+        assert_eq!(h.start, 16384);
+        let err = h.release_transaction(1).expect_err("past the end");
+        assert!(
+            matches!(err, Error::InvalidField { .. }),
+            "releasing space that was never held is a caller error, not no-space; \\
+             got {err:?}"
+        );
+    }
+}
