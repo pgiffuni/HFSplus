@@ -1827,6 +1827,90 @@ fn truncating_to_what_the_file_already_is_refused() {
 
 // --- What it refuses -------------------------------------------------------
 
+// --- The alternate volume header -------------------------------------------
+
+/// Whether `fsck.hfsplus` modifies the image, ignoring its own signature.
+fn fsck_modifies(path: &std::path::Path) -> Option<bool> {
+    let fsck = common::fsck_available()?;
+    let before = std::fs::read(path).expect("read image");
+    let mut probe = std::env::temp_dir();
+    probe.push(format!("alt-hdr-{}.img", std::process::id()));
+    std::fs::copy(path, &probe).expect("copy for fsck");
+    let _ = common::run_fsck(&fsck, &probe);
+    let after = std::fs::read(&probe).expect("read the checked image");
+    let _ = std::fs::remove_file(&probe);
+    let len = before.len();
+    let signature = |i: usize| {
+        i == 1024 + 8
+            || (1033..=1036).contains(&i)
+            || i == len - 1024 + 8
+            || (len - 1024 + 9..=len - 1024 + 12).contains(&i)
+    };
+    Some((0..len).any(|i| before[i] != after[i] && !signature(i)))
+}
+
+#[test]
+fn the_alternate_header_only_needs_syncing_when_a_fork_changes() {
+    // TN1150: "The implementation should only update this copy when the length or
+    // location of one of the special files changes."
+    //
+    // This crate synced it on *every* header write, because a catalog that grew had
+    // left the two headers describing different forks and `fsck` repaired it. The
+    // conclusion drawn was "sync always", and it was drawn from a misreading -- so
+    // the thing worth pinning is what `fsck` actually compares.
+    //
+    // It validates the **primary** header against the allocation bitmap, and does
+    // not compare the two headers' counts. A backup left holding a stale
+    // `freeBlocks` is not repaired, and a volume this crate writes is accepted.
+    //
+    // The cost of getting it wrong is not cosmetic: syncing on every header write
+    // is a kilobyte read and a kilobyte write for every `nextCatalogID` bump.
+    let Some(_) = common::fsck_available() else {
+        eprintln!("skipping: fsck.hfsplus not installed");
+        return;
+    };
+
+    // A volume where only counts have moved -- the common case, since every create
+    // writes `nextCatalogID` and `fileCount` -- must be left alone.
+    let path = create_many(40);
+    assert_eq!(
+        fsck_modifies(&path),
+        Some(false),
+        "a volume whose forks have not moved must not need repair"
+    );
+
+    // And one where the catalog *has* moved must be synced, or fsck repairs it.
+    // That is the bug this rule was written for, so it is the half that must hold.
+    let grown = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            // The root, read before the writer exists: a `Volume` borrows the
+            // device, so it cannot outlive the scope that opens the writer.
+            let root = {
+                let d = FileDevice::open(&path).expect("open");
+                let v = Volume::open(&d).expect("mount");
+                v.root_cnid().0
+            };
+            let cnid = writable
+                .create_file(root, &units("pushes-it-over.txt"))
+                .expect("create");
+            writable
+                .write_file_contents(cnid, &[9u8; 300_000])
+                .expect("contents");
+            dev.sync().expect("flush");
+        }
+        dev.sync().ok();
+        path
+    };
+    assert_eq!(
+        fsck_modifies(&grown),
+        Some(false),
+        "a catalog that grew must leave the two headers agreeing about where the \
+         catalog is, or fsck repairs the volume -- which is what the sync is for"
+    );
+}
+
 // --- Growing, which allocates ----------------------------------------------
 
 /// The CNID of `payload.bin` in a fresh copy of the fixture.

@@ -2238,13 +2238,26 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// primary header unusable can still learn where the special files are; a count
     /// that has moved is not that kind of information, and the primary holds it.
     ///
-    /// So this is called from the places that change a fork -- a fork's extents,
-    /// its `totalBlocks` or its `logicalSize` -- and not from `write_header_u32`,
-    /// which is where it lives now. Keeping it on every write is not *wrong* -- the
-    /// two copies then agree, which is what `fsck` wants -- but it is more than the
-    /// specification asks for, and the reason it was done that way is a bug this
-    /// crate had: a catalog that grew left the two headers describing different
-    /// forks, and `fsck.hfsplus` reported "Volume header needs minor repair".
+    /// So this is called only where a fork's extents, `totalBlocks` or
+    /// `logicalSize` change, and *not* from `write_header_u32`. It was originally
+    /// called from there, because a catalog that grew left the two headers
+    /// describing different forks and `fsck.hfsplus` reported "Volume header needs
+    /// minor repair" -- so the obvious conclusion was to sync on everything.
+    ///
+    /// That conclusion was drawn from a misreading, and is worth correcting here
+    /// rather than quietly. The experiment:
+    ///
+    /// - Both headers identical, **primary**'s `freeBlocks` off by one from the
+    ///   bitmap: fsck reports "Invalid volume free block count" and repairs the
+    ///   primary.
+    /// - Both headers identical, **backup**'s `freeBlocks` off by one from the
+    ///   bitmap: fsck reports **"appears to be OK"** and changes nothing.
+    ///
+    /// So `lib_fsck_hfs` validates the *primary* against the allocation bitmap and
+    /// does not compare the two headers' counts at all. The backup can therefore
+    /// hold a stale `freeBlocks` indefinitely, exactly as TN1150 says it may, and
+    /// the cost of syncing on every header write -- a kilobyte read and a kilobyte
+    /// write for every `nextCatalogID` bump -- buys nothing.
     ///
     /// Mining reference: `core/hfs_vfsops.c` writes the "alternate volume header
     /// located at 1024 bytes before end of the partition"; TN1150, Volume Header,
@@ -2766,6 +2779,9 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     ) -> Result<()> {
         let at = crate::blockdev::VOLUME_HEADER_OFFSET + 112 + 80 * 2; // the catalog is the third of the five forks
         self.device.write_at(at, &fork.to_bytes())?;
+        // A fork's length and location changed, which is the one thing the alternate
+        // header exists to record. See `sync_backup_header`.
+        self.sync_backup_header()?;
         self.write_header_u32(48, free_blocks)
     }
 
