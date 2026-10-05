@@ -1385,18 +1385,24 @@ impl RecordedWrite {
     /// has to take, and it is why the sentinel is a block number rather than a flag.
     pub fn killed() -> Self {
         RecordedWrite {
-            bnum: 0xFFFF_FFFF_FFFF_FFFF,
+            bnum: KILLED_BNUM,
             data: Vec::new(),
         }
     }
 }
 
-/// The maximum blocks one block list can describe.
+/// The capacity of one block list's `binfo` array -- entries, **not** blocks.
 ///
 /// Apple's `MAX_BLISTHDR_BLKS`, and the reason a transaction is split into several
 /// block lists rather than growing one without limit: a list lives in a single
 /// journal block, so the number of entries it can hold is bounded by that block's
 /// size.
+///
+/// The distinction matters by exactly one. `binfo[0]` is the sequence-number slot
+/// and not a block, so a list with this capacity describes
+/// [`FIRST_BLOCK_INDEX`] fewer blocks than it has entries -- which is the same fact
+/// as `end_transaction` starting its write loop at `i = 1`, seen from the other
+/// side.
 pub const MAX_BLOCKS_PER_LIST: usize = 127;
 
 /// Build the bytes of one block list header, plus the blocks it describes.
@@ -1560,5 +1566,227 @@ mod write_tests {
         let parsed = BlockListHeader::parse(&raw).expect("parse");
         assert_eq!(parsed.blocks[0].bnum, 0xFFFF_FFFF_FFFF_FFFF);
         assert_eq!(parsed.blocks[0].bsize, 0);
+    }
+}
+
+/// One list as the assembler emits it: where it sits and how big it is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedList {
+    /// Byte offset of the list's header within the assembled transaction.
+    pub offset: u64,
+    /// Byte offset of the list's block data.
+    pub data_offset: u64,
+    /// The header, exactly as `BlockListHeader::parse` will read it.
+    pub header: Vec<u8>,
+    /// How many blocks the list describes.
+    pub num_blocks: usize,
+}
+
+/// A transaction assembled for writing, and where it ends.
+///
+/// The inverse of the walk in [`Journal::replay`], which advances
+/// `next = data_offset + bytes_used` and reads each list's header from a whole
+/// `blhdr_size` block. Lists are packed **back to back with no rounding**, which is
+/// the part that is not obvious and which the reader's arithmetic fixes exactly.
+///
+/// # Splitting
+///
+/// A block list describes at most [`MAX_BLOCKS_PER_LIST`] blocks, because it lives
+/// in one journal block. A transaction with more blocks than that becomes several
+/// lists, and only the first carries [`BLHDR_FIRST_HEADER`].
+///
+/// A killed block contributes a list entry but no data, so it costs an entry and
+/// no bytes -- which is what makes "this block was freed" a thing the journal can
+/// say.
+///
+/// Mining reference: `end_transaction`'s `for (blhdr = tr->blhdr; blhdr; blhdr = next)`
+/// over the block lists, each followed by its own blocks.
+pub fn encode_transaction(
+    sequence_num: u32,
+    blocks: &[RecordedWrite],
+    blhdr_size: u32,
+    check_blocks: bool,
+) -> Result<(Vec<u8>, u32, Vec<EncodedList>)> {
+    use crate::error::Error;
+
+    if blhdr_size == 0 {
+        return Err(Error::invalid(
+            "blhdr_size",
+            "a zero-sized block list cannot hold a header",
+        ));
+    }
+    let blhdr_size = blhdr_size as usize;
+    let mut out: Vec<u8> = Vec::new();
+    let mut lists = Vec::new();
+
+    // The capacity is set by the journal block the list lives in, not by a constant:
+    // a list is one `blhdr_size` block, and its `binfo` array has to fit inside it.
+    // `MAX_BLOCKS_PER_LIST` is Apple's ceiling on that array, and a block smaller
+    // than that gives a smaller one -- which is the whole reason `blhdr_size` is
+    // carried in the journal header.
+    let capacity = blhdr_size.saturating_sub(BLHDR_PREFIX_SIZE) / BLOCK_INFO_SIZE;
+    if capacity <= FIRST_BLOCK_INDEX {
+        return Err(Error::invalid(
+            "blhdr_size",
+            format!("{blhdr_size} bytes cannot hold a block list header and a block"),
+        ));
+    }
+    if capacity > MAX_BLOCKS_PER_LIST {
+        return Err(Error::invalid(
+            "blhdr_size",
+            format!(
+                "{blhdr_size} bytes would hold {capacity} entries, above Apple's \
+                 maximum of {MAX_BLOCKS_PER_LIST}"
+            ),
+        ));
+    }
+    // Entries, not blocks: the sequence slot takes one of them.
+    let per_list = capacity - FIRST_BLOCK_INDEX;
+    debug_assert!(per_list > 0);
+    for (i, chunk) in blocks.chunks(per_list).enumerate() {
+        let flags = if i == 0 { BLHDR_FIRST_HEADER } else { 0 };
+        let header = encode_block_list(sequence_num, flags, capacity as u16, chunk, check_blocks)?;
+        if header.len() > blhdr_size {
+            return Err(Error::invalid(
+                "blhdr_size",
+                format!(
+                    "{} bytes of block list header does not fit in a {blhdr_size}-byte \\
+                     journal block",
+                    header.len()
+                ),
+            ));
+        }
+        let offset = out.len();
+        // The header occupies a whole journal block; the data starts after it.
+        out.resize(offset + blhdr_size, 0);
+        out[offset..offset + header.len()].copy_from_slice(&header);
+        let data_offset = out.len();
+        let mut used = 0usize;
+        for b in chunk {
+            if b.bnum == KILLED_BNUM {
+                continue; // recorded, not written
+            }
+            out.extend_from_slice(&b.data);
+            used += b.data.len();
+        }
+        lists.push(EncodedList {
+            offset: offset as u64,
+            data_offset: data_offset as u64,
+            header,
+            num_blocks: chunk.len(),
+        });
+        debug_assert_eq!(used, out.len() - data_offset);
+    }
+
+    if out.len() > u32::MAX as usize {
+        return Err(Error::overflow("transaction length"));
+    }
+    let end = u32::try_from(out.len()).map_err(|_| Error::overflow("transaction length"))?;
+    Ok((out, end, lists))
+}
+
+/// `bnum` meaning "this block was released", as `end_transaction` writes it and
+/// replay skips it.
+pub const KILLED_BNUM: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+
+    fn block(n: u8) -> RecordedWrite {
+        RecordedWrite {
+            bnum: u64::from(n) + 26,
+            data: vec![n; 256],
+        }
+    }
+
+    /// Re-walk an assembled transaction exactly as `Journal::replay` does: take a
+    /// `blhdr_size` block, read the header at the cursor, put the data after it, and
+    /// advance by `data_offset + bytes_used`. If the assembler's layout and the
+    /// reader's arithmetic ever disagree, this is where it shows.
+    fn walk(image: &[u8], blhdr_size: usize, first: u64) -> Vec<(u64, u64, usize)> {
+        let mut out = Vec::new();
+        let mut offset = first;
+        while offset as usize + blhdr_size <= image.len() {
+            let bytes = &image[offset as usize..offset as usize + blhdr_size];
+            let data_offset = offset + blhdr_size as u64;
+            let blhdr = BlockListHeader::parse_at(bytes, data_offset).expect("parse");
+            assert!(blhdr.checksum_matches(bytes), "header checksum");
+            out.push((offset, data_offset, blhdr.blocks.len()));
+            let next = data_offset + u64::from(blhdr.bytes_used);
+            assert!(next > offset, "a list must advance");
+            offset = next;
+        }
+        out
+    }
+
+    #[test]
+    fn an_assembled_transaction_is_walkable_by_the_readers_own_arithmetic() {
+        let blocks: Vec<RecordedWrite> = (0..5).map(block).collect();
+        let (image, end, lists) = encode_transaction(0x11, &blocks, 512, true).expect("encode");
+        assert_eq!(lists.len(), 1, "five blocks fit one list");
+        let found = walk(&image, 512, 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, 0);
+        assert_eq!(found[0].2, blocks.len());
+        assert_eq!(u64::from(end), image.len() as u64);
+    }
+
+    #[test]
+    fn more_blocks_than_one_list_holds_become_several_lists() {
+        // One list is bounded by the journal block it lives in, so a transaction
+        // with more blocks is several lists, packed back to back, and only the
+        // first is the first.
+        // A 512-byte journal block holds 31 entries -- 16 of prefix and 16 per
+        // entry -- so 30 blocks per list, and the sequence slot is the 31st.
+        let per_list = (512 - BLHDR_PREFIX_SIZE) / BLOCK_INFO_SIZE - FIRST_BLOCK_INDEX;
+        assert_eq!(per_list, 30, "the capacity comes from the journal block");
+        let blocks: Vec<RecordedWrite> = (0..(per_list + 3))
+            .map(|i| RecordedWrite {
+                bnum: i as u64 + 26,
+                data: vec![i as u8; 64],
+            })
+            .collect();
+        let (image, _end, lists) = encode_transaction(0x22, &blocks, 512, true).expect("encode");
+        assert_eq!(lists.len(), 2, "one full list and the remainder");
+        assert_eq!(lists[0].num_blocks, per_list);
+        assert_eq!(lists[1].num_blocks, 3);
+
+        let found = walk(&image, 512, 0);
+        assert_eq!(found.len(), 2, "and the reader's walk finds both");
+        assert_eq!(
+            found[1].0,
+            found[0].0 + 512 + (per_list * 64) as u64,
+            "the second list follows the first's data with no rounding"
+        );
+    }
+
+    #[test]
+    fn a_killed_block_costs_a_list_entry_and_no_bytes() {
+        let mut blocks = vec![block(1), block(2)];
+        blocks.push(RecordedWrite::killed());
+        let (image, _end, lists) = encode_transaction(0x33, &blocks, 512, true).expect("encode");
+        let found = walk(&image, 512, 0);
+        assert_eq!(found.len(), 1);
+        assert_eq!(lists[0].num_blocks, 3, "three entries");
+
+        // And the data is two blocks, not three: the sentinel contributes nothing.
+        let blhdr = BlockListHeader::parse_at(&image[..512], 512).expect("parse");
+        assert_eq!(blhdr.blocks[2].bnum, KILLED_BNUM);
+        assert_eq!(blhdr.blocks[2].bsize, 0);
+        assert_eq!(u64::from(blhdr.bytes_used), 512, "two 256-byte blocks");
+    }
+
+    #[test]
+    fn a_header_too_large_for_its_journal_block_is_refused() {
+        // The capacity and the journal block size have to agree; a header that will
+        // not fit is a configuration error, not something to truncate.
+        let blocks: Vec<RecordedWrite> = (0..3).map(block).collect();
+        let err =
+            encode_transaction(1, &blocks, 8, true).expect_err("8 bytes cannot hold a header");
+        assert!(
+            format!("{err}").contains("blhdr_size"),
+            "the refusal must name the field that is wrong; got: {err}"
+        );
     }
 }
