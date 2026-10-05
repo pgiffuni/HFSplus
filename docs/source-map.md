@@ -638,6 +638,75 @@ is `iNode17`, not `17` -- and **that is how `fsck.hfsplus` recognises an indirec
 node**. The earlier attempt named the record with the bare CNID, which is why the
 checker cleared its link-chain flag with nothing to show for it.
 
+### Where the implementation stands, after a third attempt
+
+Written against the step order *read off the source* rather than reconstructed --
+which was the change that stopped the previous attempt's failures, all of which had
+been sequencing rather than model. The resulting volume:
+
+```
+(2,  "alias.bin")        file 19  link=true  ref=Some(17)  forks=0/0
+(18, "iNode17")          file 17  link=false count=2       forks=1/700
+```
+
+which is the shape `hfs_makelink` describes: the data has moved into the private
+folder under `iNode<cnid>`, and the name the user typed is a link record with no
+forks. `check::check` calls it clean.
+
+What that attempt settled:
+
+- **The counts are 1, in both records.** `fsck.hfsplus` wanted "1 instead of 2" for
+  the indirect node and "1 instead of 17" for the link, and with both set to 1
+  *every count complaint disappears*. So `linkCount` is not "itself plus its links",
+  and -- more awkwardly -- a link record's `special` is **not** the indirect node's
+  CNID, whatever `#define hl_linkReference bsdInfo.special.iNodeNum` says.
+- **The target's key comes from its thread record**, not from the `name` argument:
+  `name` is the link being created, which may be anywhere.
+- **A thread record's body starts after its key.** A node record is key-then-body
+  and a thread key is eight bytes; reading the body from offset 0 reads the key.
+- **A thread is replaced, not inserted** -- its key is `(cnid, "")` whatever it
+  names, and the body changes length.
+
+And the bug the written order caught: the earlier attempt removed the target's
+record **twice**, once in the rename half and once in the link half, and reported
+"catalog record to remove not present" for a record it had just deleted itself.
+
+### The one byte that is left
+
+`fsck.hfsplus` still repairs, and the repair is one byte:
+
+```
+offset 110793 (catalog block 27, within 201):  ours=0x20  fsck=0x00
+```
+
+`0x20` is `kHFSHasLinkChainMask`, and within 201 of the leaf it is early enough to
+be the **link record in the user's folder** -- the record `fsck` had just announced
+with "File record has hard link chain flag (id = 19)" before clearing it.
+
+So the arrangement is right for the *indirect node* and wrong for the *link*. The
+question `hfs.h` leaves open is what "iNode" names, and the two attempts bracket it:
+
+- With the **indirect node** at `iNode<cnid>` and the **link** in the user's folder,
+  every count is right and `fsck` clears the link's chain flag.
+- With the **link** in the private folder under its bare CNID -- the arrangement two
+  attempts ago -- `fsck` cleared the flag too, but there the counts were also wrong
+  and the record was not named the way `MAKE_INODE_NAME` says.
+
+`hl_firstLinkID` is documented "Valid only if HasLinkChain flag is set (**indirect
+nodes only**)". That word *indirect nodes only* is the thread to pull: if the chain
+head is marked on the indirect node rather than on a self-referential link, then
+`reserved1` belongs on `iNode17` pointing at the link, and the link's own
+`reserved1` is not a self-pointer at all. The next attempt should test that
+before writing anything else, because it predicts exactly what `fsck` is objecting
+to.
+
+### Every attempt rolled back
+
+Worth saying plainly, because it is why six wrong attempts cost documentation and
+not a fixture: each one put the volume back byte-for-byte, and `fsck.hfsplus`
+accepted the result. That is the rollback discipline from `create_file` doing its
+job on a path nothing else checks.
+
 ### Where the implementation stands
 
 An implementation of the corrected model was written and **not committed**: four
