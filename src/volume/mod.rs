@@ -627,10 +627,26 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         drop(volume);
 
         if journal_replayed {
+            // Refused here rather than papered over, and the reason is structural
+            // rather than a missing feature. On a journalled volume Apple's writer
+            // does not write the catalog at all: `hfs_start_transaction` opens a
+            // transaction, the mutation happens inside it, and `end_transaction`
+            // commits the blocks it touched. Every mutating path in the kernel
+            // brackets itself that way -- `core/hfs_catalog.c`, `core/hfs_cnode.c`,
+            // `core/hfs_btreeio.c`, `core/hfs_cprotect.c` each call
+            // `hfs_start_transaction` first. See `src/journal/mod.rs`.
+            //
+            // So what this crate does elsewhere is the *recovery* path, and writing
+            // it against a volume that has a live journal would leave a journal that
+            // does not describe the volume -- the one state that makes a journal
+            // worse than none, because the next replay would undo the write or apply
+            // it twice.
             return Err(Error::invalid(
                 "write",
-                "journalled writes are not implemented; a write without a journal entry \
-                 would leave a journal that does not describe the volume",
+                "journalled writes are not implemented; on a journalled volume the \
+                 writer works through a transaction rather than writing the catalog \
+                 directly, so a direct write here would leave a journal that does not \
+                 describe the volume",
             ));
         }
 

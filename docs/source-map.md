@@ -371,7 +371,9 @@ compression metadata (7B.2) are done and appear above.
 | Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | Milestone 10D |
 | Opened-but-deleted files in the metadata directory | `HFS_DELETE_PREFIX "temp"`; TN1150's Hard Links section | Milestone 10D |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
-| Journal writes | `core/hfs_journal.c` `write_journal_header`, `end_transaction` | Milestone 12 |
+| **Writing** a journal transaction | `core/hfs_vfsutils.c` `hfs_start_transaction`/`hfs_end_transaction`; `core/hfs_journal.c` `end_transaction`, `journal_open` | Milestone 12, **now first** |
+| The block list a transaction accumulates | `core/hfs_journal.c` the transaction's block-list array and its checksum | Milestone 12 |
+| The syncer and `nextAllocation` interactions | `hfs_syncer`, `HFS_SKIP_UPDATE_NEXT_ALLOCATION` | Milestone 12 |
 
 ### The "exchange" is not an exchange
 
@@ -961,6 +963,53 @@ and then diffed a copy of the *repaired* image reported "appears to be OK" with 
 differences, which read as success for a volume the checker had just rewritten. The
 only trustworthy measurement is a checker run against an image nothing has touched,
 and the diff has to come from a copy made *before* that run.
+
+## Why journal writing is now the next milestone
+
+It was twelfth on the list and it should be first, for a reason that only became
+clear once the hard-link work hit `fsck`.
+
+`fsck.hfsplus` prints which kind of volume it is looking at:
+
+```
+** Checking Journaled HFS Plus volume.
+** Checking non-journaled HFS Plus Volume.
+```
+
+and takes a **different code path** either way. Every volume this crate mutates is
+non-journalled — the corpus fixture `bootstrapped-with-file` derives from
+`basic-hfsplus`, which has `kHFSVolumeJournaledBit` clear — so every check this
+project has run has been along the non-journalled path, which is not the path a
+real volume would take.
+
+And the difference is not confined to the checker. On a journalled volume **a
+writer does not write the catalog**: `hfs_start_transaction` opens a transaction,
+the mutation happens inside it, and `end_transaction` commits the blocks it
+touched. Every mutating path in Apple's kernel brackets itself that way —
+`core/hfs_catalog.c`, `core/hfs_cnode.c`, `core/hfs_btreeio.c`,
+`core/hfs_cprotect.c`, `core/hfs_hotfiles.c` each call `hfs_start_transaction`
+before changing anything.
+
+So the direct block writes this crate performs reproduce the **recovery** path, not
+the writer's. That is coherent for a volume with no journal, and it is why
+`WritableVolume::open` refuses a journalled volume outright. But it means the whole
+mutation surface is being built against a shape macOS does not produce, and verified
+against a checker path that a real volume would not take.
+
+Two more things the mining turned up while writing this up:
+
+- **The transaction's unit is the system-file lock, not the record write.**
+  `hfs_start_transaction` asserts the lock order by `panic` — holding the catalog or
+  attribute lock and *then* starting a transaction is
+  `"bad lock order (cat before jnl)"`. A userspace port has no lock hierarchy to
+  violate, but the ordering says what a transaction must be atomic *around*, and it
+  is wider than any single mutation here: `SFL_CATALOG | SFL_ATTRIBUTE |
+  SFL_EXTENTS | SFL_BITMAP` exclusive.
+- **Read-only is signalled through the mount, not the volume.** `HFS_RDONLY_DOWNGRADE`
+  is documented in `core/hfs.h` as "we are in process of downgrading or have
+  downgraded to read-only, so `hfs_start_transaction` should return EROFS". A library
+  has no such state, so its equivalent is the *absence* of write capability -- which is
+  why `BlockDeviceMut` rather than `BlockDevice` is the bound on `WritableVolume`.
 
 ## What Milestone 8 has and has not reached
 
