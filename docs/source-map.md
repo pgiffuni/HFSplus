@@ -359,8 +359,11 @@ compression metadata (7B.2) are done and appear above.
 | A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | done |
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
-| **Creating** a hard link | `core/hfs_catalog.c` `cat_createlink`; the private hardlinks directory | blocked -- see below |
+| **The private hardlinks folder** | `core/hfs_link.c` `hfs_private_names`, `HFSPLUSMETADATAFOLDER` in `core/hfs_format.h` | Milestone 10, first |
+| **Creating** a hard link | `core/hfs_catalog.c` `cat_createlink`; `core/hfs_link.c` `hfs_makelink` | blocked -- see below |
 | **Threading** a second link | `cat_lookup_lastlink`, `cat_lookup_siblinglinks`, `hl_firstLinkID` | blocked -- see below |
+| **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | Milestone 10 |
+| **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
 | **Unlinking** through a link | `cat_delete` refusing a record with siblings | Milestone 10 |
 | Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
@@ -478,23 +481,58 @@ claim to believe. **A file hard link is a name, not a second owner of the data.*
 Both forks on the link's record must be empty. Fixing that removed the overlap *and*
 the free-block-count complaint, and is worth keeping whatever else happens.
 
-### The finding that blocks it
+### What actually blocks it -- corrected, after mining `hfs_link.c`
 
-The two count complaints say something specific. `fsck` reads a link count out of
-`special` for *every* record, and for the link it read **17** -- which is what this
-crate put there as `hl_linkReference`. And `fsck` expects **1** for the indirect
-node too, even though it now has itself plus one link.
+An earlier version of this section concluded that the link's `hl_linkReference`
+"is not in the link's own record ... the reference lives in the private hardlinks
+directory, keyed by the indirect node's CNID". **That was wrong**, and reading
+`core/hfs_link.c` says so in its own first comment:
 
-So both records should be reading 1, which means `hl_linkReference` is **not** in the
-link's own record for a file link. The reference lives in the private hardlinks
-directory, keyed by the indirect node's CNID -- and that is precisely what the
-directory is *for*. The reasoning that had said a chain of one needs nothing else,
-because `cat_lookup_siblinglinks` reads `hl_prevLinkID`/`hl_nextLinkID` straight out
-of an ordinary link, was right about the *chain* and wrong about the *reference*.
+```c
+/*
+ * Private directories where hardlink inodes reside.
+ */
+const char *hfs_private_names[] = {
+        HFSPLUSMETADATAFOLDER,      /* FILE HARDLINKS */
+        HFSPLUS_DIR_METADATA_FOLDER /* DIRECTORY HARDLINKS */
+};
 
-So a hard link cannot be expressed in a form `fsck` accepts until the private
-directory exists, and creating that directory is the first thing Milestone 10 has to
-do. Everything measured above is recorded so the next attempt starts from it.
+/*
+ * Hardlink inodes save the head of their link chain in a
+ * private extended attribute.
+ */
+static int  setfirstlink(struct hfsmount * hfsmp, cnid_t fileid, cnid_t firstlink);
+```
+
+So the three facts, and they are different from what the fsck output alone suggested:
+
+- **The reference stays in the link record.** `hl_linkReference` is
+  `bsdInfo.special.iNodeNum` and `cat_createlink` sets it to the indirect node.
+  That was never in doubt; what was wrong was the *reason* fsck objected.
+- **Link records live in a private folder, named by their own CNID.**
+  `HFSPLUSMETADATAFOLDER` is `"\xE2\x90\x80\xE2\x90\x80\xE2\x90\x80\xE2\x90\x80HFS+ Private Data"`
+  and `HFSPLUS_DIR_METADATA_FOLDER` is `".HFS+ Private Directory Data\xd"`.
+  `hfs_makelink` *renames* a link inode into that folder, and
+  `cat_lookup_siblinglinks` special-cases a link whose parent is the file
+  hardlinks folder to report `next = hl_firstLinkID`. So a link record left in an
+  ordinary folder is not where `fsck` -- or Apple -- expects to find the chain.
+- **The chain head is marked on the first link, pointing at itself.**
+  `hfs_makelink` sets `cp->c_attr.ca_firstlink = linkcnid` after
+  `cp->c_desc.cd_cnid = linkcnid`, so the head link's `hl_firstLinkID`
+  (`reserved1`) is its own CNID. *Directory* links instead put the head in an
+  extended attribute, `com.apple.system.hfs.firstlink`, holding the CNID as a
+  **decimal string** -- `snprintf(..., "%lu", firstlink)`.
+
+That last pair is the likely explanation for the count complaints: with the link
+sitting in an ordinary folder and no head marked anywhere, `fsck` could not find a
+chain to reconcile the counts against, and reported both records as wrong rather
+than either as unreachable.
+
+So the first thing Milestone 10 must do is not "write a link record". It is to
+create the private hardlinks folder with Apple's exact name, and put the link
+record *in* it under its own CNID, with `reserved1` pointing at itself. Until those
+three exist the count is unfixable, and guessing at their shape is what produced
+two wrong conclusions in this section already.
 
 ### A trap worth naming
 
