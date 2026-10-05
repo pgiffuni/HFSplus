@@ -242,6 +242,88 @@ impl BlockListHeader {
 }
 
 /// One transaction: a run of block lists followed by their data.
+///
+/// # What a writer has to produce, which is the inverse of what this reads
+///
+/// This type is what replay *finds*. The writer's job is the other direction, and
+/// mining `end_transaction` in `core/hfs_journal.c` gives the order -- which is
+/// worth writing down, because it is not the obvious one:
+///
+/// 1. **Check for room first.** `check_free_space(jnl, tr->total_bytes,
+///    &tr->delayed_header_write, jnl->saved_sequence_num)` runs before anything is
+///    written, and it may decide to *defer the journal header write* rather than
+///    fail. So the space decision comes first and can change what is emitted.
+/// 2. **Record the sequence number**: `jnl->saved_sequence_num = jnl->sequence_num`.
+/// 3. **Validate the write head**: `if (jnl->jhdr->end <= 0 || jnl->jhdr->end >
+///    jnl->jhdr->size)` -- an end outside the journal is rejected rather than
+///    clamped, so a corrupt header stops the transaction instead of writing past it.
+/// 4. **`tr->journal_start = jnl->jhdr->end`** -- where this transaction begins.
+/// 5. **Write each block list, then its blocks**:
+///    ```c
+///    for (blhdr = tr->blhdr; blhdr; blhdr = next) {
+///            for (i = 1; i < blhdr->num_blocks; i++) {
+///                    if (blhdr->binfo[i].bnum != (off_t)-1) {
+///                            ... write ...
+///                    }
+///            }
+///    }
+///    ```
+///    **`i` starts at 1**, because index 0 is the block-list header's *own* block --
+///    the list is stored in a journal block, and that block is not one of the blocks
+///    the list describes. A writer that started at 0 would list its own header as
+///    recorded data.
+///
+/// The `do/while (err == EAGAIN)` around each write is the device being retried,
+/// not a retry of the whole transaction: a transaction is written once, in order,
+/// and a torn write is recovered by the journal header not having been advanced.
+///
+/// # Why the order of blocks inside a list is not the write order
+///
+/// A block list header records *which* blocks changed, and they need not be written
+/// in list order for recovery to work -- replay writes them in whatever order the
+/// journal holds them. But a writer should still emit them in a deterministic order,
+/// because the journal's own space accounting and its `end` advance assume a stable
+/// layout, and because a transaction whose bytes depend on iteration order of a hash
+/// map is not reproducible.
+///
+/// # A journalled write never touches the home block
+///
+/// This is the fact that decides how a writer is shaped, and it is not visible
+/// from the replay side at all.
+///
+/// A block that changes is **copied into the transaction's own buffer** as it is
+/// dirtied. The data is written from that buffer at commit:
+///
+/// ```c
+/// blkptr = (char*)&blhdrim->buffers[tbuffer_offset];
+/// ```
+///
+/// so the home block is untouched until the transaction commits, and a crash before
+/// that leaves the filesystem exactly as it was -- the journal holds the only copy of
+/// the change. That is why `end_transaction` has nothing to undo and why a torn write
+/// is recovered by the journal header not having advanced.
+///
+/// The port consequence is that a journalled writer here is not "write, then journal
+/// what I wrote". It is "copy into a transaction buffer, then commit", which means
+/// every mutation in this crate that currently writes a home block would have to be
+/// re-expressed to write into the buffer instead. That is why journal writing is not
+/// a feature that can be added after the mutations but a change to all of them.
+///
+/// # An empty transaction, and a killed block
+///
+/// Two things a writer must be able to express, both of which replay has to
+/// recognise and neither of which the current mutations need:
+///
+/// - **An empty transaction.** `if (tr->total_bytes == jnl->jhdr->blhdr_size)` is
+///   how a transaction with nothing in it is recognised, so "no blocks changed" is a
+///   representable event and not a special case to be elided.
+/// - **A killed block.** `blhdr->binfo[i].bnum = (off_t)-1` marks a block that was
+///   freed, and the write loop skips it: `if (blhdr->binfo[i].bnum != (off_t)-1)`.
+///   So releasing a block is something the journal records rather than the absence
+///   of a record. That is the shape a future `remove`-through-a-link has to take.
+///
+/// Mining reference: `core/hfs_journal.c` `end_transaction`; the block-list header
+/// and its checksum are parsed by [`BlockListHeader`] in this module.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Transaction {
     /// Sequence number assigned when the transaction began.
