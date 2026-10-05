@@ -82,6 +82,24 @@ impl NameComparison {
 
 /// A catalog key: parent CNID plus a Unicode name.
 ///
+/// `keyLength` "varies between kHFSPlusCatalogKeyMinimumLength (6) to
+/// kHFSPlusCatalogKeyMaximumLength (516)" -- it excludes its own two bytes -- and
+/// `parentID` means two different things depending on the record: for a file or
+/// folder record it is "the folder containing the file or folder", and for a
+/// thread record it is "the CNID of the file or folder **itself**", with an
+/// **empty** `nodeName`. (TN1150, Catalog File.)
+///
+/// That asymmetry is the whole reason a thread record exists: it is what makes a
+/// CNID resolvable, since file and folder keys never contain one.
+///
+/// Keys compare by `parentID` first, as an unsigned 32-bit integer, and then by
+/// `nodeName` -- case-insensitively on HFS+, or on a case-insensitive HFSX volume,
+/// and as a plain unsigned sequence on a case-sensitive one. The
+/// "since files do not contain other files or folders, there are no catalog records
+/// whose key has a parentID equal to a file's CNID and a non-zero-length
+/// nodeName. These unused key values are reserved" -- which is why the parent IDs
+/// below 16 are free for the reserved system files.
+///
 /// Mining reference: the layout above; the decode order follows
 /// `core/hfs_endian.c`'s swap routine for `HFSPlusCatalogKey`.
 #[derive(Clone, Debug, PartialEq, Eq)]

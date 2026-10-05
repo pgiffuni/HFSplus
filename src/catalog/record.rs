@@ -92,6 +92,15 @@ pub const K_HFS_HAS_FOLDER_COUNT_MASK: u16 = 0x0010;
 /// `kHFSHasLinkChainMask`: the object belongs to a hard link chain.
 pub const K_HFS_HAS_LINK_CHAIN_MASK: u16 = 0x0020;
 
+/// `kHFSThreadExistsMask`: this record has a thread record.
+///
+/// TN1150: "this bit indicates that the file has a thread record. As all files in
+/// HFS Plus have thread records, **this bit must be set**." It is distinct from
+/// `kHFSHasLinkChainMask` above -- they are adjacent bits meaning unrelated things,
+/// and a record that sets one and not the other is exactly what
+/// `createindirectlink` produces for a hard link.
+pub const K_HFS_THREAD_EXISTS_MASK: u16 = 0x0002;
+
 /// `kHFSHasChildLinkMask`: an HFSX folder has a child that is a directory link.
 pub const K_HFS_HAS_CHILD_LINK_MASK: u16 = 0x0040;
 
@@ -170,7 +179,22 @@ pub struct BsdInfo {
     pub owner_flags: u8,
     /// `fileMode`: file type and permission bits.
     pub file_mode: u16,
-    /// `special`: link count, indirect node number, or device number.
+    /// `special`: a **union**, and which member it holds is not decided by the
+    /// value.
+    ///
+    /// TN1150, HFS Plus Permissions:
+    ///
+    /// - "**iNodeNum** -- For hard link files, this field contains the link
+    ///   reference number."
+    /// - "**linkCount** -- For indirect node files, this field contains the number
+    ///   of hard links that point at this indirect node file."
+    /// - "**rawDevice** -- For block and character special devices files (when the
+    ///   S_IFMT field contains S_IFCHR or S_IFBLK), this field contains the device
+    ///   number."
+    ///
+    /// So on a record with [`K_HFS_HAS_LINK_CHAIN_MASK`] it is a reference, and on
+    /// one without it is a count, and nothing in the bytes themselves says which.
+    /// For "directories, and most files, this field is unused and reserved."
     pub special: u32,
 }
 
@@ -635,12 +659,38 @@ impl FileRecord {
         self.flags & K_HFS_HAS_LINK_CHAIN_MASK != 0
     }
 
-    /// The link count, meaningful when this record is not a hard link.
+    /// The link count: how many hard links point at this indirect node.
+    ///
+    /// TN1150 is explicit that it is an **estimate**, and that is a property of the
+    /// format rather than a caveat: "The linkCount field in the permissions is an
+    /// estimate of the number of links referring to this indirect node file. An
+    /// implementation that understands hard links should increment this value when
+    /// creating an additional link, and decrement the value when removing a link.
+    /// However, some implementations (such as traditional Mac OS) do not understand
+    /// hard links and may make changes that cause the linkCount to be inaccurate."
+    ///
+    /// So the count is not a cross-check that fails loudly when wrong; a reader has
+    /// to find the links and count them, which is precisely what
+    /// `lib_fsck_hfs` does.
     pub fn link_count(&self) -> u32 {
         self.bsd_info.special
     }
 
-    /// For a hard link, the CNID of the indirect node holding the real data.
+    /// For a hard link, the **link reference** of the indirect node holding the
+    /// data.
+    ///
+    /// TN1150 draws a distinction this method's name used to blur: the reference is
+    /// *not* the CNID. "Indirect node files have a special identifying number
+    /// called a link reference. The link reference is unique among indirect node
+    /// files on a given volume. **The link reference is not related to catalog node
+    /// IDs.** When a new indirect node file is created, it is assigned a new link
+    /// reference randomly chosen from the range 100 to 1073741923."
+    ///
+    /// Apple *reuses* the CNID as the reference for file links, and
+    /// `lib_fsck_hfs` says why -- "which is same as inode ID for file hard links
+    /// created post-Tiger" -- so on a real volume the two coincide. A reader must
+    /// not rely on that: the format permits any value in that range, and
+    /// "A hard link with a link reference equal to 0 is invalid."
     pub fn link_reference(&self) -> Option<Cnid> {
         if self.is_hard_link() {
             Some(Cnid(self.bsd_info.special))

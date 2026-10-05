@@ -357,6 +357,18 @@ impl<'a> Node<'a> {
     /// i.e. the gap between the lowest record and the start of the offset array.
     /// The node descriptor is not subtracted: it sits below the records, outside
     /// that gap.
+    ///
+    /// TN1150 states the same arithmetic from the other end, and adds the case this
+    /// has to get right at the boundary: "the list of record offsets always contains
+    /// one more entry than there are records in the node. This entry contains the
+    /// offset to the first byte of free space in the node... **If there is no free
+    /// space in the node, the entry contains its own byte offset from the start of
+    /// the node.**"
+    ///
+    /// That last clause is why a full node reports zero rather than underflowing: the
+    /// free-space entry then points at its own slot in the offset array, so
+    /// `nodeSize - freeOffset - (numRecords + 1) * 2` is exactly 0 and not a
+    /// negative number a caller would have to guard against.
     pub fn free_space(&self) -> Result<usize> {
         let free = self.free_offset()?;
         let tail = (usize::from(self.desc.num_records) + 1) * OFFSET_SIZE;
@@ -701,6 +713,26 @@ fn set_num_records(node: &mut [u8], count: u16) -> Result<()> {
         .copy_from_slice(&count.to_be_bytes());
     Ok(())
 }
+
+/// The height rule for a node, which is not the one a textbook B-tree uses.
+///
+/// TN1150, B-Trees, `BTNodeDescriptor`: "For the header node, this field must be
+/// zero. For leaf nodes, this field must be one. For index nodes, this field is one
+/// greater than the height of the child nodes it points to. The height of a map
+/// node is zero, just like for a header node."
+///
+/// And `treeDepth` "is always equal to the height field of the root node". The two
+/// together mean a height is a *count down from the root*, not a level index: a
+/// one-leaf catalog has a leaf at height 1 and `treeDepth` 1, which is why
+/// `treeDepth == 0` is not a tree that exists, and why "is this leaf its own
+/// parent" has to be asked as `rootNode == leafNode`.
+///
+/// `lib_fsck_hfs` checks the same invariant from the other end -- a node's expected
+/// height is the depth minus the levels above it -- and the two agree.
+pub const LEAF_NODE_HEIGHT: u8 = 1;
+
+/// A header or map node's height, which TN1150 requires to be zero.
+pub const NON_LEAF_NODE_HEIGHT: u8 = 0;
 
 /// Unused bytes in a node, as `GetNodeFreeSize` computes it.
 ///

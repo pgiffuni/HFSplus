@@ -74,6 +74,20 @@ pub const K_HFSX_VERSION: u16 = 0x0005;
 pub const VOLUME_HEADER_SIZE: usize = 512;
 
 /// `kHFSVolumeHardwareLockBit` — bit 7: the volume is locked by hardware.
+///
+/// **Bits 0 through 7, and bit 14, are reserved to implementations.** TN1150: "An
+/// implementation must treat these as reserved fields", and separately "An
+/// implementation may keep a copy of the attributes in memory and use bits 0-7 for
+/// its own runtime flags. As an example, Mac OS uses bit 7,
+/// `kHFSVolumeHardwareLockBit`, to indicate that the volume is write-protected due
+/// to some hardware setting."
+///
+/// So bit 7 has a name and no defined on-disk meaning, and bits 0-6 are the
+/// implementation's own. TN1150 contradicts itself here: the enum in that document
+/// comments "Bits 0-6 are reserved" while the prose beneath it is headed "bits 0-7".
+/// The prose is the one that describes use, and this crate follows it -- which is
+/// also why the volume-header disagreement this project recorded earlier is about
+/// *bit 8*, the first bit with a specified meaning.
 pub const K_HFS_VOLUME_HARDWARE_LOCK_BIT: u32 = 0x0000_0080;
 
 /// `kHFSVolumeUnmountedBit` — bit 8: the volume was cleanly unmounted.
@@ -259,6 +273,19 @@ pub struct VolumeHeader {
     pub attributes: u32,
     /// Implementation version string that last mounted the volume, big-endian
     /// four-character code, e.g. `10.0`.
+    ///
+    /// TN1150 makes this a duty rather than a courtesy: "**Any code which modifies
+    /// the on disk structures must also set this field to a unique value which
+    /// identifies that code.** Third-party implementations of HFS Plus should place
+    /// a registered creator code in this field."
+    ///
+    /// It is also how another implementation finds out it is not alone: values in
+    /// use include `10.0` (Mac OS X), `HFSJ` (a journaled volume) and `fsck` -- the
+    /// last of which `fsck.hfsplus` writes when it repairs a volume, which is why a
+    /// repaired image comes back reporting `fsc.k` here.
+    ///
+    /// **This crate does not set it.** A writer here changes a volume without
+    /// saying so, which leaves the question TN1150 asks the field to answer open.
     pub last_mounted_version: u32,
     /// Allocation block holding the journal info block, or 0 if not journaled.
     ///
@@ -274,9 +301,26 @@ pub struct VolumeHeader {
     pub backup_date: u32,
     /// Last disk-check time, raw Mac OS seconds.
     pub checked_date: u32,
-    /// Number of files in the volume.
+    /// Number of **file** records in the catalog.
+    ///
+    /// TN1150, Volume Header: "The total number of files on the volume. **The
+    /// fileCount field does not include the special files. It should equal the
+    /// number of file records found in the catalog file.**"
+    ///
+    /// "Should", not "must": the field is a count, and a writer that gets it wrong
+    /// produces a volume that reads correctly and reports a wrong number. Which is
+    /// why `fsck.hfsplus` recomputes it rather than believing it.
     pub file_count: u32,
-    /// Number of folders in the volume.
+    /// Number of **folder** records in the catalog, **excluding the root**.
+    ///
+    /// TN1150, Volume Header: "The total number of folders on the volume. **The
+    /// folderCount field does not include the root folder. It should equal the
+    /// number of folder records in the catalog file, minus one** (since the root
+    /// folder has a folder record in the catalog file)."
+    ///
+    /// The root has a folder record like any other; it is the *count* that omits it.
+    /// So a volume holding nothing but its root reports 0, and one holding the root
+    /// and one folder reports 1.
     pub folder_count: u32,
     /// Allocation block size in bytes.
     pub block_size: u32,
@@ -293,6 +337,15 @@ pub struct VolumeHeader {
     /// Next unused catalog node ID (CNID).
     pub next_catalog_id: u32,
     /// Volume write count.
+    /// `writeCount`: how many times the volume has been mounted for writing.
+    ///
+    /// TN1150: "incremented every time a volume is mounted", and "it is very
+    /// important that an implementation or utility change the writeCount field if it
+    /// modifies the volume's structures directly. This is particularly important if
+    /// it adds or deletes items on the volume."
+    ///
+    /// **This crate does not increment it**, which is the same gap as
+    /// [`Self::last_mounted_version`] seen from the other side.
     pub write_count: u32,
     /// Which legacy text encodings have been used on this volume.
     pub encodings_bitmap: u64,

@@ -1347,6 +1347,47 @@ fn renaming_onto_a_name_that_folds_onto_an_existing_one_is_refused() {
 }
 
 #[test]
+fn a_created_file_says_it_has_a_thread_record() {
+    // TN1150: "this bit indicates that the file has a thread record. As all files
+    // in HFS Plus have thread records, **this bit must be set**."
+    //
+    // Without it, a reader may assume there is no thread record and decline to
+    // build the reverse mapping -- so a file created by this crate is findable by
+    // name and not by CNID, which is exactly the asymmetry the thread record
+    // exists to remove.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_file(parent, &units("threaded.bin"))
+                .expect("create");
+            dev.sync().expect("flush");
+        }
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let f = vol
+        .lookup(vol.root_cnid(), &units("threaded.bin"))
+        .expect("lookup")
+        .expect("threaded.bin exists")
+        .as_file()
+        .expect("a file")
+        .record;
+    assert!(
+        f.flags & hfsplus::catalog::record::K_HFS_THREAD_EXISTS_MASK != 0,
+        "a file's record must say its thread record exists; flags were {:#x}",
+        f.flags
+    );
+}
+
+#[test]
 fn a_folder_is_created_and_counted() {
     // `folderCount` excludes the root, which is the kind of off-by-one that only
     // an independent checker notices: a volume with one folder and nothing else

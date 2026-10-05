@@ -363,9 +363,29 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
 
     /// Choose the child node to descend into from an index node.
     ///
+    /// The rule is an **upper bound** over the separators: the child for a key is
+    /// the record whose key is the greatest one not exceeding it. TN1150 states it
+    /// as the search contract in so many words -- "it begins searching at the root
+    /// node. Starting with the first record, it searches for the record with the
+    /// **greatest key that is less than or equal to the search key**. It then moves
+    /// to the child node ... and repeats the same process."
+    ///
+    /// That is worth having in the crate's own words, because the opposite reading
+    /// is equally plausible and was held here for a long time: a separator holds
+    /// the *first* key of the subtree it points at, which makes "the first
+    /// separator greater than or equal to the key" look right too. It is not, and
+    /// against this rule it misses silently -- the search lands on a subtree that
+    /// does not hold the key, and nothing reports it.
+    ///
+    /// TN1150 also explains why a subtree's own first key doubles as its separator,
+    /// which is otherwise surprising: "in a given subtree, there are no keys less
+    /// than the first key of that subtree's root node." So the separator is a lower
+    /// bound on its subtree, and the search takes the separator that is greatest
+    /// among those not above the key.
+    ///
     /// Mining reference: Apple `core/BTree.c` `BTSearchRecord`, which binary
-    /// searches the index records and, for the first key greater than the search
-    /// key, follows its trailing child pointer.
+    /// searches the index records and follows the child pointer of the record it
+    /// lands on.
     fn descend_index(
         &self,
         node: &crate::btree::node::Node<'_>,

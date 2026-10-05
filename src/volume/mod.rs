@@ -76,6 +76,45 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// read-write; this layer is read-only throughout, so that check does not
     /// apply, but the dirty bit is reported by [`Volume::is_clean`] so a caller
     /// can warn.
+    /// What a mount owes the volume, and does not yet.
+    ///
+    /// TN1150, Volume Attributes, states three obligations around mounting, and
+    /// this crate meets none of them. They are recorded here rather than left
+    /// implicit, because each is a field on disk that a reader elsewhere will look
+    /// at:
+    ///
+    /// - `kHFSVolumeUnmountedBit` (bit 8): "An implementation **must clear this bit**
+    ///   on the media when it mounts a volume for writing. An implementation must
+    ///   set this bit on the media as the last step of unmounting a writable volume,
+    ///   after all other volume information has been flushed. **If an implementation
+    ///   is asked to mount a volume where this bit is clear, it must assume the
+    ///   volume is inconsistent**, and do appropriate consistency checking before
+    ///   using the volume."
+    /// - `kHFSBootVolumeInconsistentBit` (bit 11): the same, inverted. Set on mount
+    ///   for writing, cleared as the last step of unmounting.
+    /// - `writeCount`: "incremented every time a volume is mounted... **It is very
+    ///   important that an implementation or utility change the writeCount field if
+    ///   it modifies the volume's structures directly. This is particularly
+    ///   important if it adds or deletes items on the volume.**"
+    ///
+    /// And one that belongs to any *writer* rather than to a mount:
+    ///
+    /// - `lastMountedVersion`: "**Any code which modifies the on disk structures
+    ///   must also set this field to a unique value which identifies that code.**
+    ///   Third-party implementations of HFS Plus should place a registered creator
+    ///   code in this field."
+    ///
+    /// The last one is why `fsck.hfsplus` writes `fsc.k` into it and calls that a
+    /// repair: the field is how another implementation learns that something other
+    /// than Mac OS X has been writing here. A library that changes a volume without
+    /// setting it leaves exactly that question open.
+    ///
+    /// The last item on that list -- clearing bit 8 on mount -- is also why
+    /// [`Self::open`] does not treat a clear bit as fatal today. It reads the bit
+    /// but does not act on it, which is a deliberate gap rather than an oversight:
+    /// the check TN1150 describes is a full consistency pass, and a reader that
+    /// performed one on every open would be far slower than one that does not.
+    ///
     pub fn open(device: &'a D) -> Result<Self> {
         let header = VolumeHeader::read_from(device)?;
         let kind = header.kind()?;
@@ -808,6 +847,12 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 special: 1,
                 ..FileRecord::EMPTY.bsd_info
             },
+            // `kHFSThreadExistsMask`: "this bit indicates that the file has a thread
+            // record. As all files in HFS Plus have thread records, this bit must be
+            // set." (TN1150, Catalog File.) Without it a reader may assume there is
+            // no thread record and refuse to build the reverse mapping, so a file
+            // created without it is findable by name and not by CNID.
+            flags: crate::catalog::record::K_HFS_THREAD_EXISTS_MASK,
             ..FileRecord::EMPTY
         };
         // The thread record, built by hand because its length follows its name and
@@ -2187,10 +2232,24 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// unmount or a header update; a library with no unmount to hang it on has to
     /// write it whenever the header changes.
     ///
+    /// **It does not have to, and TN1150 says it should not.** "The implementation
+    /// should only update this copy when the length or location of one of the
+    /// special files changes." The copy exists so that a repair utility finding the
+    /// primary header unusable can still learn where the special files are; a count
+    /// that has moved is not that kind of information, and the primary holds it.
+    ///
+    /// So this is called from the places that change a fork -- a fork's extents,
+    /// its `totalBlocks` or its `logicalSize` -- and not from `write_header_u32`,
+    /// which is where it lives now. Keeping it on every write is not *wrong* -- the
+    /// two copies then agree, which is what `fsck` wants -- but it is more than the
+    /// specification asks for, and the reason it was done that way is a bug this
+    /// crate had: a catalog that grew left the two headers describing different
+    /// forks, and `fsck.hfsplus` reported "Volume header needs minor repair".
+    ///
     /// Mining reference: `core/hfs_vfsops.c` writes the "alternate volume header
-    /// located at 1024 bytes before end of the partition"; the same file notes that
-    /// where the filesystem size equals the partition size this is the only such
-    /// header worth tracking.
+    /// located at 1024 bytes before end of the partition"; TN1150, Volume Header,
+    /// for when it should be written and that it is "intended for use solely by disk
+    /// repair utilities".
     fn sync_backup_header(&mut self) -> Result<()> {
         let volume_bytes = u64::from(self.header.total_blocks) * u64::from(self.header.block_size);
         if volume_bytes <= 1024 {
