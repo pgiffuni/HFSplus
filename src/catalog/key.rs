@@ -231,6 +231,50 @@ mod tests {
     use super::*;
     use crate::catalog::cnid::Cnid;
 
+    /// A key must survive the on-disk encoding and come back identical.
+    ///
+    /// This is the question a case-folding search depends on. A folded lookup
+    /// builds its search key by encoding a `CatalogKey` and decoding it again --
+    /// `CatalogKey::from_record(&key.to_record(), max)` -- because that is the only
+    /// constructor that goes through the same bytes the tree stores. If that round
+    /// trip changed anything, the folded lookup would be searching for a key that is
+    /// not the one it was asked for, and would report "no such key" for a key that is
+    /// demonstrably there.
+    ///
+    /// The names below include one of even length and one of odd length in *code
+    /// units*, because that is where `to_record`'s pad byte would appear if it
+    /// appeared at all -- and the answer turns out to be that it never does, since a
+    /// UTF-16 name is always a whole number of two-byte units.
+    #[test]
+    fn a_key_survives_being_encoded_and_decoded_again() {
+        for name in [
+            "".to_string(),
+            "a".to_string(),
+            "ab".to_string(),
+            "README.TXT".to_string(),
+            "Readme.txt".to_string(),
+            "\u{4f60}\u{597d}".to_string(),
+            "\u{1f600}".to_string(),
+        ] {
+            let key = CatalogKey::for_child(Cnid(2), &name.encode_utf16().collect::<Vec<_>>());
+            let bytes = key.to_record();
+            assert_eq!(
+                bytes.len() % 2,
+                0,
+                "an encoded key must be a whole number of bytes, for {name:?}"
+            );
+            let back = CatalogKey::from_record(&bytes, 516).expect("decode");
+            assert_eq!(back.parent_id, key.parent_id, "parentID, for {name:?}");
+            assert_eq!(back.name, key.name, "name, for {name:?}");
+            assert_eq!(back.key_length, key.key_length, "keyLength, for {name:?}");
+            assert_eq!(
+                back.on_disk_size(),
+                key.on_disk_size(),
+                "and therefore the size, for {name:?}"
+            );
+        }
+    }
+
     #[test]
     fn key_offsets_match_the_struct() {
         // u16 keyLength, u32 parentID, HFSUniStr255{u16 length, UniChar[255]}

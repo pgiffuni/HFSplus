@@ -394,12 +394,45 @@ a re-key the insert finds the very record that is about to leave and refuses it 
 duplicate, so this case has to remove first, and the bytes are already read so a
 failure puts them straight back.
 
-Not implemented, and the reason is recorded rather than guessed: doing the remove
-first made the *removal* fail to find the record. That is the next thing to work out,
-and it is not a matter of a missing comparison — `catalog_record_bytes` matches names
-exactly and the source spelling is the one stored. Something else in the re-key path is
-wrong, and an attempt that removed the record and then failed to put it back was
-reverted rather than kept.
+Not implemented, after two attempts, both reverted. What they showed is worth more
+than a third attempt without the two facts below.
+
+- **The committed tree already refuses the case-folded collision, and loses
+  nothing.** `renaming_onto_a_name_that_folds_onto_an_existing_one_is_refused` pins
+  that, so the hazard is a property to keep rather than a bug to chase.
+- **A key survives being encoded and decoded again.**
+  `a_key_survives_being_encoded_and_decoded_again` settles it: `parentID`, the name
+  and `keyLength` all come back identical, for an empty name, one of odd and even
+  code-unit length, CJK, and an astral character.
+
+That second fact was the *suspected* cause — a folded lookup builds its search key
+by going through the on-disk encoding, and if that round trip changed anything the
+lookup would be searching for a key that is not the one it was asked for. It does
+not change anything. The hypothesis is wrong, and ruling it out is worth as much as
+having had it. (It also settles a smaller thing: `to_record`'s pad byte never
+appears, because a UTF-16 name is a whole number of two-byte units and the prefix is
+even, so an encoded key is always an even number of bytes.)
+
+So the remaining explanation is in the *lookup*, not the key. Two observations
+constrain it, from the same run:
+
+- The removal failed with "catalog record to remove" for a record the folded lookup
+  had just found under the *other* spelling. `remove_catalog_record` looks a record
+  up twice — once by exact key, then again after `leaf_for` re-locates the leaf — and
+  reports `NotFound` if either fails. So either the exact lookup missed, which
+  contradicts the record being there, or `leaf_for` returned a leaf whose contents do
+  not hold it. The second is the more interesting one: a folded search landing on the
+  wrong leaf is exactly the failure mode that made `lookup_cnid` miss files, and the
+  fix there was in the bound rather than in the key.
+- A rename onto the same case-folded name was then *accepted*, producing a second
+  record under a key the tree considers equal to an existing one. It did not
+  reproduce on the committed tree, so it is not evidence of a live bug — but it was
+  observed, and an observation that did not reproduce should be recorded rather than
+  forgotten.
+
+A third attempt should instrument `remove_catalog_record`'s two lookups rather than
+change anything, and only then decide whether `leaf_for` can return a leaf that does
+not contain the record it was asked for.
 
 ## What Milestone 8 has and has not reached
 
