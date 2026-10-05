@@ -1092,6 +1092,102 @@ fn a_case_variant_rename_is_a_rekey_rather_than_a_move() {
 }
 
 #[test]
+fn a_folder_cannot_be_moved_beneath_itself_or_its_own_descendants() {
+    // Moving `/a/b/c` into `/a/b/c` makes the path to `/a/b/c` run through itself,
+    // and every lookup afterwards would have to decide where to stop. Apple refuses
+    // the obvious cases outright and then walks the destination path back to the
+    // root; both halves are here, because the walk is what catches a grandparent.
+    //
+    // Each case gets a *fresh* volume. That is not tidiness: a case that moves a
+    // folder changes the tree the next case is reasoning about, and an earlier
+    // version of this test reused one volume and so asserted that two of the
+    // refusals were allowed -- correctly, for the tree as it then stood.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let (a, b, c) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let a = writable.create_folder(parent, &units("a")).expect("a");
+            let b = writable.create_folder(a, &units("b")).expect("a/b");
+            let c = writable.create_folder(b, &units("c")).expect("a/b/c");
+            (a, b, c)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+    assert!(
+        c > b && b > a,
+        "CNIDs are allocated in order, and this depends on it"
+    );
+
+    // The three illegal moves, each refused with the reason.
+    for (desc, from_parent, from_name, to_parent) in [
+        // /a/b/c: `c` into `c` is into itself; `b` into `c` is into its own
+        // child; `a` into `c` is into its own grandchild. The last two are what the
+        // walk up the destination path is for -- neither is caught by comparing the
+        // folder with the destination alone.
+        ("into itself", b, "c", c),
+        ("into its own child", a, "b", c),
+        ("into its own grandchild", parent, "a", c),
+    ] {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let err = writable
+                .rename(from_parent, &units(from_name), to_parent, &units("x"))
+                .expect_err("this move must be refused");
+            assert!(
+                format!("{err}").contains("above it"),
+                "the refusal for {desc} must explain the cycle; got: {err}"
+            );
+        }
+    }
+
+    // And the two legal ones, which the check must not over-reach and refuse.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .rename(b, &units("c"), parent, &units("up"))
+                .expect("a folder may move up to the root");
+            // From its *new* home, into the folder that used to be above it --
+            // legal, and the case the cycle check must not over-reach on.
+            writable
+                .rename(parent, &units("up"), a, &units("sideways"))
+                .expect("a folder may move into a former ancestor");
+            dev.sync().expect("flush");
+        }
+    }
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    // Both legal moves landed, the second having replaced the first: the folder is
+    // now `/a/sideways`, having gone `/a/b/c` -> `/up` -> `/a/sideways`.
+    assert!(
+        vol.lookup(hfsplus::catalog::cnid::Cnid(a), &units("sideways"))
+            .expect("lookup")
+            .is_some(),
+        "the folder must be at its final home"
+    );
+    assert!(
+        vol.lookup(hfsplus::catalog::cnid::Cnid(c), &units("x"))
+            .expect("lookup")
+            .is_none(),
+        "none of the refused moves may have left a record behind"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "folder moves, three refused and two allowed");
+}
+
+#[test]
 fn renaming_onto_a_name_that_is_taken_is_refused() {
     // `EEXIST`, not an overwrite. Apple allows the same-parent case, where it
     // becomes an exchange; a cross-parent collision is refused outright.

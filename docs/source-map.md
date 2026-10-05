@@ -357,7 +357,7 @@ compression metadata (7B.2) are done and appear above.
 | --- | --- | --- |
 | Catalog record updates | `core/hfs_catalog.c` `cat_update`, `catrec_update`, `buildrecord`; `core/hfs_xattr.c` | Milestone 9B |
 | A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | done |
-| Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | Milestone 9B |
+| Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | Hard links | `core/hfs_catalog.c` `cat_createlink`, `cat_lookuplink`, `cat_lookup_siblinglinks`, `cat_lookup_lastlink` | Milestone 10 |
 | Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
@@ -415,6 +415,17 @@ looked like a lookup problem, and the answer was one line of control flow that a
 careful read of the diff would have found immediately. Two failed attempts produced a
 *sharper* hypothesis than either, and it was the control flow -- but the cheapest
 next step after the first failure was to read what had just been written.
+
+A folder may also not be moved beneath itself or any of its own descendants.
+`cat_rename` refuses the obvious cases outright -- the root, the destination folder
+itself, and the destination's own parent -- and then traverses the destination path
+"all the way back to the root making sure that source directory is not encountered".
+The walk goes up through thread records, since those are the only place a folder
+records its parent, and it is bounded by depth rather than by a visited set: a
+corrupted cycle in the thread records would otherwise loop forever, and a depth bound
+answers "not an ancestor", which leaves the caller's own check to catch it. Only two
+of the three illegal moves are caught by comparing the folder with the destination
+alone, which is what the walk is for.
 
 A re-key also needs the steps the other way round, because the two spellings are one
 key to the tree: inserting the new one before removing the old finds the record that

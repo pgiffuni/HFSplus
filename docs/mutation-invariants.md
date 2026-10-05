@@ -324,9 +324,7 @@ What is *not* yet true of any mutation here:
   That is why growth and shrinking stay inside the eight inline extent slots, and
   why a rename *removes and re-inserts* rather than rewriting a key in place: a new
   name is a different length.
-- **A folder is never moved beneath itself or one of its own descendants.** The
-  check walks the destination path back to the root looking for the source
-  directory; nothing here does.
+
 - **No journal.** `WritableVolume::open` refuses a journaled volume, so every
   mutation above runs on a volume with no journal. The checker therefore never
   has to reason about a transaction it did not write.

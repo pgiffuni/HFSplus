@@ -1044,6 +1044,51 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.replace_catalog_body(cnid, &body)
     }
 
+    /// Whether `candidate` is `cursor` or one of the folders above it.
+    ///
+    /// Walks up from `cursor` through thread records, which are the only place a
+    /// folder records its parent, and stops at the root.
+    ///
+    /// The walk is bounded by the depth rather than by a visited set: a corrupted
+    /// cycle in the thread records would otherwise loop forever, and a depth bound
+    /// turns that into "not an ancestor", which is the answer that leaves the
+    /// caller's own check to catch it.
+    ///
+    /// Mining reference: `core/hfs_catalog.c` `cat_rename` traverses the destination
+    /// path "all the way back to the root making sure that source directory is not
+    /// encountered", after refusing the obvious cases outright -- the root, the
+    /// destination directory itself, and the destination's own parent.
+    fn folder_is_ancestor(&self, candidate: u32, cursor: u32) -> Result<bool> {
+        use crate::catalog::cnid::Cnid;
+        use crate::catalog::lookup::Catalog;
+        use crate::catalog::record::CatalogRecord;
+
+        let catalog = Catalog::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let mut cursor = cursor;
+        // A path cannot be longer than the number of objects in the catalog, and
+        // one folder per level is the shape; 64 is generous for a real volume and
+        // small enough to be a hard stop.
+        let mut budget = 64u32;
+        while cursor > ROOT_FOLDER_ID.0 && budget > 0 {
+            budget -= 1;
+            let Some(CatalogRecord::Thread(thread)) = catalog.lookup(Cnid(cursor), &[])? else {
+                // No thread record, so no parent is recorded and the walk ends here.
+                return Ok(false);
+            };
+            let parent = thread.parent_id.0;
+            if parent == candidate {
+                return Ok(true);
+            }
+            cursor = parent;
+        }
+        Ok(false)
+    }
+
     /// Create an empty folder called `name` in `parent`, and return its CNID.
     ///
     /// The same shape as [`Self::create_file`] with a folder record and a folder
@@ -1242,6 +1287,33 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             }
             Some(u32::from_be_bytes([body[8], body[9], body[10], body[11]]))
         };
+        // A folder may not be moved beneath itself.
+        //
+        // Moving `/a` into `/a/b` would make the path to `/a` run through `/a`, and
+        // every lookup of it afterwards would have to decide where to stop. Apple
+        // refuses the obvious cases outright -- the root, the destination folder
+        // itself, and the destination's own parent -- and then walks the destination
+        // path back to the root looking for the folder being moved.
+        //
+        // Refused before anything is written, because a rename that has already
+        // inserted the new record and then discovers the cycle has left the volume
+        // with two records for one object.
+        if is_folder && from_parent != to_parent {
+            if cnid == ROOT_FOLDER_ID.0 {
+                return Err(Error::invalid("rename", "the root folder cannot be moved"));
+            }
+            if cnid == to_parent || self.folder_is_ancestor(cnid, to_parent)? {
+                return Err(Error::invalid(
+                    "rename",
+                    format!(
+                        "CNID {cnid} is the destination folder or one of the folders \
+                         above it, so moving it there would make the path to it run \
+                         through itself"
+                    ),
+                ));
+            }
+        }
+
         let folded = self.catalog_record_bytes_folded(&new_key)?;
         let rekey = from_parent == to_parent
             && folded.as_deref().and_then(identity) == identity(&old_record);
