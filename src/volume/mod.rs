@@ -3662,8 +3662,21 @@ pub const K_HFS_THREAD_EXISTS_MASK: u16 = 0x0002;
 /// something to write through, only a second name to read by.
 pub const UF_IMMUTABLE: u8 = 0x0002;
 
-/// `kHardLinkFileType` -- `'hlnk'`, in a hard link's FinderInfo.
-pub const K_HARD_LINK_FILE_TYPE: u32 = 0x686C_6C6E;
+/// `kHardLinkFileType` -- `'hlnk'`, in a hard link's **`userInfo`**.
+///
+/// Which is `FileInfo` at offset 48 and *not* `finderInfo`, the `ExtendedFileInfo`
+/// at 64, which has no type or creator fields. `lib_fsck_hfs` decides a file record
+/// is a link from `userInfo.fdType == kHardLinkFileType &&
+/// userInfo.fdCreator == kHFSPlusCreator`, and a record that fails that test is
+/// treated as an ordinary file -- whose `special` is then read as a link *count*,
+/// and a count of 17 produces "File has incorrect number of links (It should be 1
+/// instead of 17)".
+///
+/// Worth stating because the value does not read as letters. An earlier version of
+/// this constant was `0x686C_6C6E`, which is `'hlln'` -- two nibbles transposed,
+/// in the same edit that fixed an overflow in the literal. Nothing in the source
+/// would have shown it; decoding the bytes out of a generated image did.
+pub const K_HARD_LINK_FILE_TYPE: u32 = 0x686C_6E6B;
 
 /// `kHFSPlusCreator` -- `'hfs+'`, in a hard link's FinderInfo.
 pub const K_HFS_PLUS_CREATOR: u32 = 0x6866_732B;

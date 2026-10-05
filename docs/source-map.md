@@ -886,12 +886,69 @@ count check and breaks the bucketing, which is the trade this crate made two rou
 ago and reverted; setting it to the CNID satisfies the bucketing and the count check
 complains. **Both values were measured, in both directions.**
 
-The one step that would finish it is small: read the function in
-`lib_fsck_hfs/dfalib/HardLinkCheck.c` that emits "File has incorrect number of links"
-and see which record and which field it reads for a record it has already decided is
-a link. That is one function, and it is not in the part of the file this crate has
-needed so far. Everything else -- the model, the ordering, every field value, and the
-two corrections above -- is settled and recorded.
+Reading that function settled two of the three, and the third was a typo.
+
+**What "File has incorrect number of links" actually checks.** `CatalogCheck.c`:
+
+```c
+if (((file->bsdInfo.fileMode & S_IFMT) == S_IFREG) &&
+    gScavGlobals->filelink_priv_dir_id != key->parentID &&
+    file->bsdInfo.special.linkCount > 1 &&
+    isjrnl == 0) {
+```
+
+It is inside `if (islink == 0)`. So it never complains about a link's reference at
+all -- it complains about a record fsck **did not recognise as a link** whose
+`special` is greater than one. Every appearance of that message was the same fact:
+the link was not being seen as a link.
+
+And what decides that, in the same function:
+
+```c
+if (file->userInfo.fdType == kHardLinkFileType  &&
+    file->userInfo.fdCreator == kHFSPlusCreator) {
+        islink = 1;
+```
+
+**`userInfo`** -- the `FileInfo` at offset 48, which is where the type and creator
+live. Three earlier attempts wrote them into `finderInfo` (the `ExtendedFileInfo` at
+64), which has no such fields, so nothing recognised the record.
+
+**And a typo, which is the actual reason nothing recognised it.** The constant was
+
+```rust
+pub const K_HARD_LINK_FILE_TYPE: u32 = 0x686C_6C6E;   // "hlln"
+```
+
+`'hlnk'` is `0x686C_6E6B`. Two nibbles were transposed, in a commit that was fixing
+an unrelated overflow in the same literal -- so the "fix" for one mistake introduced
+another, and it was invisible in the source because a hex constant does not read as
+letters. Decoding the bytes is what caught it.
+
+With the type and creator in the right place and spelled right, both the flags
+clearing and the link-count complaint are gone. What remains is one message:
+
+```
+** Checking multi-linked files.
+   Incorrect number of file hard links
+```
+
+which is `RecordBadLinkCount` in `HardLinkCheck.c`: the inode's
+`bsdInfo.special.linkCount` against the number of links the checker found pointing at
+it (`li->linkCount`, which `hash_insert` initialises to 1 and each further link
+increments). The inode is written with 1 and there is one link, so the two should
+agree -- which means a link is being counted twice, most likely once by
+`hardlink_add_bucket` in the verification pass and once by `CaptureHardLink` in the
+catalog pass, or the chain is being entered under two references. That is one
+function and one call site.
+
+**What this round is worth beyond the fix.** Two of the four failed attempts were
+not chasing the format at all. One was reading the wrong field for the link's
+identity, and one was a mistyped constant. Both presented as "the checker disagrees
+about a structure I have read three times", and neither would have been found by
+reading the sources more carefully -- one needed TN1150's plain statement of where
+the type lives, and the other needed the bytes decoded out of the image. Three
+rounds of theorising about a union member would not have found either.
 
 ### Every attempt rolled back
 
