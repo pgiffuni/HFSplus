@@ -481,12 +481,9 @@ claim to believe. **A file hard link is a name, not a second owner of the data.*
 Both forks on the link's record must be empty. Fixing that removed the overlap *and*
 the free-block-count complaint, and is worth keeping whatever else happens.
 
-### What actually blocks it -- corrected, after mining `hfs_link.c`
+### What mining `hfs_link.c` established, and what a measurement then changed
 
-An earlier version of this section concluded that the link's `hl_linkReference`
-"is not in the link's own record ... the reference lives in the private hardlinks
-directory, keyed by the indirect node's CNID". **That was wrong**, and reading
-`core/hfs_link.c` says so in its own first comment:
+`core/hfs_link.c`'s first comment says where the chain head lives:
 
 ```c
 /*
@@ -504,35 +501,89 @@ const char *hfs_private_names[] = {
 static int  setfirstlink(struct hfsmount * hfsmp, cnid_t fileid, cnid_t firstlink);
 ```
 
-So the three facts, and they are different from what the fsck output alone suggested:
+So three facts, and they are *different* from what a checker's output alone
+suggested:
 
-- **The reference stays in the link record.** `hl_linkReference` is
-  `bsdInfo.special.iNodeNum` and `cat_createlink` sets it to the indirect node.
-  That was never in doubt; what was wrong was the *reason* fsck objected.
 - **Link records live in a private folder, named by their own CNID.**
-  `HFSPLUSMETADATAFOLDER` is `"\xE2\x90\x80\xE2\x90\x80\xE2\x90\x80\xE2\x90\x80HFS+ Private Data"`
-  and `HFSPLUS_DIR_METADATA_FOLDER` is `".HFS+ Private Directory Data\xd"`.
-  `hfs_makelink` *renames* a link inode into that folder, and
-  `cat_lookup_siblinglinks` special-cases a link whose parent is the file
-  hardlinks folder to report `next = hl_firstLinkID`. So a link record left in an
-  ordinary folder is not where `fsck` -- or Apple -- expects to find the chain.
+  `HFSPLUSMETADATAFOLDER` is four U+2500 BOX DRAWINGS LIGHT HORIZONTAL followed by
+  "HFS+ Private Data" -- 21 UTF-16 units, 29 UTF-8 bytes.
+  `HFSPLUS_DIR_METADATA_FOLDER` is ".HFS+ Private Directory Data" plus CR. The
+  trailing CR is in Apple's definition and is precisely what gets lost transcribing a
+  `#define` into a doc comment and back, so both names are asserted in the tests.
+  `hfs_makelink` *renames* a link inode in there rather than leaving it where the
+  user asked for it, and `cat_lookup_siblinglinks` special-cases a link whose parent
+  is that folder.
 - **The chain head is marked on the first link, pointing at itself.**
-  `hfs_makelink` sets `cp->c_attr.ca_firstlink = linkcnid` after
-  `cp->c_desc.cd_cnid = linkcnid`, so the head link's `hl_firstLinkID`
-  (`reserved1`) is its own CNID. *Directory* links instead put the head in an
-  extended attribute, `com.apple.system.hfs.firstlink`, holding the CNID as a
-  **decimal string** -- `snprintf(..., "%lu", firstlink)`.
+  `hfs_makelink` sets `ca_firstlink = linkcnid` immediately after
+  `cd_cnid = linkcnid`.
+- **Only *directory* links use an extended attribute** for the head:
+  `com.apple.system.hfs.firstlink`, holding the CNID as a **decimal string** --
+  `snprintf(..., "%lu", firstlink)`.
 
-That last pair is the likely explanation for the count complaints: with the link
-sitting in an ordinary folder and no head marked anywhere, `fsck` could not find a
-chain to reconcile the counts against, and reported both records as wrong rather
-than either as unreachable.
+### Three corrections, measured
 
-So the first thing Milestone 10 must do is not "write a link record". It is to
-create the private hardlinks folder with Apple's exact name, and put the link
-record *in* it under its own CNID, with `reserved1` pointing at itself. Until those
-three exist the count is unfixable, and guessing at their shape is what produced
-two wrong conclusions in this section already.
+A first attempt at `create_hard_link` got three things wrong, each caught by
+`fsck.hfsplus`:
+
+- **A regular file's `linkCount` is 1, not 0.** `special` is `hl_linkCount` on a
+  record that is not a link, and Apple says "set linkCount to 1 for regular files".
+  Zero is not "no links" so much as "never counted" -- and it silently disables a
+  guard of the form "refuse if the count is above 1". Fixed.
+- **The user's folder gains no catalog child.** The link's record lives in the
+  private folder, so there is nothing in the folder the user named to count.
+  Bumping it as well makes `fsck` report "Invalid directory item count (It should be
+  3 instead of 4)" for the root. Fixed.
+- **A link's `special` is 1, not the reference.** `fsck` reads a link record's count
+  out of that same union member and reports "It should be 1 instead of 17" when it
+  holds the reference. So a link does not carry `hl_linkReference` there, which
+  contradicts `#define hl_linkReference bsdInfo.special.iNodeNum`. **Unresolved.**
+
+One more, from the very first attempt: **a link's forks must be empty.** Copying
+the target's extents into the link's record makes two catalog records describe the
+same blocks -- allocated once, claimed twice -- which is "Overlapped extent
+allocation", and which nothing on the way back can adjudicate. A link is a *name*,
+not a second owner of the data.
+
+### What is still missing, precisely
+
+With all four fixed, **every count complaint disappears**. `fsck` reports only
+
+```
+File record has hard link chain flag (id = 19)
+```
+
+and then repairs the image, with no complaint attached. Diffing the repair against
+the original shows what it does:
+
+```
+offset 111601 (catalog block 27, within 1009):  ours=0x20  fsck=0x00
+```
+
+`0x20` is `kHFSHasLinkChainMask`, in the middle of a catalog record. So `fsck`
+**clears the chain flag**: it does not accept the record as a link, and it does so
+quietly, which is worse than a complaint. (The other eight differing bytes are
+`fsck` writing its own "fsc.k" signature into the primary and backup volume headers,
+which is not a repair at all.)
+
+| | |
+| --- | --- |
+| The private folder | created, Apple's exact name, `fsck` accepts it with **zero** differences |
+| The link's location | inside the private folder, named by its own CNID in decimal |
+| Its forks | empty |
+| `hl_firstLinkID` | the head link points at itself |
+| `hl_linkReference` | `special` per `hfs_format.h`, but `fsck` reads `1` there -- **unresolved** |
+
+So `create_hard_link` is **not** written. The folder it needs is, and the link-count
+fix that came out of the attempt is, but a writer whose records `fsck` quietly
+rewrites is not something to ship.
+
+The next step is the unresolved row, and the way in is the diff: `fsck` is deleting
+the chain flag, so it does not think that record is a link. That points at the
+*flags* or the record's position rather than at `special` -- and the first thing to
+re-examine is whether the record is where `fsck` looks for one. `hfs_makelink`'s
+rename is into `hfs_private_desc[FILE_HARDLINKS]`, and `cat_lookup_siblinglinks`
+identifies such a link by its *parent* being that folder's CNID, so a link whose
+parent is anything else is not a link as far as Apple is concerned either.
 
 ### A trap worth naming
 
