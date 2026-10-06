@@ -35,18 +35,25 @@
 //! - [`write_journal_header`] encodes and stores the header at byte zero of the
 //!   journal.
 //!
-//! The commit path is wired in but not yet called by the mutating write paths:
-//! a volume this crate mutates stays **non-journalled**, and
-//! [`crate::volume::WritableVolume`] still refuses a journalled volume rather
-//! than pretending to write one — not from lack of machinery, but because
-//! every mutation must be re-expressed to write through the transaction buffer
-//! instead of the home block, which is a change to all of them at once.
+//! The commit path is wired in and called by every mutating write path in
+//! [`crate::volume::WritableVolume`]. Each public mutation method begins a
+//! journal transaction, routes all disk writes through
+//! [`crate::volume::WritableVolume::journal_write`] (which records before-images
+//! in the [`TransactionBuffer`] before mutating home blocks), and commits via
+//! [`end_transaction`](crate::volume::WritableVolume::end_transaction) →
+//! [`commit_transaction`]. On failure the transaction is abandoned without
+//! advancing the journal header, so uncommitted writes are invisible to replay.
+//!
+//! A journaled volume can be opened for writing: [`crate::volume::WritableVolume`]
+//! reads the journal info block and header during [`open`](crate::volume::WritableVolume::open)
+//! and stores them in a [`JournalState`](crate::volume::JournalState) that
+//! [`TransactionBuffer`] fills on the first mutation.
 //!
 //! That has a measurable consequence for verification, and it is not a subtlety:
 //! `fsck.hfsplus` prints "Checking Journaled HFS Plus volume" or "Checking
 //! non-journaled HFS Plus Volume" and takes a **different code path** either way.
-//! Every volume this crate writes is checked along the non-journalled path, which
-//! is not the path a real volume would be checked along.
+//! Volumes this crate writes are now checked along the journalled path, which
+//! is the path a real macOS volume takes.
 //!
 //! # What a transaction is, and the one invariant that is easy to get wrong
 //!

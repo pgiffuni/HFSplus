@@ -1742,23 +1742,15 @@ pub fn encode_transaction(
 
     // The capacity is set by the journal block the list lives in, not by a constant:
     // a list is one `blhdr_size` block, and its `binfo` array has to fit inside it.
-    // `MAX_BLOCKS_PER_LIST` is Apple's ceiling on that array, and a block smaller
-    // than that gives a smaller one -- which is the whole reason `blhdr_size` is
-    // carried in the journal header.
-    let capacity = blhdr_size.saturating_sub(BLHDR_PREFIX_SIZE) / BLOCK_INFO_SIZE;
+    // `MAX_BLOCKS_PER_LIST` is Apple's ceiling on that array: Apple clamps the
+    // capacity rather than rejecting, so a 4096-byte block (which would hold 255
+    // entries) is capped at 127 the same way macOS clamps it.
+    let capacity =
+        (blhdr_size.saturating_sub(BLHDR_PREFIX_SIZE) / BLOCK_INFO_SIZE).min(MAX_BLOCKS_PER_LIST);
     if capacity <= FIRST_BLOCK_INDEX {
         return Err(Error::invalid(
             "blhdr_size",
             format!("{blhdr_size} bytes cannot hold a block list header and a block"),
-        ));
-    }
-    if capacity > MAX_BLOCKS_PER_LIST {
-        return Err(Error::invalid(
-            "blhdr_size",
-            format!(
-                "{blhdr_size} bytes would hold {capacity} entries, above Apple's \
-                 maximum of {MAX_BLOCKS_PER_LIST}"
-            ),
         ));
     }
     // Entries, not blocks: the sequence slot takes one of them.

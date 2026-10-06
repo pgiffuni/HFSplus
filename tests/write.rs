@@ -2309,6 +2309,163 @@ fn a_journaled_volume_accepts_writes() {
 }
 
 #[test]
+fn a_journaled_write_advances_the_journal_sequence() {
+    // A write on a journaled volume must be captured in a journal transaction:
+    // the journal header's sequence_num must advance.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    // Capture the journal state before any write.
+    let (seq_before, end_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let journal = vol.journal().expect("read journal");
+        match journal {
+            Some(j) => match j.header() {
+                Some(h) => (h.sequence_num, h.end),
+                None => (0, 0),
+            },
+            None => (0, 0),
+        }
+    };
+
+    // Look up a specific file by name.
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+
+    // Perform a write on the journaled volume.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        assert!(writable.is_journaled(), "the volume should be journaled");
+        writable
+            .write_file_contents(cnid, b"journaled write test data")
+            .expect("write should succeed on a journaled volume");
+        dev.sync().expect("flush");
+    }
+
+    // Reopen and verify the journal advanced.
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let journal = vol.journal().expect("read journal after write");
+    let Some(journal) = journal else {
+        panic!("a journaled volume must still have a journal after a write");
+    };
+    let header = journal
+        .header()
+        .expect("journal should have a header after a write");
+    assert!(
+        header.sequence_num > seq_before || header.end != end_before,
+        "the journal header must advance after a committed write: \
+         before seq={} end={} vs after seq={} end={}",
+        seq_before,
+        end_before,
+        header.sequence_num,
+        header.end,
+    );
+    assert!(
+        !journal.is_clean(),
+        "a committed write leaves the journal dirty (start != end)"
+    );
+}
+
+#[test]
+fn a_journaled_write_is_durable_after_reopen() {
+    // Perform a write on a journaled volume, then verify the data survives
+    // a close/reopen cycle — proving the transaction was committed to disk.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    // Look up a specific file by name.
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+
+    let test_data = b"durable journaled write data";
+
+    // Perform the write on the journaled volume.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_file_contents(cnid, test_data)
+            .expect("write should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Reopen and verify the data is readable from the home blocks directly.
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("the file must exist after the journaled write");
+    let read_back = vol
+        .read(&obj, 0, test_data.len())
+        .expect("read back after reopen");
+    assert_eq!(
+        read_back,
+        test_data.as_slice(),
+        "the written data must survive a close/reopen cycle on a journaled volume"
+    );
+}
+
+#[test]
+fn a_failed_journaled_write_does_not_modify_the_image() {
+    // A write that fails (e.g. writing to a CNID that does not exist) must
+    // not commit any journal transaction: the before-images captured so far
+    // are abandoned, the journal header is not advanced, and the volume
+    // remains byte-identical to before the attempt.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let before = std::fs::read(&path).expect("read image");
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let err = writable
+            .write_file_contents(99999, b"this CNID does not exist")
+            .expect_err("CNID 99999 must not exist");
+        assert!(
+            matches!(err, hfsplus::Error::NotFound { .. }),
+            "an invalid CNID must be NotFound, got {err:?}"
+        );
+        dev.sync().expect("flush");
+    }
+
+    // The image must be byte-identical: no transaction was committed.
+    let after = std::fs::read(&path).expect("read image after failed write");
+    assert_eq!(
+        before, after,
+        "a failed write on a journaled volume must not modify the image"
+    );
+}
+
+#[test]
 fn a_missing_cnid_is_reported_rather_than_writing_something_else() {
     // A CNID that is not in the catalog must not resolve to whatever record does
     // exist. The leaf walk is bounded by the node count, so a corrupted `fLink`
