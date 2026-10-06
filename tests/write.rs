@@ -2292,23 +2292,20 @@ fn growing_into_a_full_volume_reports_no_space_and_writes_nothing() {
 }
 
 #[test]
-fn a_journaled_volume_is_refused_for_mutation() {
-    // Not because writing is impossible -- but because a write that is not
-    // journalled leaves a journal that does not describe the volume, which is the
-    // exact failure the journal exists to prevent. Journalled writes come later.
+fn a_journaled_volume_accepts_writes() {
+    // A journaled volume now accepts writes through `WritableVolume::open`.
+    // The journal state is read and stored, and each mutation will be wrapped in
+    // a transaction that commits before-images to the journal ring.
     let Some(path) = copy_fixture("journal-with-attributes") else {
         return;
     };
-    let before = std::fs::read(&path).expect("read image");
 
-    let mut dev = FileDevice::open(&path).expect("open");
-    let err = WritableVolume::open(&mut dev).expect_err("a journaled volume must be refused");
-    let rendered = format!("{err}");
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    let writable = WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
     assert!(
-        rendered.contains("journal"),
-        "the refusal must say why, not merely fail; got: {rendered}"
+        writable.is_journaled(),
+        "the volume should report as journaled"
     );
-    assert_untouched(&path, &before, "the refusal of a journaled volume");
 }
 
 #[test]
