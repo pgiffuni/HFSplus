@@ -210,6 +210,76 @@ fn digest(bytes: &[u8]) -> u64 {
 // --- The writable trust boundary ------------------------------------------
 
 #[test]
+fn volume_getxattr_reads_an_inline_attribute() {
+    let path = common::image("journal-with-attributes");
+    if !path.exists() {
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
+
+    // CNID 18 is the file with the test attributes.
+    let file = vol
+        .lookup_cnid(OWNER.into())
+        .expect("lookup by cnid")
+        .expect("CNID 18 must exist");
+
+    // The inline attribute should be readable.
+    let val = vol
+        .getxattr(&file, INLINE_NAME)
+        .expect("getxattr")
+        .expect("inline attribute must be present");
+    assert_eq!(&val[..], INLINE_VALUE);
+
+    // A non-existent attribute returns None, not an error.
+    let missing = vol
+        .getxattr(&file, "com.apple.does.not.exist")
+        .expect("getxattr on missing name");
+    assert!(missing.is_none());
+}
+
+#[test]
+fn volume_listxattr_lists_all_attributes_on_a_file() {
+    let path = common::image("journal-with-attributes");
+    if !path.exists() {
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
+
+    let file = vol
+        .lookup_cnid(OWNER.into())
+        .expect("lookup by cnid")
+        .expect("CNID 18 must exist");
+
+    let mut names = vol.listxattr(&file).expect("listxattr");
+    names.sort();
+    let mut expected = vec![INLINE_NAME.to_string(), FORKED_NAME.to_string()];
+    expected.sort();
+    assert_eq!(names, expected, "both attributes must be listed");
+}
+
+#[test]
+fn volume_getxattr_on_a_volume_without_attributes_returns_none() {
+    let path = common::image("basic-hfsplus");
+    if !path.exists() {
+        return;
+    }
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
+
+    let root = vol
+        .lookup_cnid(vol.root_cnid())
+        .expect("lookup root")
+        .expect("root must exist");
+
+    let result = vol.getxattr(&root, "anything").expect("getxattr");
+    assert!(result.is_none(), "no attributes on this volume");
+}
+
+// --- The writable trust boundary ------------------------------------------
+
+#[test]
 fn a_writable_view_records_whether_a_journal_was_replayed() {
     // `Volume::open` replays the journal when there is one, and does not when the
     // journal lives on another device or there is none. A writer needs to know
@@ -221,10 +291,9 @@ fn a_writable_view_records_whether_a_journal_was_replayed() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
-    // This volume *is* journaled, and `WritableVolume::open` refuses one -- so the
-    // fact that a journal was replayed can now only be observed on the read-only
-    // path. The refusal is asserted in `opening_for_mutation_does_not_bypass_
-    // the_journal_check`; what matters here is that the fact is still reachable.
+    // This volume *is* journaled, and the journal was replayed in the read-only
+    // view, so the writable view must record that fact -- the writer works through
+    // a journal transaction rather than writing the catalog directly.
     let mut dev = FileDevice::open(&path).expect("open");
     let vol = hfsplus::volume::Volume::open(&dev).expect("mount");
     assert!(
@@ -232,10 +301,15 @@ fn a_writable_view_records_whether_a_journal_was_replayed() {
         "this volume is journaled and the journal replays, so a writer must know"
     );
     drop(vol);
+    let writable = hfsplus::volume::WritableVolume::open(&mut dev)
+        .expect("a journaled volume should be accepted for mutation");
     assert!(
-        hfsplus::volume::WritableVolume::open(&mut dev).is_err(),
-        "a journaled volume must be refused for mutation rather than written \
-         without a journal entry"
+        writable.journal_was_replayed(),
+        "the writable view must report that a journal was replayed"
+    );
+    assert!(
+        writable.is_journaled(),
+        "the writable view must report that the volume is journaled"
     );
 }
 

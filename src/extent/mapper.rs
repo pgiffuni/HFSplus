@@ -215,6 +215,205 @@ impl<'a> ExtentMapper<'a> {
     }
 }
 
+/// One contiguous range of allocation blocks in a fork's extent chain.
+///
+/// A single allocation-descriptor pair from the on-disk extent chain:
+/// the first fork-relative block it covers, how many blocks long the run is,
+/// and where those blocks live on the device. Holes between extents (sparse
+/// regions) are not represented here -- they are the absence of a range.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExtentRange {
+    /// First fork-relative allocation block covered by this range.
+    pub fork_block: u32,
+    /// Number of allocation blocks in this run.
+    pub block_count: u32,
+    /// First physical allocation block on the device.
+    pub physical_block: u32,
+}
+
+impl ExtentRange {
+    /// Last fork-relative block covered, inclusive.
+    ///
+    /// `None` when the range is empty, which should not occur for ranges
+    /// yielded by [`ExtentRanges`].
+    pub fn end_fork_block(&self) -> Option<u32> {
+        if self.block_count == 0 {
+            None
+        } else {
+            Some(self.fork_block + self.block_count - 1)
+        }
+    }
+
+    /// Last physical block covered, inclusive.
+    pub fn end_physical_block(&self) -> Option<u32> {
+        if self.block_count == 0 {
+            None
+        } else {
+            Some(self.physical_block + self.block_count - 1)
+        }
+    }
+}
+
+/// Iterate over every extent range in a fork, inline extents first then
+/// overflow groups from the Extents B-tree.
+///
+/// Each item is an [`ExtentRange`] describing one contiguous run of
+/// fork-allocated blocks. Sparse holes between extents are skipped -- this
+/// iterator walks only what is actually allocated, which is exactly what an
+/// LSEEK SEEK_DATA/SEEK_HOLE scan needs.
+///
+/// Mining reference: Apple `core/hfs_extents.c` (`hfs_ext_iter_init`,
+/// `hfs_ext_iter_next_group`) walks the inline extents then the overflow groups
+/// in the same shape.
+pub struct ExtentRanges<'a> {
+    mapper: &'a ExtentMapper<'a>,
+    inline_idx: usize,
+    consumed: u64,
+    overflow_group: Option<ExtentRecord>,
+    overflow_idx: usize,
+    overflow_fetch_count: u32,
+}
+
+impl<'a> std::fmt::Debug for ExtentRanges<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExtentRanges")
+            .field("inline_idx", &self.inline_idx)
+            .field("consumed", &self.consumed)
+            .field("overflow_idx", &self.overflow_idx)
+            .field("overflow_fetch_count", &self.overflow_fetch_count)
+            .finish()
+    }
+}
+
+impl<'a> ExtentRanges<'a> {
+    pub fn new(mapper: &'a ExtentMapper<'a>) -> Self {
+        ExtentRanges {
+            mapper,
+            inline_idx: 0,
+            consumed: 0,
+            overflow_group: None,
+            overflow_idx: 0,
+            overflow_fetch_count: 0,
+        }
+    }
+}
+
+impl<'a> Iterator for ExtentRanges<'a> {
+    type Item = Result<ExtentRange>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let used_inline = self.mapper.inline.used();
+
+        if self.inline_idx < used_inline {
+            let desc = self.mapper.inline.raw[self.inline_idx];
+            self.inline_idx += 1;
+            let range = ExtentRange {
+                fork_block: self.consumed as u32,
+                block_count: desc.block_count,
+                physical_block: desc.start_block,
+            };
+            self.consumed += u64::from(desc.block_count);
+            return Some(Ok(range));
+        }
+
+        loop {
+            if let Some(group) = &self.overflow_group {
+                if self.overflow_idx < group.used() {
+                    let desc = group.raw[self.overflow_idx];
+                    self.overflow_idx += 1;
+                    let range = ExtentRange {
+                        fork_block: self.consumed as u32,
+                        block_count: desc.block_count,
+                        physical_block: desc.start_block,
+                    };
+                    self.consumed += u64::from(desc.block_count);
+                    return Some(Ok(range));
+                }
+            }
+
+            if self.consumed >= u64::from(self.mapper.total_blocks) {
+                return None;
+            }
+
+            self.overflow_fetch_count += 1;
+            if self.overflow_fetch_count > MAX_OVERFLOW_GROUPS {
+                return Some(Err(Error::overflow("overflow extent groups")));
+            }
+
+            let resolver = self.mapper.overflow.as_ref()?;
+            let key = match u32::try_from(self.consumed) {
+                Ok(k) => k,
+                Err(_) => return Some(Err(Error::overflow("overflow extent key"))),
+            };
+            match resolver.resolve_group(key) {
+                Ok(Some(group)) => {
+                    self.overflow_group = Some(group);
+                    self.overflow_idx = 0;
+                }
+                Ok(None) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+    }
+}
+
+impl<'a> ExtentMapper<'a> {
+    /// Iterate over every extent range in this fork.
+    ///
+    /// Yields [`ExtentRange`] items in fork-block order, inline extents first
+    /// then overflow groups. Holes (unallocated blocks between extents) are
+    /// not emitted; callers that need to know about holes must compare the
+    /// fork-block boundaries themselves.
+    pub fn ranges(&self) -> ExtentRanges<'_> {
+        ExtentRanges::new(self)
+    }
+
+    /// Find the extent range covering `fork_block`, if any.
+    ///
+    /// Returns the descriptor whose `[fork_block, fork_block + count)` range
+    /// contains `fork_block`, or `Err(OutOfRange)` when the block is past all
+    /// allocated blocks. A sparse hole below the logical size yields `Ok(None)`:
+    /// the block index is within the fork's allocation but no descriptor covers
+    /// it.
+    pub fn range_at(&self, fork_block: u32) -> Result<Option<ExtentRange>> {
+        let target = u64::from(fork_block);
+        if target >= u64::from(self.total_blocks) {
+            return Err(Error::out_of_range(
+                "fork block",
+                u64::from(fork_block),
+                u64::from(self.total_blocks),
+            ));
+        }
+        for range in self.ranges() {
+            let range = range?;
+            let start = u64::from(range.fork_block);
+            let end = start + u64::from(range.block_count);
+            if target >= start && target < end {
+                return Ok(Some(range));
+            }
+        }
+        Ok(None)
+    }
+
+    /// BMAP: translate a fork-relative byte offset to a device byte offset.
+    ///
+    /// The offset must be aligned to the volume's allocation block size, as
+    /// FUSE's BMAP opcode requires. A hole (allocated block count less than the
+    /// logical size) yields `Error::OutOfRange`.
+    pub fn bmap(&self, offset: u64) -> Result<u64> {
+        let block_size = u64::from(self.block_size);
+        let unaligned = offset % block_size;
+        if unaligned != 0 {
+            return Err(Error::invalid(
+                "offset",
+                "not aligned to the allocation block size",
+            ));
+        }
+        let fork_block = u32::try_from(offset / block_size)
+            .map_err(|_| Error::overflow("fork block from bmap offset"))?;
+        self.map_to_device_offset(fork_block, 0)
+    }
+}
 /// Hard cap on overflow groups examined for one lookup.
 ///
 /// The Extents B-tree cannot contain more groups than a fork has blocks, and a
@@ -357,5 +556,144 @@ mod tests {
         let m = ExtentMapper::new(&f, 4096).with_overflow(Box::new(NoOverflow));
         assert_eq!(m.map_block(0).unwrap(), 100);
         assert!(matches!(m.map_block(20), Err(Error::OutOfRange { .. })));
+    }
+
+    fn collect_ranges(m: &ExtentMapper) -> Vec<ExtentRange> {
+        m.ranges().map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn ranges_yields_inline_extents_in_order() {
+        let f = fork_with(&[(100, 4), (200, 4)], 8);
+        let m = ExtentMapper::new(&f, 4096);
+        let ranges = collect_ranges(&m);
+
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(
+            ranges[0],
+            ExtentRange {
+                fork_block: 0,
+                block_count: 4,
+                physical_block: 100,
+            }
+        );
+        assert_eq!(
+            ranges[1],
+            ExtentRange {
+                fork_block: 4,
+                block_count: 4,
+                physical_block: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn ranges_yields_fragmented_extents_in_order() {
+        // Two inline extents: the file is fragmented on disk but the fork
+        // blocks are still covered sequentially with no gap.
+        let f = fork_with(&[(500, 1), (300, 2)], 3);
+        let m = ExtentMapper::new(&f, 4096);
+
+        let ranges = collect_ranges(&m);
+        assert_eq!(ranges.len(), 2);
+        assert_eq!(ranges[0].fork_block, 0);
+        assert_eq!(ranges[0].block_count, 1);
+        assert_eq!(ranges[0].physical_block, 500);
+        assert_eq!(ranges[1].fork_block, 1);
+        assert_eq!(ranges[1].block_count, 2);
+        assert_eq!(ranges[1].physical_block, 300);
+    }
+
+    #[test]
+    fn ranges_continues_into_overflow() {
+        let f = fork_with(&[(100, 8), (200, 8)], 24);
+        let mut group = ExtentRecord::EMPTY;
+        group.raw[0] = ExtentDescriptor {
+            start_block: 300,
+            block_count: 8,
+        };
+        let m = ExtentMapper::new(&f, 4096).with_overflow(Box::new(Fixed(group)));
+
+        let ranges = collect_ranges(&m);
+        assert_eq!(ranges.len(), 3);
+        assert_eq!(ranges[2].fork_block, 16);
+        assert_eq!(ranges[2].block_count, 8);
+        assert_eq!(ranges[2].physical_block, 300);
+    }
+
+    #[test]
+    fn ranges_with_no_overflow_stops_at_inline() {
+        let f = fork_with(&[(100, 4)], 4);
+        let m = ExtentMapper::new(&f, 4096);
+        let ranges = collect_ranges(&m);
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].fork_block, 0);
+        assert_eq!(ranges[0].block_count, 4);
+    }
+
+    #[test]
+    fn range_at_finds_covering_extent() {
+        let f = fork_with(&[(50, 4), (200, 4)], 8);
+        let m = ExtentMapper::new(&f, 4096);
+
+        let r = m.range_at(0).unwrap().unwrap();
+        assert_eq!(r.physical_block, 50);
+
+        let r = m.range_at(3).unwrap().unwrap();
+        assert_eq!(r.physical_block, 50);
+
+        // Block 4..7 covers the second extent starting at fork block 4.
+        let r = m.range_at(5).unwrap().unwrap();
+        assert_eq!(r.physical_block, 200);
+    }
+
+    #[test]
+    fn range_at_none_past_allocated_blocks() {
+        let mut f = fork_with(&[(100, 1)], 1);
+        // One allocated block but logical size implies 10: blocks 1..9 are
+        // holes beyond the extent chain.
+        f.logical_size = 10 * 4096;
+        let m = ExtentMapper::new(&f, 4096);
+
+        // Block 0 is covered.
+        assert!(m.range_at(0).unwrap().is_some());
+        // Block 1 is past total_blocks (1), so it is out of range, not a hole.
+        assert!(m.range_at(1).is_err());
+    }
+
+    #[test]
+    fn extent_range_end_block_helpers() {
+        let r = ExtentRange {
+            fork_block: 10,
+            block_count: 5,
+            physical_block: 100,
+        };
+        assert_eq!(r.end_fork_block(), Some(14));
+        assert_eq!(r.end_physical_block(), Some(104));
+    }
+
+    #[test]
+    fn bmap_translates_aligned_offset() {
+        let f = fork_with(&[(100, 4)], 4);
+        let m = ExtentMapper::new(&f, 4096);
+
+        assert_eq!(m.bmap(0).unwrap(), 100 * 4096);
+        assert_eq!(m.bmap(4096).unwrap(), 101 * 4096);
+        // 4KB offset aligned.
+        assert_eq!(m.bmap(3 * 4096).unwrap(), 103 * 4096);
+    }
+
+    #[test]
+    fn bmap_rejects_unaligned_offset() {
+        let f = fork_with(&[(100, 4)], 4);
+        let m = ExtentMapper::new(&f, 4096);
+        assert!(m.bmap(1).is_err());
+    }
+
+    #[test]
+    fn bmap_past_allocation_is_out_of_range() {
+        let f = fork_with(&[(100, 4)], 4);
+        let m = ExtentMapper::new(&f, 4096);
+        assert!(m.bmap(4 * 4096).is_err());
     }
 }

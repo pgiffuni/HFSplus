@@ -10,4 +10,4 @@
 
 pub mod mapper;
 
-pub use mapper::{ExtentMapper, NoOverflow, OverflowResolver};
+pub use mapper::{ExtentMapper, ExtentRange, ExtentRanges, NoOverflow, OverflowResolver};

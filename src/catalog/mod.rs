@@ -32,5 +32,5 @@ pub use cnid::{
     ROOT_FOLDER_ID, ROOT_PARENT_ID,
 };
 pub use key::{CatalogKey, NameComparison};
-pub use lookup::{Catalog, CatalogEntry};
+pub use lookup::{Catalog, CatalogEntry, DirCursor, DirEntry};
 pub use record::{CatalogRecord, FileRecord, FolderRecord, ThreadRecord};

@@ -62,6 +62,21 @@ impl CatalogEntry {
     }
 }
 
+/// One directory entry paired with its full catalog record, for READDIRPLUS.
+///
+/// The record is kept so a caller can extract stat metadata (permissions,
+/// sizes, timestamps) without a second B-tree lookup — the data is already
+/// in the leaf record that produced the entry.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirEntry {
+    /// The entry's name, as UTF-16 code units from the catalog key.
+    pub name: Vec<u16>,
+    /// The entry's CNID.
+    pub cnid: Cnid,
+    /// The full catalog record behind this entry.
+    pub record: CatalogRecord,
+}
+
 /// A read-only view of the catalog B-tree.
 pub struct Catalog<'a, D: ?Sized> {
     tree: BTreeFile<'a, D>,
@@ -74,6 +89,26 @@ impl<'a, D: BlockDevice + ?Sized> std::fmt::Debug for Catalog<'a, D> {
             .field("node_size", &self.tree.node_size())
             .field("comparator", &self.comparator)
             .finish()
+    }
+}
+
+/// A position in a directory leaf chain, for resuming a scan.
+///
+/// Encodes the leaf-node number and the record index within it. `Default`
+/// is at the beginning of the tree, so the first call can pass
+/// `DirCursor::default()` to start from the first leaf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct DirCursor {
+    /// The leaf node number to resume from, or 0 for the tree's first leaf.
+    node: u32,
+    /// The record index within `node` to resume from.
+    index: u16,
+}
+
+impl DirCursor {
+    /// Start from the beginning of the directory.
+    pub fn start() -> Self {
+        Self::default()
     }
 }
 
@@ -531,6 +566,111 @@ impl<'a, D: BlockDevice + ?Sized> Catalog<'a, D> {
     /// List every child of `parent_id`, in catalog order.
     pub fn read_dir(&self, parent_id: Cnid) -> Result<Vec<CatalogEntry>> {
         self.scan_children(parent_id, |_| false)
+    }
+
+    /// Scan children of `parent_id`, starting from `cursor`, yielding up to
+    /// `limit` fully-parsed records plus a cursor for the next call.
+    ///
+    /// Unlike [`Catalog::scan_children`], which returns only name/CNID/kind,
+    /// this yields the complete [`CatalogRecord`] so a caller can build a full
+    /// `Object` without a second B-tree lookup per entry.
+    ///
+    /// `limit` is a hard cap on entries returned in one call. Pass `usize::MAX`
+    /// to drain the directory in one shot.
+    pub fn read_dir_records(
+        &self,
+        parent_id: Cnid,
+        cursor: DirCursor,
+        limit: usize,
+    ) -> Result<(Vec<DirEntry>, DirCursor)> {
+        let header = self.tree.header();
+        if header.leaf_records == 0 {
+            return Ok((Vec::new(), cursor));
+        }
+
+        let mut node_num = if cursor.node == 0 {
+            header.first_leaf_node
+        } else {
+            cursor.node
+        };
+        let mut index = cursor.index;
+        let last = header.last_leaf_node;
+        let mut budget = header.total_nodes;
+        let mut out = Vec::new();
+
+        while budget > 0 {
+            budget -= 1;
+            let bytes = self.tree.read_node_bytes(node_num)?;
+            let node = self.tree.parse_node(&bytes)?;
+            if node.kind() != NodeKind::Leaf {
+                break;
+            }
+            let count = node.num_records();
+
+            while index < count {
+                let record = match node.record(index) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        index += 1;
+                        continue;
+                    }
+                };
+                let Some((key, body)) = split_record(record) else {
+                    index += 1;
+                    continue;
+                };
+
+                // Past the matching parent's range: done.
+                if key.parent_id > parent_id {
+                    return Ok((
+                        out,
+                        DirCursor {
+                            node: node_num,
+                            index,
+                        },
+                    ));
+                }
+
+                if key.parent_id == parent_id {
+                    if let Ok(parsed) = parse_record(body) {
+                        if !parsed.is_thread() {
+                            if let Some(cnid) = parsed.cnid() {
+                                if out.len() >= limit {
+                                    return Ok((
+                                        out,
+                                        DirCursor {
+                                            node: node_num,
+                                            index,
+                                        },
+                                    ));
+                                }
+                                out.push(DirEntry {
+                                    name: key.name.clone(),
+                                    cnid,
+                                    record: parsed,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                index += 1;
+            }
+
+            if node_num == last {
+                break;
+            }
+            node_num = node.descriptor().f_link;
+            index = 0;
+        }
+
+        Ok((
+            out,
+            DirCursor {
+                node: node_num,
+                index,
+            },
+        ))
     }
 
     /// Enumerate every object on the volume.

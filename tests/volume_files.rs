@@ -38,6 +38,7 @@ mod common;
 
 use hfsplus::blockdev::FileDevice;
 use hfsplus::catalog::record::{S_IFLNK, S_IFMT, S_IFREG};
+use hfsplus::catalog::DirCursor;
 use hfsplus::volume::{Object, Volume};
 
 /// The image `tools/mkfiles.py` produces from `journaled-hfsplus`.
@@ -708,5 +709,137 @@ fn a_symlink_whose_target_is_empty_is_refused() {
     }
 }
 
+// --- READDIRPLUS ----------------------------------------------------------
+
+#[test]
+fn read_dir_plus_yields_entries_with_metadata_inlined() {
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        // A large limit means everything comes back in one shot.
+        let (entries, cursor) = vol
+            .read_dir_plus(vol.root_cnid(), DirCursor::start(), usize::MAX)
+            .expect("read_dir_plus");
+
+        // Should match what read_dir returns, but with full metadata.
+        let mut names: Vec<String> = entries.iter().map(|o| o.name_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                ".journal",
+                ".journal_info_block",
+                "fragmented.bin",
+                "link",
+                "overflow.bin",
+            ],
+            "the plus call must list the same entries as read_dir"
+        );
+
+        // Each entry carries real stat metadata.
+        let frag = entries
+            .iter()
+            .find(|o| o.name_string() == FRAGMENTED)
+            .expect("fragmented.bin must be present");
+        assert_eq!(frag.as_file().expect("must be a file").data_size, 8 * 4096);
+
+        // The cursor should not advance when the directory is exhausted.
+        let (empty_batch, same_cursor) = vol
+            .read_dir_plus(vol.root_cnid(), cursor, 10)
+            .expect("read_dir_plus after completion");
+        assert!(empty_batch.is_empty(), "no entries after exhaustion");
+        assert_eq!(same_cursor, cursor, "cursor stays put past the end");
+    });
+}
+
+#[test]
+fn read_dir_plus_resumes_from_cursor_in_batches() {
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        // Walk the root folder two entries at a time.
+        let mut cursor = DirCursor::start();
+        let mut all_names = Vec::new();
+
+        loop {
+            let (batch, next) = vol
+                .read_dir_plus(vol.root_cnid(), cursor, 2)
+                .expect("read_dir_plus");
+            for obj in &batch {
+                all_names.push(obj.name_string());
+            }
+            if batch.is_empty() {
+                break;
+            }
+            cursor = next;
+        }
+
+        all_names.sort();
+        assert_eq!(
+            all_names,
+            vec![
+                ".journal",
+                ".journal_info_block",
+                "fragmented.bin",
+                "link",
+                "overflow.bin",
+            ],
+            "batched reads must collect the same entries as a single call"
+        );
+    });
+}
+
+#[test]
+fn read_dir_plus_metadata_matches_lookup() {
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        let (plus_entries, _) = vol
+            .read_dir_plus(vol.root_cnid(), DirCursor::start(), usize::MAX)
+            .expect("read_dir_plus");
+
+        // Every entry from read_dir_plus must match a lookup by the same name.
+        for obj in &plus_entries {
+            let units: Vec<u16> = obj.name().to_vec();
+            let looked_up = vol
+                .lookup(vol.root_cnid(), &units)
+                .expect("lookup")
+                .expect("entry must still be present");
+
+            assert_eq!(obj.cnid(), looked_up.cnid());
+            assert_eq!(obj.data_size(), looked_up.data_size());
+            assert_eq!(obj.bsd_info(), looked_up.bsd_info());
+        }
+    });
+}
+
 /// Name of the fragmented file in the generated fixtures.
 const FRAGMENTED_NAME: &str = "fragmented.bin";
+
+#[test]
+fn volume_bmap_translates_a_fragmented_file_offset() {
+    if !require(WITH_FILES) {
+        return;
+    }
+    with_volume(WITH_FILES, |vol| {
+        let frag = entry(vol, FRAGMENTED);
+        let bs = 4096u64;
+
+        // First block of the file maps to some physical device offset.
+        let dev_offset = vol.bmap(&frag, 0).expect("bmap");
+        assert_eq!(dev_offset % bs, 0, "device offset must be block-aligned");
+
+        // Second block maps to a different physical offset (fragmented file).
+        let second = vol.bmap(&frag, bs).expect("bmap second block");
+        assert_ne!(dev_offset, second);
+
+        // An unaligned offset is rejected.
+        assert!(vol.bmap(&frag, 1).is_err());
+
+        // Past the file's data fork is out of range.
+        assert!(vol.bmap(&frag, frag.data_size() + 1).is_err());
+    });
+}

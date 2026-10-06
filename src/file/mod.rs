@@ -160,6 +160,73 @@ impl<'a, D: BlockDevice + ?Sized> ForkReader<'a, D> {
         }
         self.read(0, size as usize)
     }
+
+    /// SEEK_DATA: the byte offset of the next allocated region at or after `offset`.
+    ///
+    /// If `offset` already falls inside an extent, it is returned unchanged.
+    /// If `offset` is in a hole, the start of the next extent is returned.
+    /// Returns `None` when no extent covers or follows the offset.
+    pub fn seek_data(&self, offset: u64) -> Result<Option<u64>> {
+        if offset >= self.fork.logical_size {
+            return Ok(None);
+        }
+        let block_size = u64::from(self.mapper.block_size());
+        let fork_block = offset / block_size;
+
+        for range in self.mapper.ranges() {
+            let range = range?;
+            let range_end = u64::from(range.fork_block + range.block_count);
+            if fork_block < range_end {
+                if fork_block >= u64::from(range.fork_block) {
+                    // Offset is within this extent.
+                    return Ok(Some(offset));
+                }
+                // Offset is in a hole before this extent.
+                return Ok(Some(u64::from(range.fork_block) * block_size));
+            }
+        }
+        Ok(None)
+    }
+
+    /// SEEK_HOLE: the byte offset of the next hole at or after `offset`.
+    ///
+    /// If `offset` already falls in a hole, it is returned unchanged.
+    /// If `offset` is inside an extent, the end of that extent is returned
+    /// (the start of the following hole, if any).
+    /// Returns `None` when the entire fork is allocated with no hole past `offset`.
+    pub fn seek_hole(&self, offset: u64) -> Result<Option<u64>> {
+        if offset >= self.fork.logical_size {
+            return Ok(None);
+        }
+        let block_size = u64::from(self.mapper.block_size());
+
+        for range in self.mapper.ranges() {
+            let range = range?;
+            let range_start = u64::from(range.fork_block) * block_size;
+            let range_end = u64::from(range.fork_block + range.block_count) * block_size;
+
+            if offset < range_start {
+                // In a hole before this extent.
+                return Ok(Some(offset));
+            }
+            if offset < range_end {
+                // Inside this extent; hole starts at the end of it.
+                return Ok(Some(range_end));
+            }
+        }
+
+        // Past all extents but within logical size: a tail hole.
+        Ok(Some(offset))
+    }
+
+    /// BMAP: translate a fork-relative byte offset to a device byte offset.
+    ///
+    /// The offset must be block-aligned. A hole yields
+    /// [`Error::OutOfRange`](crate::error::Error::OutOfRange), matching the
+    /// semantics of `ExtentMapper::bmap`.
+    pub fn bmap(&self, offset: u64) -> Result<u64> {
+        self.mapper.bmap(offset)
+    }
 }
 
 /// Resolves a fork's overflow extents through a volume's Extents B-tree.
@@ -440,5 +507,98 @@ mod tests {
         ));
         // One below the wrap point is merely past the end.
         assert!(r.read(u64::MAX - 8191, 4096).unwrap().is_empty());
+    }
+
+    #[test]
+    fn seek_data_returns_offset_when_already_in_data() {
+        let dev = patterned_device(32, 4096);
+        let f = fork(&[(4, 2)], 2, 8192);
+        let r = ForkReader::new(&dev, &f, 4096);
+
+        // Offset 0 is at the start of the first extent.
+        assert_eq!(r.seek_data(0).unwrap(), Some(0));
+        // Offset 100 is within the first extent.
+        assert_eq!(r.seek_data(100).unwrap(), Some(100));
+        // Offset 4096 is at the start of the second extent.
+        assert_eq!(r.seek_data(4096).unwrap(), Some(4096));
+    }
+
+    #[test]
+    fn seek_data_skips_to_next_extent_from_tail_hole() {
+        let dev = patterned_device(32, 4096);
+        // Only block 0 is allocated, but logical size implies 4 blocks.
+        // Fork blocks 1-3 are holes.
+        let f = fork(&[(4, 1)], 1, 4 * 4096);
+        let r = ForkReader::new(&dev, &f, 4096);
+
+        // Offset 0 is in the extent.
+        assert_eq!(r.seek_data(0).unwrap(), Some(0));
+        // Offset in the hole: no more extents, so None.
+        assert_eq!(r.seek_data(4096).unwrap(), None);
+    }
+
+    #[test]
+    fn seek_hole_returns_offset_when_already_in_hole() {
+        let dev = patterned_device(32, 4096);
+        // Block 0: allocated. Logical size is 4 blocks, so blocks 1-3 are holes.
+        let f = fork(&[(4, 1)], 1, 4 * 4096);
+        let r = ForkReader::new(&dev, &f, 4096);
+
+        // Offset in the hole returns itself.
+        assert_eq!(r.seek_hole(4096).unwrap(), Some(4096));
+        // Offset past the end returns None.
+        assert_eq!(r.seek_hole(4 * 4096).unwrap(), None);
+    }
+
+    #[test]
+    fn seek_hole_finds_end_of_extent_from_within() {
+        let dev = patterned_device(32, 4096);
+        // Block 0: allocated at phys 4 (2 blocks). Logical size 4 blocks.
+        let f = fork(&[(4, 2)], 2, 4 * 4096);
+        let r = ForkReader::new(&dev, &f, 4096);
+
+        // Inside the extent: hole starts after it (block 2).
+        assert_eq!(r.seek_hole(0).unwrap(), Some(2 * 4096));
+        assert_eq!(r.seek_hole(4096).unwrap(), Some(2 * 4096));
+        // Block 2 is the start of the hole.
+        assert_eq!(r.seek_hole(2 * 4096).unwrap(), Some(2 * 4096));
+    }
+
+    #[test]
+    fn seek_data_and_seek_hole_work_with_overflow() {
+        let dev = patterned_device(64, 4096);
+
+        // A resolver that serves one fixed overflow group.
+        struct Fixed(crate::format::extents::ExtentRecord);
+        impl crate::extent::OverflowResolver for Fixed {
+            fn resolve_group(
+                &self,
+                start_block: u32,
+            ) -> Result<Option<crate::format::extents::ExtentRecord>> {
+                if start_block == 16 {
+                    Ok(Some(self.0))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+
+        let mut group = crate::format::extents::ExtentRecord::EMPTY;
+        group.raw[0] = ExtentDescriptor {
+            start_block: 300,
+            block_count: 8,
+        };
+        let f = fork(&[(100, 8), (200, 8)], 24, 24 * 4096);
+        let r = ForkReader::with_overflow(&dev, &f, 4096, Box::new(Fixed(group)));
+
+        // Block 16 starts the overflow extent at physical 300.
+        assert_eq!(r.seek_data(16 * 4096).unwrap(), Some(16 * 4096));
+        // Block 20 is inside the overflow extent.
+        assert_eq!(r.seek_data(20 * 4096).unwrap(), Some(20 * 4096));
+        // Block 24 is past all data.
+        assert_eq!(r.seek_data(24 * 4096).unwrap(), None);
+
+        // Seeking for a hole: inside the overflow extent, hole starts after it.
+        assert_eq!(r.seek_hole(16 * 4096).unwrap(), Some(24 * 4096));
     }
 }

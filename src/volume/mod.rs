@@ -27,18 +27,24 @@ use crate::blockdev::{BlockDevice, BlockDeviceMut};
 use crate::btree::node::NODE_DESCRIPTOR_SIZE;
 use crate::btree::ExtentKey;
 use crate::catalog::cnid::{Cnid, ROOT_FOLDER_ID, ROOT_PARENT_ID};
-use crate::catalog::lookup::Catalog;
-use crate::catalog::record::{BsdInfo, CatalogRecord, FileRecord, FolderRecord};
+use crate::catalog::lookup::{Catalog, DirCursor};
+use crate::catalog::record::{
+    BsdInfo, CatalogRecord, FileRecord, FolderRecord, S_IFDIR, S_IFLNK, S_IFREG,
+};
 use crate::error::{Error, Result};
 use crate::extent::OverflowResolver;
 use crate::file::{ForkOverflow, ForkReader, TreeOverflow};
 use crate::format::fork::ForkData;
 use crate::format::volume_header::{FileSystemKind, VolumeHeader};
+use crate::journal::info::{JournalHeader, JournalInfoBlock};
+use crate::journal::replay::{commit_transaction, TransactionBuffer};
 
 mod bitmap;
 
 use crate::timestamp::HfsTimestamp;
 pub use bitmap::{bytes_for_blocks, AllocationBitmap};
+
+use crate::attributes::AttributesFile;
 
 /// A mounted, read-only HFS+ or HFSX volume.
 pub struct Volume<'a, D: ?Sized> {
@@ -53,6 +59,12 @@ pub struct Volume<'a, D: ?Sized> {
     /// built per read because a `ForkOverflow` borrows the tree it resolves
     /// against.
     extents: std::cell::OnceCell<TreeOverflow<'a, D>>,
+    /// The attributes B-tree, opened on first use.
+    ///
+    /// Opened lazily for the same reason as `extents`: a volume whose files
+    /// have no extended attributes never touches it, and the tree may be empty
+    /// on a formatted volume.
+    attributes: std::cell::OnceCell<AttributesFile<'a, D>>,
 }
 
 impl<'a, D: BlockDevice + ?Sized> std::fmt::Debug for Volume<'a, D> {
@@ -160,6 +172,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             catalog,
             kind,
             extents: std::cell::OnceCell::new(),
+            attributes: std::cell::OnceCell::new(),
         })
     }
 
@@ -293,6 +306,41 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         Ok(out)
     }
 
+    /// List a directory's entries with metadata inlined, resuming from `cursor`.
+    ///
+    /// Like [`Volume::read_dir`] but fetches each child's record in the same
+    /// B-tree pass, avoiding the per-entry second lookup. This is the entry
+    /// point for FUSE READDIRPLUS: the returned [`Object`] already carries
+    /// name, CNID, permissions, timestamps, and sizes, so the adapter has
+    /// everything it needs for `fuse_reply_entry` without another catalog
+    /// descent.
+    ///
+    /// At most `limit` entries are returned. If the directory is not exhausted,
+    /// the returned [`DirCursor`] advances the position so the next call resumes
+    /// exactly where this one left off. When the directory is exhausted the
+    /// cursor does not advance (it stays at the end), so a caller can detect
+    /// completion by comparing cursors.
+    ///
+    /// Mining reference: `core/hfs_catalog.c` `cat_getdirentries` does a single
+    /// forward walk of the leaf chain; the per-entry `catalog.lookup` in
+    /// [`Volume::read_dir`] is a separate descent that this method removes.
+    pub fn read_dir_plus(
+        &self,
+        parent: Cnid,
+        cursor: DirCursor,
+        limit: usize,
+    ) -> Result<(Vec<Object>, DirCursor)> {
+        let (entries, next_cursor) = self.catalog.read_dir_records(parent, cursor, limit)?;
+        let volume_expanded = self.header.has_expanded_times();
+        let mut out = Vec::with_capacity(entries.len());
+        for entry in entries {
+            if let Some(object) = Object::from_record(entry.name, entry.record, volume_expanded) {
+                out.push(object);
+            }
+        }
+        Ok((out, next_cursor))
+    }
+
     /// Resolve a CNID to its object, wherever it is in the tree.
     ///
     /// This is one B-tree descent rather than a scan, because an object's thread
@@ -335,6 +383,46 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             .read_all(limit)
     }
 
+    /// SEEK_DATA: the byte offset of the next allocated region at or after
+    /// `offset` in the file's data fork.
+    ///
+    /// Returns `None` when no extent covers or follows the offset. This is a
+    /// wrapper around [`ForkReader::seek_data`] that resolves the file's fork
+    /// (including overflow extents) before delegating.
+    pub fn seek_data(&self, file: &Object, offset: u64) -> Result<Option<u64>> {
+        let f = file.as_file()?;
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+            .seek_data(offset)
+    }
+
+    /// SEEK_HOLE: the byte offset of the next hole at or after `offset` in the
+    /// file's data fork.
+    ///
+    /// Returns `None` when the entire fork is allocated past the offset. This is
+    /// a wrapper around [`ForkReader::seek_hole`] that resolves the file's fork
+    /// before delegating.
+    pub fn seek_hole(&self, file: &Object, offset: u64) -> Result<Option<u64>> {
+        let f = file.as_file()?;
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+            .seek_hole(offset)
+    }
+
+    /// BMAP: translate a file byte offset to a device byte offset.
+    ///
+    /// The offset must be aligned to the volume's allocation block size, as
+    /// FUSE's BMAP opcode requires. Returns
+    /// [`Error::OutOfRange`](crate::error::Error::OutOfRange) when the block is
+    /// past the file's allocated extents (a sparse hole).
+    ///
+    /// Mining reference: Apple `core/FileExtentMapping.c` `MapFileBlockC`
+    /// performs this same fork-block to device-offset translation for the
+    /// kernel's BMAP path.
+    pub fn bmap(&self, file: &Object, offset: u64) -> Result<u64> {
+        let f = file.as_file()?;
+        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+            .bmap(offset)
+    }
+
     /// Read `len` bytes from a file's resource fork.
     ///
     /// A file with no resource fork reads empty rather than failing, because the
@@ -350,6 +438,72 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             file_id(f),
         )
         .read(offset, len)
+    }
+
+    /// The attributes B-tree for this volume, opened lazily.
+    ///
+    /// Returns `None` when the volume has no attributes fork (empty or absent),
+    /// which is the normal case on volumes whose files have no extended
+    /// attributes.
+    fn attributes(&self) -> Result<Option<&AttributesFile<'_, D>>> {
+        if self.header.attributes_file.logical_size == 0 {
+            return Ok(None);
+        }
+        if self.attributes.get().is_none() {
+            let attrs = AttributesFile::open(
+                self.device,
+                &self.header.attributes_file,
+                self.header.block_size,
+                true,
+            )?;
+            self.attributes
+                .set(attrs)
+                .map_err(|_| Error::invalid("attributes", "already initialised"))?;
+        }
+        // `set` cannot fail after the get-check above; unwrap is safe because
+        // the cell was empty and we just filled it.
+        Ok(self.attributes.get())
+    }
+
+    /// Read the value of an extended attribute named `name` from `file`.
+    ///
+    /// Returns `Ok(None)` when the file has no such attribute, so a caller can
+    /// distinguish "absent" from "error". A file with no attributes tree at all
+    /// returns `Ok(None)` for every name without touching the device.
+    ///
+    /// Mining reference: `core/hfs_xattr.c` `hfs_vnop_getattrlist` resolves a
+    /// named attribute through the attributes B-tree for one `fileID`.
+    pub fn getxattr(&self, file: &Object, name: &str) -> Result<Option<Vec<u8>>> {
+        let Some(attrs) = self.attributes()? else {
+            return Ok(None);
+        };
+        if attrs.is_empty() {
+            return Ok(None);
+        }
+        let cnid = file.cnid().0;
+        let list = attrs.attributes_for(cnid)?;
+        for attr in &list {
+            if attr.name == name {
+                return Ok(Some(attr.value.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// List the names of all extended attributes on `file`.
+    ///
+    /// Returns an empty vector when the file has no attributes. The names are
+    /// the raw on-disk strings, not prefixed with anything.
+    pub fn listxattr(&self, file: &Object) -> Result<Vec<String>> {
+        let Some(attrs) = self.attributes()? else {
+            return Ok(Vec::new());
+        };
+        if attrs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cnid = file.cnid().0;
+        let list = attrs.attributes_for(cnid)?;
+        Ok(list.into_iter().map(|a| a.name).collect())
     }
 
     /// The target of a symbolic link.
@@ -543,7 +697,11 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 /// This type exists to make the trust boundary explicit rather than to expose
 /// mutation. Opening one performs exactly the same work as [`Volume::open`] --
 /// header validation, then journal detection, then journal replay -- and then
-/// stops. Anything that changes the volume has to be asked for by name.
+/// stops. Anything that changes the volume has to be asked for by name. On a
+/// journaled volume, each such mutation is wrapped in a journal transaction:
+/// before-images are recorded before the home blocks are modified, and committed
+/// to the journal ring at the end of the operation, so that a crash mid-write
+/// is recoverable by replay.
 ///
 /// # Why a separate type at all
 ///
@@ -598,6 +756,23 @@ pub struct WritableVolume<'d, D: ?Sized> {
     kind: FileSystemKind,
     /// Whether a journal was replayed while validating.
     journal_replayed: bool,
+    /// The journal state, if the volume is journaled. Holds the info block that
+    /// locates the journal on the device and the mutable header whose `end` and
+    /// `sequence_num` advance on every commit.
+    journal: Option<JournalState>,
+}
+
+/// Journal state for a writable volume.
+///
+/// The info block locates the journal on the device; the header tracks the
+/// ring's cursors and sequence number. An active transaction buffer, if present,
+/// accumulates before-images for the in-flight commit. The header is `None` when
+/// the journal has never been written to (`kJIJournalNeedInitMask`): it is
+/// initialised lazily on the first commit.
+struct JournalState {
+    info: JournalInfoBlock,
+    header: Option<JournalHeader>,
+    tx: Option<TransactionBuffer>,
 }
 
 impl<D: ?Sized> std::fmt::Debug for WritableVolume<'_, D> {
@@ -607,6 +782,7 @@ impl<D: ?Sized> std::fmt::Debug for WritableVolume<'_, D> {
         f.debug_struct("WritableVolume")
             .field("filesystem", &self.kind)
             .field("journal_was_replayed", &self.journal_replayed)
+            .field("journaled", &self.journal.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -624,37 +800,50 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         let journal_replayed = volume.journal()?.is_some();
         let header = volume.header;
         let kind = volume.kind;
+        let journal_info_block = header.journal_info_block;
+        let block_size = header.block_size;
         drop(volume);
 
-        if journal_replayed {
-            // Refused here rather than papered over, and the reason is structural
-            // rather than a missing feature. On a journalled volume Apple's writer
-            // does not write the catalog at all: `hfs_start_transaction` opens a
-            // transaction, the mutation happens inside it, and `end_transaction`
-            // commits the blocks it touched. Every mutating path in the kernel
-            // brackets itself that way -- `core/hfs_catalog.c`, `core/hfs_cnode.c`,
-            // `core/hfs_btreeio.c`, `core/hfs_cprotect.c` each call
-            // `hfs_start_transaction` first. See `src/journal/mod.rs`.
-            //
-            // So what this crate does elsewhere is the *recovery* path, and writing
-            // it against a volume that has a live journal would leave a journal that
-            // does not describe the volume -- the one state that makes a journal
-            // worse than none, because the next replay would undo the write or apply
-            // it twice.
-            return Err(Error::invalid(
-                "write",
-                "journalled writes are not implemented; on a journalled volume the \
-                 writer works through a transaction rather than writing the catalog \
-                 directly, so a direct write here would leave a journal that does not \
-                 describe the volume",
-            ));
-        }
+        // Read the journal info block and header, if this is a journaled volume.
+        // The info block lives at journal_info_block * block_size, one allocation
+        // block. On a non-journaled volume journal_info_block is zero and is
+        // ignored.
+        let journal = if journal_replayed && journal_info_block != 0 {
+            let bs = u64::from(block_size);
+            let info_at = u64::from(journal_info_block)
+                .checked_mul(bs)
+                .ok_or(Error::overflow("journal info block offset"))?;
+            let mut info_buf =
+                vec![0u8; usize::try_from(bs).map_err(|_| Error::overflow("block size"))?];
+            device.read_at(info_at, &mut info_buf)?;
+            let info = JournalInfoBlock::parse(&info_buf)?;
+
+            // Read the journal header at info.offset. For a journal that has
+            // never been written to (kJIJournalNeedInitMask), the header area is
+            // all-zeroes and `JournalHeader::parse` returns `None`; that is
+            // treated as "needs initialisation" and the header is created lazily
+            // on the first commit.
+            let mut hdr_buf =
+                vec![0u8; usize::try_from(info.size).map_err(|_| Error::overflow("journal size"))?];
+            let want = hdr_buf.len().min(4096);
+            device.read_at(info.offset, &mut hdr_buf[..want])?;
+            let header = JournalHeader::parse(&hdr_buf[..want])?;
+
+            Some(JournalState {
+                info,
+                header,
+                tx: None,
+            })
+        } else {
+            None
+        };
 
         Ok(WritableVolume {
             device,
             header,
             kind,
             journal_replayed,
+            journal,
         })
     }
 
@@ -674,12 +863,153 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// journal lives on another device. A writer needs to know which, and
     /// needs to be told rather than infer it.
     ///
-    /// Always false today: [`WritableVolume::open`] refuses a journaled volume
-    /// outright. It is kept because the refusal is a property of what is
-    /// implemented, not of the volume, and a writer that could not tell the two
-    /// apart would have no way to notice when the refusal is lifted.
+    /// On a journaled volume whose journal had transactions, this is `true`
+    /// and the writer journals every mutation. On a new journal that has never
+    /// been written to (`kJIJournalNeedInitMask` set), this is `false` and the
+    /// first mutation initializes the journal header.
     pub fn journal_was_replayed(&self) -> bool {
         self.journal_replayed
+    }
+
+    /// Whether this volume is journaled.
+    ///
+    /// On a journaled volume, every mutating operation is wrapped in a journal
+    /// transaction before the bytes are written to their home blocks. This is
+    /// the writable counterpart of [`Volume::journal`].
+    pub fn is_journaled(&self) -> bool {
+        self.journal.is_some()
+    }
+
+    /// Record a block's before-image in the current transaction, then write.
+    ///
+    /// On a journalled volume this is the only path to disk: the block's current
+    /// contents are copied into the transaction buffer before the new bytes go
+    /// out, so a crash before commit leaves the journal holding a before-image
+    /// that replay can apply or that the home write can make durable.
+    ///
+    /// On a non-journaled volume this is a plain write.
+    fn journal_write(&mut self, offset: u64, data: &[u8]) -> Result<()> {
+        if let Some(jnl) = &mut self.journal {
+            let tx = jnl.tx.get_or_insert_with(TransactionBuffer::new);
+            // The journal addresses blocks in jhdr_size units, which on every
+            // volume Apple writes today is the volume block size.
+            let blk = u64::from(self.header.block_size);
+            let block_start = offset / blk * blk;
+            let block_num = block_start / blk;
+            // Only record the before-image the first time a block is touched in
+            // this transaction; later writes to the same block are covered by the
+            // initial record.
+            if !tx.writes().iter().any(|w| w.bnum == block_num) {
+                let mut before =
+                    vec![0u8; usize::try_from(blk).map_err(|_| Error::overflow("block size"))?];
+                self.device.read_at(block_start, &mut before)?;
+                tx.record_write(block_num, before);
+            }
+        }
+        self.device.write_at(offset, data)
+    }
+
+    /// Begin a journal transaction.
+    ///
+    /// On a non-journaled volume this is a no-op: writes go straight to disk.
+    /// On a journaled volume it starts an empty [`TransactionBuffer`] that
+    /// [`journal_write`](Self::journal_write) fills with before-images, closed
+    /// by [`end_transaction`](Self::end_transaction).
+    fn begin_transaction(&mut self) -> Result<()> {
+        if let Some(jnl) = &mut self.journal {
+            // A transaction already open from the same caller is a logic error.
+            if jnl.tx.is_some() {
+                return Err(Error::invalid("journal", "a transaction is already open"));
+            }
+            jnl.tx = Some(TransactionBuffer::new());
+        }
+        Ok(())
+    }
+
+    /// Commit the current journal transaction, if one is open.
+    ///
+    /// On a non-journaled volume this is a no-op -- there is nothing to commit
+    /// because the writes were direct. On a journaled volume the accumulated
+    /// before-images are flushed to the journal ring and the header's `end`
+    /// cursor and `sequence_num` advance, making the transaction durable and
+    /// replayable.
+    fn end_transaction(&mut self) -> Result<()> {
+        let Some(mut jnl) = self.journal.take() else {
+            return Ok(());
+        };
+        let Some(tx) = jnl.tx.take() else {
+            self.journal = Some(jnl);
+            return Ok(());
+        };
+        let result = if !tx.is_empty() {
+            // Lazily initialise an uninitialized journal (one whose info block has
+            // kJIJournalNeedInitMask set and whose header is zeroed). Apple's writer
+            // does the same: it writes the header before the first transaction and
+            // clears the flag so a reader does not mistake it for an empty journal.
+            if jnl.header.is_none() {
+                let info = jnl.info;
+                let header = self.make_journal_header(&info)?;
+                crate::journal::replay::write_journal_header(self.device, &info, &header)?;
+                jnl.header = Some(header);
+                // Clear kJIJournalNeedInitMask in the info block's flags.
+                let flags = info.flags & !crate::journal::info::K_JI_JOURNAL_NEED_INIT_MASK;
+                jnl.info.flags = flags;
+                let bs = u64::from(self.header.block_size);
+                let info_at = u64::from(self.header.journal_info_block)
+                    .checked_mul(bs)
+                    .ok_or(Error::overflow("journal info block offset"))?;
+                // self.journal is temporarily None, so this writes directly.
+                self.journal_write(info_at, &flags.to_be_bytes())?;
+            }
+            let header = jnl.header.as_mut().expect("header was just initialised");
+            let blhdr_size = header.blhdr_size;
+            commit_transaction(
+                self.device,
+                &jnl.info,
+                header,
+                &tx,
+                blhdr_size,
+                /* check_blocks */ true,
+                /* pending */ 0,
+            )
+        } else {
+            Ok(())
+        };
+        self.journal = Some(jnl);
+        result
+    }
+
+    /// Build a fresh journal header for an uninitialized journal.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `journal_init` sets
+    /// `jhdr_start = jhdr_end = jhdr_size`, `size = jnl_size`, and clears
+    /// `kJIJournalNeedInitMask` before the first use.
+    fn make_journal_header(&self, info: &JournalInfoBlock) -> Result<JournalHeader> {
+        use crate::journal::info::{ByteOrder, ENDIAN_MAGIC, JOURNAL_HEADER_MAGIC};
+        let jhdr_size = u64::from(self.header.block_size);
+        let blhdr_size = jhdr_size;
+        Ok(JournalHeader {
+            magic: JOURNAL_HEADER_MAGIC,
+            endian: ENDIAN_MAGIC,
+            start: jhdr_size,
+            end: jhdr_size,
+            size: info.size,
+            blhdr_size: u32::try_from(blhdr_size).map_err(|_| Error::overflow("blhdr_size"))?,
+            checksum: 0,
+            jhdr_size: u32::try_from(jhdr_size).map_err(|_| Error::overflow("jhdr_size"))?,
+            sequence_num: 0,
+            byte_order: ByteOrder::Big,
+        })
+    }
+
+    /// Abandon the current transaction without committing.
+    ///
+    /// Drops the transaction buffer so the journal header is not advanced and
+    /// the half-applied writes are invisible to a future replay.
+    fn abandon_transaction(&mut self) {
+        if let Some(jnl) = &mut self.journal {
+            jnl.tx.take();
+        }
     }
 
     /// Replace a file's contents, without changing its allocation.
@@ -697,15 +1027,13 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     ///
     /// The data blocks and the catalog's leaf node are written, and the record's
     /// `logicalSize` and timestamps are updated. Nothing else: no bitmap, no
-    /// volume header, no journal.
+    /// volume header.
     ///
     /// # What it refuses, and why
     ///
     /// - **Growth.** A file that outgrows its blocks needs an allocator, and an
     ///   allocator that guessed at a free block would be worse than no mutation.
     ///   The error names the shortfall rather than truncating the write.
-    /// - **A journaled volume.** Refused in [`WritableVolume::open`], before any
-    ///   byte is written.
     /// - **A length change in the record.** See [`Self::replace_catalog_record`].
     ///
     /// Mining reference: `core/hfs_cnode.c` `hfs_update` sets `c_touch_modtime`
@@ -716,6 +1044,20 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// alone is also the only choice that does not invent semantics -- an
     /// atime a writer had to guess at would be worse than a stale one.
     pub fn write_file_contents(&mut self, cnid: u32, data: &[u8]) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.write_file_contents_inner(cnid, data);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            // Abandon the partial transaction: drop the buffer without committing,
+            // so the journal header is not advanced and the uncommitted writes are
+            // invisible to replay.
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn write_file_contents_inner(&mut self, cnid: u32, data: &[u8]) -> Result<()> {
         let block_size = self.header.block_size;
         let expanded = self.header.has_expanded_times();
 
@@ -757,7 +1099,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 break;
             }
             let at = u64::from(*block) * u64::from(block_size);
-            self.device.write_at(at, &data[start..end])?;
+            self.journal_write(at, &data[start..end])?;
         }
 
         // Then the record: logicalSize, and the two timestamps a content change
@@ -818,6 +1160,17 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// with `buildkey` and `buildthread` for the two records; `cat_create` calls
     /// `newcatalogid()` for the CNID and `incvalency()` for the parent's count.
     pub fn create_file(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.create_file_inner(parent, name);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn create_file_inner(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
         use crate::catalog::key::CatalogKey;
         use crate::catalog::record::{
             FileRecord, K_HFS_PLUS_FILE_THREAD_RECORD, S_IFREG, THREAD_RECORD_NAME_LEN_OFFSET,
@@ -976,6 +1329,17 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// inconsistent". The valence and count adjustments live in the unlink/rmdir
     /// path above it, which is where they belong: `cat_delete` is the record layer.
     pub fn remove(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.remove_inner(parent, name);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn remove_inner(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
         let parent_cnid = Cnid(parent);
         let object = {
             use crate::catalog::lookup::Catalog;
@@ -1263,6 +1627,17 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// `MAKE_INODE_NAME`; `core/hfs_format.h` `HFS_INODE_PREFIX` and the `hl_*`
     /// aliases; TN1150's Hard Links section; `lib_fsck_hfs/dfalib/HardLinkCheck.c`.
     pub fn create_hard_link(&mut self, parent: u32, name: &[u16], target: u32) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.create_hard_link_inner(parent, name, target);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn create_hard_link_inner(&mut self, parent: u32, name: &[u16], target: u32) -> Result<u32> {
         use crate::catalog::key::CatalogKey;
         use crate::catalog::record::{
             FileRecord, K_HFS_HAS_LINK_CHAIN_MASK, K_HFS_THREAD_EXISTS_MASK, S_IFREG,
@@ -1538,7 +1913,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                      folder, so it cannot hold hard link records"
                 ),
             )),
-            None => self.create_folder(root.0, &name),
+            None => self.create_folder_inner(root.0, &name),
         }
     }
 
@@ -1555,6 +1930,17 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// the root here is the kind of plausible value only an independent checker
     /// catches.
     pub fn create_folder(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.create_folder_inner(parent, name);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn create_folder_inner(&mut self, parent: u32, name: &[u16]) -> Result<u32> {
         use crate::catalog::key::CatalogKey;
         use crate::catalog::record::{FolderRecord, THREAD_RECORD_NAME_LEN_OFFSET};
 
@@ -1665,6 +2051,23 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// and which refuses a destination name already in use with `EEXIST` unless the
     /// parents are the same.
     pub fn rename(
+        &mut self,
+        from_parent: u32,
+        from_name: &[u16],
+        to_parent: u32,
+        to_name: &[u16],
+    ) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.rename_inner(from_parent, from_name, to_parent, to_name);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn rename_inner(
         &mut self,
         from_parent: u32,
         from_name: &[u16],
@@ -2075,7 +2478,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             let count = num_records(&buf)?;
             (bt.node_offset(node_num)?, buf, count)
         };
-        self.device.write_at(at, &buf)?;
+        self.journal_write(at, &buf)?;
 
         let leaf_records = self.btree_header_leaf_records()?;
         let leaf_records = leaf_records.checked_sub(1).ok_or_else(|| {
@@ -2137,12 +2540,10 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// would be a wider change than this method, and getting it wrong is caught by
     /// `fsck.hfsplus` recomputing the count.
     fn write_header_u32(&mut self, offset: u64, value: u32) -> Result<()> {
-        self.device.write_at(
+        self.journal_write(
             crate::blockdev::VOLUME_HEADER_OFFSET + offset,
             &value.to_be_bytes(),
         )?;
-        // Every header write has to move the copy at the end of the volume with it.
-        // See `sync_backup_header`.
         self.sync_backup_header()
     }
 
@@ -2579,7 +2980,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             )?;
             bt.node_offset(0)? + crate::btree::header::HEADER_RECORD_OFFSET as u64
         };
-        self.device.write_at(at + offset, &value.to_be_bytes())
+        self.journal_write(at + offset, &value.to_be_bytes())
     }
 
     /// Copy the volume header to the copy at the end of the volume.
@@ -2639,7 +3040,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         let mut buf = [0u8; 1024];
         self.device
             .read_at(crate::blockdev::VOLUME_HEADER_OFFSET, &mut buf)?;
-        self.device.write_at(volume_bytes - 1024, &buf)
+        self.journal_write(volume_bytes - 1024, &buf)
     }
 
     /// Read a `u32` field of the catalog's B-tree header record.
@@ -2678,7 +3079,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             )?;
             bt.node_offset(node_num)?
         };
-        self.device.write_at(at, bytes)
+        self.journal_write(at, bytes)
     }
 
     /// Locate any catalog record whose body names `cnid` in its `fileID`/`folderID`.
@@ -2855,7 +3256,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 // keys it now bounds still live in that leaf -- until one of them
                 // does not, at which point `fsck.hfsplus` reports "Invalid index
                 // key" on a tree whose every other property is right.
-                self.device.write_at(at_node_offset, &buf)?;
+                self.journal_write(at_node_offset, &buf)?;
                 if first_changed {
                     self.refresh_index()?;
                 }
@@ -3142,7 +3543,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         free_blocks: u32,
     ) -> Result<()> {
         let at = crate::blockdev::VOLUME_HEADER_OFFSET + 112 + 80 * 2; // the catalog is the third of the five forks
-        self.device.write_at(at, &fork.to_bytes())?;
+        self.journal_write(at, &fork.to_bytes())?;
         // A fork's length and location changed, which is the one thing the alternate
         // header exists to record. See `sync_backup_header`.
         self.sync_backup_header()?;
@@ -3370,7 +3771,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             )?;
             bt.node_offset(0)? + NODE_DESCRIPTOR_SIZE as u64
         };
-        self.device.write_at(at + offset, &value.to_be_bytes())
+        self.journal_write(at + offset, &value.to_be_bytes())
     }
 
     /// Replace the record whose body names `cnid`, whatever its type.
@@ -3414,7 +3815,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // catalog that does not start at block 0 -- which is every volume this
         // crate generates, and most real ones -- would otherwise be written over
         // the allocation bitmap and the volume header.
-        self.device.write_at(node_at, &patched)
+        self.journal_write(node_at, &patched)
     }
 
     /// Locate the record whose body names `cnid`.
@@ -3528,6 +3929,17 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// `extentNextBlock - nextBlock`, zeroes the descriptors of every following
     /// extent, and takes the `peof == 0` path first.
     pub fn truncate_file(&mut self, cnid: u32, new_len: u64) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.truncate_file_inner(cnid, new_len);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn truncate_file_inner(&mut self, cnid: u32, new_len: u64) -> Result<()> {
         let block_size = self.header.block_size;
         let mut record = self.read_file_record(cnid)?;
         let keep = (new_len as usize + block_size as usize - 1) / block_size as usize;
@@ -3803,7 +4215,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 1
             };
             let at = mapper.map_to_device_offset((i / block_size) as u32, in_block as u64)?;
-            self.device.write_at(at, &bytes[i..i + span])?;
+            self.journal_write(at, &bytes[i..i + span])?;
             i += span;
         }
         self.write_header_u32(48, free_blocks)
@@ -3900,7 +4312,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             // be written to the wrong place, silently.
             (bt.node_offset(node_num)?, buf)
         };
-        self.device.write_at(at, &patched)
+        self.journal_write(at, &patched)
     }
 
     /// Locate a catalog record by CNID, walking the leaf chain.
@@ -4239,7 +4651,11 @@ impl Object {
     /// Returns `None` for a thread record. A thread record is not an object, and
     /// turning one into a zeroed file would make a directory listing report
     /// phantom entries rather than dropping them.
-    fn from_record(name: Vec<u16>, record: CatalogRecord, volume_expanded: bool) -> Option<Self> {
+    pub(crate) fn from_record(
+        name: Vec<u16>,
+        record: CatalogRecord,
+        volume_expanded: bool,
+    ) -> Option<Self> {
         Some(match record {
             CatalogRecord::Thread(_) => return None,
             other => Self::from_main_record(name, other, volume_expanded),
@@ -4326,6 +4742,24 @@ impl Object {
         }
     }
 
+    /// The POSIX mode: type bits plus permission bits.
+    ///
+    /// This is what `st_mode` in `struct stat` would carry. The type bits come
+    /// from the record (folder vs. file), the permission bits from the BSD info
+    /// word. A caller that needs only the permission bits can mask with
+    /// `0o7777`.
+    pub fn mode(&self) -> u32 {
+        let perms = u32::from(self.bsd_info().file_mode);
+        let type_bits: u32 = if self.is_symlink() {
+            S_IFLNK as u32
+        } else if self.is_dir() {
+            S_IFDIR as u32
+        } else {
+            S_IFREG as u32
+        };
+        perms | type_bits
+    }
+
     /// The object's five timestamps.
     pub fn times(&self) -> Times {
         match self {
@@ -4358,6 +4792,20 @@ impl Object {
     /// Whether this file has a resource fork.
     pub fn has_resource_fork(&self) -> bool {
         self.resource_size() > 0
+    }
+
+    /// The link count as POSIX `st_nlinks` would report it.
+    ///
+    /// For files this is the `linkCount` (or `iNodeNum`) field from the record's
+    /// BSD info, depending on whether the file is a hard link (see
+    /// [`FileRecord::link_count`]). For directories it is 2 -- the `.` and `..`
+    /// entries -- unless the file is in the private hardlinks folder, in which
+    /// case directory hard-link counts are tracked separately.
+    pub fn nlink(&self) -> u32 {
+        match self {
+            Object::Directory(_) => 2,
+            Object::File(f) => f.link_count,
+        }
     }
 
     /// The file record behind this object, if it is a file.
@@ -4545,8 +4993,152 @@ mod tests {
             false,
         )
         .expect("a file record becomes an object");
-        assert!(!obj.is_symlink());
         assert!(!obj.is_dir());
+        assert!(!obj.is_symlink());
+        assert_eq!(obj.cnid(), Cnid(16));
+    }
+
+    #[test]
+    fn mode_combines_type_and_permission_bits() {
+        // Symlink with 0777 permissions: mode should be S_IFLNK | 0o777.
+        let symlink = Object::from_record(
+            "link".encode_utf16().collect(),
+            CatalogRecord::File(Box::new(FileRecord {
+                record_type: 2,
+                flags: 0,
+                reserved1: 0,
+                file_id: Cnid(16),
+                create_date: 0,
+                content_mod_date: 0,
+                attribute_mod_date: 0,
+                access_date: 0,
+                backup_date: 0,
+                bsd_info: BsdInfo {
+                    owner_id: 0,
+                    group_id: 0,
+                    admin_flags: 0,
+                    owner_flags: 0,
+                    file_mode: S_IFLNK | 0o777,
+                    special: 1,
+                },
+                user_info: [0; 16],
+                finder_info: [0; 16],
+                text_encoding: 0,
+                reserved2: 0,
+                data_fork: ForkData::EMPTY,
+                resource_fork: ForkData::EMPTY,
+            })),
+            false,
+        )
+        .expect("a symlink becomes an object");
+        assert_eq!(symlink.mode(), u32::from(S_IFLNK) | 0o777);
+
+        // Regular file with 0644: mode should be S_IFREG | 0o644.
+        let reg = Object::from_record(
+            vec![0x66],
+            CatalogRecord::File(Box::new(FileRecord {
+                record_type: 2,
+                flags: 0,
+                reserved1: 0,
+                file_id: Cnid(16),
+                create_date: 0,
+                content_mod_date: 0,
+                attribute_mod_date: 0,
+                access_date: 0,
+                backup_date: 0,
+                bsd_info: BsdInfo {
+                    owner_id: 0,
+                    group_id: 0,
+                    admin_flags: 0,
+                    owner_flags: 0,
+                    file_mode: S_IFREG | 0o644,
+                    special: 1,
+                },
+                user_info: [0; 16],
+                finder_info: [0; 16],
+                text_encoding: 0,
+                reserved2: 0,
+                data_fork: ForkData::EMPTY,
+                resource_fork: ForkData::EMPTY,
+            })),
+            false,
+        )
+        .expect("a regular file becomes an object");
+        assert_eq!(reg.mode(), u32::from(S_IFREG) | 0o644);
+        assert_eq!(
+            reg.mode() & 0o7777,
+            0o644,
+            "permission bits must be preserved"
+        );
+    }
+
+    #[test]
+    fn nlink_is_two_for_directories_and_from_record_for_files() {
+        use crate::catalog::record::K_HFS_PLUS_FOLDER_RECORD;
+        // Directory: nlink is always 2 (`.` and `..`).
+        let folder = FolderRecord {
+            record_type: K_HFS_PLUS_FOLDER_RECORD,
+            flags: 0,
+            valence: 0,
+            folder_id: ROOT_FOLDER_ID,
+            create_date: 0,
+            content_mod_date: 0,
+            attribute_mod_date: 0,
+            access_date: 0,
+            backup_date: 0,
+            bsd_info: BsdInfo {
+                owner_id: 0,
+                group_id: 0,
+                admin_flags: 0,
+                owner_flags: 0,
+                file_mode: S_IFDIR | 0o755,
+                special: 0,
+            },
+            user_info: [0; 16],
+            finder_info: [0; 16],
+            text_encoding: 0,
+            folder_count: 0,
+        };
+        let obj = Object::from_record(
+            "dir".encode_utf16().collect(),
+            CatalogRecord::Folder(folder),
+            false,
+        )
+        .expect("a folder record becomes an object");
+        assert_eq!(obj.nlink(), 2);
+
+        // File with link_count 3.
+        let file = Object::from_record(
+            "file".encode_utf16().collect(),
+            CatalogRecord::File(Box::new(FileRecord {
+                record_type: 2,
+                flags: 0,
+                reserved1: 0,
+                file_id: Cnid(16),
+                create_date: 0,
+                content_mod_date: 0,
+                attribute_mod_date: 0,
+                access_date: 0,
+                backup_date: 0,
+                bsd_info: BsdInfo {
+                    owner_id: 0,
+                    group_id: 0,
+                    admin_flags: 0,
+                    owner_flags: 0,
+                    file_mode: S_IFREG | 0o644,
+                    special: 3,
+                },
+                user_info: [0; 16],
+                finder_info: [0; 16],
+                text_encoding: 0,
+                reserved2: 0,
+                data_fork: ForkData::EMPTY,
+                resource_fork: ForkData::EMPTY,
+            })),
+            false,
+        )
+        .expect("a file record becomes an object");
+        assert_eq!(file.nlink(), 3);
     }
 
     #[test]
