@@ -133,6 +133,17 @@ Two key layouts were wrong here and are now pinned by tests:
 | Rust | `src/journal/` |
 | Differences | no retry loop. Apple restarts with `end = txn_start_offset` and gives up after three attempts, which yields the same transactions as truncating once; it differs only for a transient device error. No conversion of legacy `'JHDR'` magic in place — that is a write, and this crate does not write. |
 
+The writer side of the journal header is also mined and implemented:
+`free_space` (the ring arithmetic, three cases), `check_free_space` (strict `>`, pending
+check, and the `SpaceCheck` deferred-write signal), `commit_transaction` (end advance
+wrapping at `size`, sequence bump), `release_transaction` (start advance), `JournalHeader::to_bytes`
+(native byte-order encoding with checksum), `write_journal_header` (1024-byte block at the
+journal offset), the deferred-header-write flag, the `TransactionBuffer` in-memory block
+buffer (the port of `block_list_header_in_memory`), and `commit_transaction` the full
+commit path (encode, write with ring-wrap, barrier sync, advance cursor, write header).
+What remains is wiring `commit_transaction` into the mutating write paths so a journalled
+volume accepts writes.
+
 ## Timestamps
 
 | | |
@@ -371,10 +382,10 @@ compression metadata (7B.2) are done and appear above.
 | Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | Milestone 10D |
 | Opened-but-deleted files in the metadata directory | `HFS_DELETE_PREFIX "temp"`; TN1150's Hard Links section | Milestone 10D |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
-| **Writing** a journal transaction -- ordering, space, header advance | `core/hfs_vfsutils.c` `hfs_start_transaction`/`hfs_end_transaction`; `core/hfs_journal.c` `check_free_space`, `journal_open` | Milestone 12, **now first** |
+| **Writing** a journal transaction -- ordering, space, header advance | `core/hfs_vfsutils.c` `hfs_start_transaction`/`hfs_end_transaction`; `core/hfs_journal.c` `check_free_space`, `journal_open` | done |
 | The transaction's in-memory block buffer | `core/hfs_journal.c` the `block_list_header_in_memory` buffers a dirty block is copied into | Milestone 12 |
 | `binfo[]` capacity and multi-list splitting | `MAX_BLISTHDR_BLKS` | Milestone 12 |
-| Deferred journal-header writes | `tr->delayed_header_write`, `write_header_thread` | Milestone 12, later |
+| Deferred journal-header writes | `tr->delayed_header_write`, `write_header_thread` | done |
 | The syncer and `nextAllocation` interactions | `hfs_syncer`, `HFS_SKIP_UPDATE_NEXT_ALLOCATION` | Milestone 12 |
 
 ### The "exchange" is not an exchange

@@ -301,6 +301,7 @@ fn the_header_offsets_the_ring_uses_are_the_ones_apple_declares() {
     let h = JournalHeader {
         magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
         endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        byte_order: hfsplus::journal::ByteOrder::Big,
         start: 4096,
         end: 8192,
         size: 1 << 20,

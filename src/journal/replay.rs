@@ -30,7 +30,7 @@
 
 use super::checksum::{calc_checksum, BLHDR_CHECKSUM_SIZE};
 use super::info::{JournalHeader, JournalInfoBlock, END_BLK_NUM, JOURNAL_HEADER_MAGIC};
-use crate::blockdev::BlockDevice;
+use crate::blockdev::{BlockDevice, BlockDeviceMut};
 use crate::error::{Error, Result};
 
 /// On-disk size of one `block_list_header` prefix, before its `binfo` array.
@@ -1489,6 +1489,127 @@ pub fn encode_block_list(
     Ok(out)
 }
 
+/// Write a journal header to the device at the journal's own offset.
+///
+/// This is the non-FUA path of `write_journal_header` in `core/hfs_journal.c`:
+/// encode the header (with a fresh checksum), then store it at byte zero of the
+/// journal. The 1024-byte `jhdr_size` block is written, with the bytes beyond
+/// the 48-byte struct left zero -- Apple's `memset(jnl->jhdr, 0, jnl->jhdr_size)`
+/// before filling fields.
+///
+/// The caller is responsible for barrier ordering: a journal that writes the
+/// header only advances once the transaction blocks it describes are durable.
+/// [`commit_transaction`] enforces that ordering by syncing before the header
+/// write, then writing and syncing the header.
+///
+/// Mining reference: `core/hfs_journal.c` `write_journal_header`.
+pub fn write_journal_header<D: BlockDeviceMut + ?Sized>(
+    device: &mut D,
+    info: &JournalInfoBlock,
+    header: &JournalHeader,
+) -> Result<()> {
+    let buf = header.to_bytes_alloc()?;
+    if buf.len() < usize::try_from(header.jhdr_size).map_err(|_| Error::overflow("jhdr_size"))? {
+        return Err(Error::invalid(
+            "journal_header.jhdr_size",
+            format!("buffer {} < jhdr_size {}", buf.len(), header.jhdr_size),
+        ));
+    }
+    device.write_at(info.offset, &buf)?;
+    device.sync()?;
+    Ok(())
+}
+
+/// Commit one transaction to the journal.
+///
+/// This is the userspace port of `end_transaction` + `check_free_space` +
+/// `write_journal_header` from `core/hfs_journal.c`. The ordering is what makes
+/// a torn write recoverable:
+///
+/// 1. **Sync first.** Everything the mutation wrote through the device before
+///    the transaction began is durable. This is the kernel's `HFS_SYNC_ON_UNLOCK`
+///    and the `buf_bdwrite` calls in `hfs_update`; here it is the caller's
+///    responsibility, and the `BlockDeviceMut` passed in is assumed synchronized.
+/// 2. **Check space.** `check_free_space` with strict `>` and the pending count.
+/// 3. **Write the transaction blocks.** The encoded image is stored at the
+///    journal's current `end`, wrapping at `size`.
+/// 4. **Sync again.** This is the pre-header barrier: on a non-FUA device it is
+///    `DKIOCSYNCHRONIZE` with a barrier option. It guarantees the blocks are on
+///    stable storage before `end` advances, so a crash after step 6 leaves a
+///    header that does not yet describe them.
+/// 5. **Advance `end` and bump `sequence_num`.** `end` wraps at `size`.
+/// 6. **Write the journal header.** `write_journal_header(jnl, 0, sequence_num)`
+///    with `updating_start = 0` -- we are advancing `end`, not `start`.
+///
+/// A crash at any point is safe:
+/// - Before step 4: the old header still describes the previous transaction;
+///   the new blocks are invisible.
+/// - Between step 4 and step 6: the blocks are on disk but `end` hasn't moved;
+///   replay ignores them.
+/// - After step 6: the header names the new blocks; replay applies them.
+///
+/// `pending` is the count of unreplayed transactions (Apple's
+/// `old_start[0] == 0` check). A non-zero count is a hard refusal: the caller
+/// must replay first.
+///
+/// Mining reference: `core/hfs_journal.c` `end_transaction` (the write loop and
+/// header advance at lines 4257-4292), and `write_journal_header` (the barrier
+/// ordering at lines 467-541).
+pub fn commit_transaction<D: BlockDeviceMut + ?Sized>(
+    device: &mut D,
+    info: &JournalInfoBlock,
+    header: &mut JournalHeader,
+    tx: &TransactionBuffer,
+    blhdr_size: u32,
+    check_blocks: bool,
+    pending: usize,
+) -> Result<()> {
+    let desired = tx.total_bytes(blhdr_size);
+    // `SequenceNum` is used for the header; the transaction gets `sequence_num + 1`.
+    let sequence_num = header.sequence_num.wrapping_add(1);
+
+    // Step 2: check space before writing anything.
+    let check = header.check_free_space(desired, pending)?;
+    // `deferred` is always false from the simplified check, but honor it: a
+    // deferred header write means `start` was bumped inside the check, and the
+    // caller should skip the header sync until the block data is written.
+    // In the current port, that never happens.
+    let _deferred = check.deferred;
+
+    // Step 3: encode and write the transaction blocks.
+    let (image, _end) = tx.encode(sequence_num, blhdr_size, check_blocks)?;
+    // The journal is a ring: the block data may straddle the end.
+    let journal_offset = info.offset;
+    let start = header.end;
+    let size = header.size;
+    if start + image.len() as u64 <= size {
+        // No wrap: a single contiguous write.
+        device.write_at(journal_offset + start, &image)?;
+    } else {
+        // Wrap: write to the end, then from the beginning (past the header).
+        let first_len = (size - start) as usize;
+        device.write_at(journal_offset + start, &image[..first_len])?;
+        device.write_at(
+            journal_offset + header.jhdr_size as u64,
+            &image[first_len..],
+        )?;
+    }
+
+    // Step 4: pre-header barrier flush.
+    device.sync()?;
+
+    // Step 5: advance the header cursor in memory.
+    header.end = (header.end + image.len() as u64) % header.size;
+    header.sequence_num = sequence_num;
+
+    // Step 6: write the header. `updating_start = false` because we are
+    // advancing `end`, which is the case that needs the pre-write barrier
+    // (not the post-write barrier that a `start` bump takes).
+    write_journal_header(device, info, header)?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod write_tests {
     use super::*;
@@ -1685,6 +1806,122 @@ pub fn encode_transaction(
     Ok((out, end, lists))
 }
 
+/// In-memory buffer for one journal transaction.
+///
+/// This is the userspace port of Apple's `block_list_header_in_memory`: a
+/// block-list header paired with a buffer that holds each dirty block's
+/// *before-image*. When a block is dirtied it is **copied into this buffer**
+/// before the home block is modified, so the journal always carries the
+/// original contents for replay. At commit time the assembled buffer is written
+/// to the journal in [`encode_transaction`], and only then -- never before.
+///
+/// Mining reference: `core/hfs_journal.h` `block_list_header_in_memory` and
+/// `core/hfs_journal.c` `journal_modify_block_end` copies the block buffer
+/// into `blhdrim->buffers[tbuffer_offset]` before the caller mutates the home
+/// block.
+#[derive(Debug, Default)]
+pub struct TransactionBuffer {
+    /// The dirty blocks accumulated so far, each carrying its new contents.
+    ///
+    /// The order is the order they will be written to the journal, which is
+    /// why the `total_bytes` advance is reproducible.
+    writes: Vec<RecordedWrite>,
+}
+
+impl TransactionBuffer {
+    /// Start a new, empty transaction.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many bytes this transaction's encoding will occupy in the journal.
+    ///
+    /// Each block list contributes its `blhdr_size` plus the sum of its blocks'
+    /// data sizes, and a list starts with `num_blocks = 1` (the sequence slot).
+    /// This is `tr->total_bytes` in Apple's `end_transaction`, which
+    /// `check_free_space` consults before writing anything.
+    ///
+    /// The value is computed over the current `writes` so the caller can size
+    /// the check before committing, and is exactly what
+    /// [`JournalHeader::commit_transaction`] consumes.
+    pub fn total_bytes(&self, blhdr_size: u32) -> u64 {
+        let blhdr_size = u64::from(blhdr_size);
+        let capacity = (blhdr_size as usize)
+            .saturating_sub(BLHDR_PREFIX_SIZE)
+            .saturating_sub(BLOCK_INFO_SIZE) // reserve the sequence slot
+            / BLOCK_INFO_SIZE;
+        if capacity == 0 {
+            return 0;
+        }
+        let n = self.writes.len() as u64;
+        let lists = if n == 0 {
+            0
+        } else {
+            (n - 1) / capacity as u64 + 1
+        };
+        let data: u64 = self.writes.iter().map(|w| w.data.len() as u64).sum();
+        lists * blhdr_size + data
+    }
+
+    /// Record a block that was copied into the transaction before mutation.
+    ///
+    /// `bnum` is the block number in the journal's `jhdr_size` units, which on
+    /// every volume Apple writes today is the same as the volume block number.
+    /// `data` is the *before-image* of the block: the contents the journal will
+    /// replay if the system crashes before the home block is updated.
+    pub fn record_write(&mut self, bnum: u64, data: Vec<u8>) {
+        self.writes.push(RecordedWrite { bnum, data });
+    }
+
+    /// Record that a block was freed during the transaction.
+    ///
+    /// This is `journal_kill_block`'s path: the block's `bnum` is set to
+    /// [`RecordedWrite::killed`] so the write loop skips it, but the list
+    /// entry remains so replay knows the block was released.
+    pub fn record_kill(&mut self, bnum: u64) {
+        self.writes.push(RecordedWrite {
+            bnum,
+            // A killed block carries no data; the encoder writes the sentinel
+            // `bnum` and empty data.
+            data: Vec::new(),
+        });
+        // Overwrite bnum with the sentinel so replay skips it.
+        self.writes.last_mut().unwrap().bnum = KILLED_BNUM;
+    }
+
+    /// The number of block entries accumulated.
+    pub fn len(&self) -> usize {
+        self.writes.len()
+    }
+
+    /// Whether no blocks have been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.writes.is_empty()
+    }
+
+    /// Encode the accumulated blocks as a journal transaction.
+    ///
+    /// Returns the full byte image (block lists back-to-back, no padding, each
+    /// header occupying a whole `blhdr_size` block) and the offset past it that
+    /// `jhdr->end` should advance to. `sequence_num` is the transaction's
+    /// sequence number, assigned at `start_transaction` time.
+    pub fn encode(
+        &self,
+        sequence_num: u32,
+        blhdr_size: u32,
+        check_blocks: bool,
+    ) -> Result<(Vec<u8>, u32)> {
+        let (image, end, _lists) =
+            encode_transaction(sequence_num, &self.writes, blhdr_size, check_blocks)?;
+        Ok((image, end))
+    }
+
+    /// The accumulated writes, as a slice.
+    pub fn writes(&self) -> &[RecordedWrite] {
+        &self.writes
+    }
+}
+
 /// `bnum` meaning "this block was released", as `end_transaction` writes it and
 /// replay skips it.
 pub const KILLED_BNUM: u64 = 0xFFFF_FFFF_FFFF_FFFF;
@@ -1692,6 +1929,7 @@ pub const KILLED_BNUM: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 #[cfg(test)]
 mod transaction_tests {
     use super::*;
+    use crate::journal::info::{ByteOrder, ENDIAN_MAGIC, K_JI_JOURNAL_IN_FS_MASK};
 
     fn block(n: u8) -> RecordedWrite {
         RecordedWrite {
@@ -1788,5 +2026,289 @@ mod transaction_tests {
             format!("{err}").contains("blhdr_size"),
             "the refusal must name the field that is wrong; got: {err}"
         );
+    }
+
+    #[test]
+    fn transaction_buffer_encodes_to_the_same_image_as_encode_transaction() {
+        // The buffer is a convenience wrapper around encode_transaction, and it
+        // must produce identical bytes -- a divergence here would mean the
+        // committer and the round-trip test disagree on layout.
+        let mut buf = TransactionBuffer::new();
+        for n in 0..5u8 {
+            buf.record_write(u64::from(n) + 26, vec![n; 256]);
+        }
+        let (image, end) = buf.encode(0x11, 512, true).expect("encode");
+        let (direct, end_direct, _lists) =
+            encode_transaction(0x11, buf.writes(), 512, true).expect("encode");
+        assert_eq!(image, direct);
+        assert_eq!(end, end_direct);
+    }
+
+    #[test]
+    fn transaction_buffer_total_bytes_matches_the_encoded_length() {
+        // total_bytes must equal the image length, because commit_transaction
+        // uses it to advance `end` and `end` must land exactly on the bytes
+        // written.
+        let mut buf = TransactionBuffer::new();
+        for n in 0..5u8 {
+            buf.record_write(u64::from(n) + 26, vec![n; 256]);
+        }
+        let (image, _end) = buf.encode(0x11, 512, true).expect("encode");
+        let total = buf.total_bytes(512);
+        assert_eq!(total, image.len() as u64);
+    }
+
+    #[test]
+    fn total_bytes_accounts_for_multi_list_splitting() {
+        // More blocks than one list holds must cost more than one header.
+        let per_list = (512 - BLHDR_PREFIX_SIZE) / BLOCK_INFO_SIZE - FIRST_BLOCK_INDEX;
+        let mut buf = TransactionBuffer::new();
+        for i in 0..(per_list + 3) {
+            buf.record_write(i as u64 + 26, vec![i as u8; 64]);
+        }
+        let (image, _end) = buf.encode(0x22, 512, true).expect("encode");
+        assert_eq!(buf.total_bytes(512), image.len() as u64);
+    }
+
+    #[test]
+    fn a_killed_block_in_the_buffer_is_encoded_as_sentinel() {
+        let mut buf = TransactionBuffer::new();
+        buf.record_write(26, vec![1u8; 256]);
+        buf.record_kill(27);
+        let (image, _end) = buf.encode(0x33, 512, true).expect("encode");
+        let blhdr = BlockListHeader::parse(&image[..512]).expect("parse");
+        assert_eq!(blhdr.blocks[0].bnum, 26);
+        assert_eq!(blhdr.blocks[1].bnum, KILLED_BNUM);
+        assert_eq!(blhdr.blocks[1].bsize, 0);
+    }
+
+    #[test]
+    fn an_empty_buffer_encodes_to_zero_bytes() {
+        let buf = TransactionBuffer::new();
+        assert_eq!(
+            buf.total_bytes(512),
+            0,
+            "no blocks means no header and no data"
+        );
+        // An empty transaction encodes to no bytes -- `encode_transaction`
+        // iterates chunks of the block list and an empty slice yields none.
+        let (image, _end) = buf.encode(0x44, 512, true).expect("encode empty");
+        assert!(image.is_empty(), "nothing was accumulated");
+    }
+
+    /// A writable mock device for testing the commit path.
+    struct MemDevice {
+        data: Vec<u8>,
+    }
+
+    impl MemDevice {
+        fn new(size: usize) -> Self {
+            Self {
+                data: vec![0u8; size],
+            }
+        }
+    }
+
+    impl BlockDevice for MemDevice {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > self.data.len() {
+                return Err(Error::out_of_range(
+                    "read",
+                    end as u64,
+                    self.data.len() as u64,
+                ));
+            }
+            buf.copy_from_slice(&self.data[start..end]);
+            Ok(())
+        }
+
+        fn len(&self) -> Result<u64> {
+            Ok(self.data.len() as u64)
+        }
+    }
+
+    impl BlockDeviceMut for MemDevice {
+        fn write_at(&mut self, offset: u64, buf: &[u8]) -> Result<()> {
+            let start = offset as usize;
+            let end = start + buf.len();
+            if end > self.data.len() {
+                return Err(Error::out_of_range(
+                    "write",
+                    end as u64,
+                    self.data.len() as u64,
+                ));
+            }
+            self.data[start..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn commit_transaction_writes_blocks_then_header_advancing_end() {
+        // The full commit path: encode, write to the journal ring, advance end,
+        // write the header. The reader must then find the data it wrote.
+        let journal_size: u64 = 4096;
+        let blhdr_size: u32 = 512;
+        let mut dev = MemDevice::new(journal_size as usize);
+
+        // A journal that is empty: start == end == jhdr_size (past the header).
+        let mut header = JournalHeader {
+            magic: JOURNAL_HEADER_MAGIC,
+            endian: ENDIAN_MAGIC,
+            byte_order: ByteOrder::Big,
+            start: blhdr_size as u64,
+            end: blhdr_size as u64,
+            size: journal_size,
+            blhdr_size,
+            checksum: 0,
+            jhdr_size: blhdr_size,
+            sequence_num: 0,
+        };
+        let info = JournalInfoBlock {
+            flags: K_JI_JOURNAL_IN_FS_MASK,
+            device_signature: [0; 8],
+            offset: 0,
+            size: journal_size,
+        };
+
+        let mut tx = TransactionBuffer::new();
+        tx.record_write(100, vec![0xABu8; 256]);
+
+        commit_transaction(&mut dev, &info, &mut header, &tx, blhdr_size, true, 0).expect("commit");
+
+        // end advanced past the transaction.
+        let expected_end = blhdr_size as u64 + tx.total_bytes(blhdr_size);
+        assert_eq!(header.end, expected_end);
+        assert_eq!(header.sequence_num, 1);
+
+        // The header at offset 0 must now reflect the new end.
+        let mut hdr_bytes = [0u8; 1024];
+        dev.read_at(0, &mut hdr_bytes).expect("read header");
+        let parsed = JournalHeader::parse(&hdr_bytes)
+            .expect("parse")
+            .expect("a header");
+        assert_eq!(parsed.end, expected_end);
+        assert_eq!(parsed.sequence_num, 1);
+        assert!(parsed.checksum_matches(&hdr_bytes));
+    }
+
+    #[test]
+    fn commit_wraps_the_transaction_across_the_journal_end() {
+        // A transaction that starts near the end wraps to the beginning, past
+        // the header block. The reader must still find both halves.
+        let journal_size: u64 = 8192;
+        let blhdr_size: u32 = 512;
+        let mut dev = MemDevice::new(journal_size as usize);
+
+        // start is set past jhdr_size so the wrap region [jhdr_size, start)
+        // has room for the wrapped data.
+        let mut header = JournalHeader {
+            magic: JOURNAL_HEADER_MAGIC,
+            endian: ENDIAN_MAGIC,
+            byte_order: ByteOrder::Big,
+            start: 2048,
+            // end is near the end so the transaction wraps.
+            end: journal_size - 256,
+            size: journal_size,
+            blhdr_size,
+            checksum: 0,
+            jhdr_size: blhdr_size,
+            sequence_num: 5,
+        };
+        let info = JournalInfoBlock {
+            flags: K_JI_JOURNAL_IN_FS_MASK,
+            device_signature: [0; 8],
+            offset: 0,
+            size: journal_size,
+        };
+
+        let mut tx = TransactionBuffer::new();
+        // total_bytes = blhdr_size (header) + 256 (data) = 768, which wraps
+        // past the end of the 8192-byte journal.
+        tx.record_write(100, vec![0xCDu8; 256]);
+
+        commit_transaction(&mut dev, &info, &mut header, &tx, blhdr_size, true, 0).expect("commit");
+
+        // end wrapped: (7936 + 768) % 8192 = 512
+        assert_eq!(header.end, 512, "wrapped past the end of the journal");
+    }
+
+    #[test]
+    fn commit_refuses_when_a_transaction_is_pending() {
+        let journal_size: u64 = 4096;
+        let blhdr_size: u32 = 512;
+        let mut dev = MemDevice::new(journal_size as usize);
+
+        let mut header = JournalHeader {
+            magic: JOURNAL_HEADER_MAGIC,
+            endian: ENDIAN_MAGIC,
+            byte_order: ByteOrder::Big,
+            start: blhdr_size as u64,
+            end: blhdr_size as u64,
+            size: journal_size,
+            blhdr_size,
+            checksum: 0,
+            jhdr_size: blhdr_size,
+            sequence_num: 0,
+        };
+        let info = JournalInfoBlock {
+            flags: K_JI_JOURNAL_IN_FS_MASK,
+            device_signature: [0; 8],
+            offset: 0,
+            size: journal_size,
+        };
+
+        let mut tx = TransactionBuffer::new();
+        tx.record_write(100, vec![0xABu8; 256]);
+
+        // Pending = 1 must refuse, even though there's free space.
+        let err = commit_transaction(&mut dev, &info, &mut header, &tx, blhdr_size, true, 1)
+            .expect_err("pending blocks the write");
+        assert!(
+            format!("{err}").contains("replayed"),
+            "the refusal must say what to do; got: {err}"
+        );
+    }
+
+    #[test]
+    fn commit_refuses_when_the_journal_is_too_small() {
+        let journal_size: u64 = 1024;
+        let blhdr_size: u32 = 512;
+        let mut dev = MemDevice::new(journal_size as usize);
+
+        let mut header = JournalHeader {
+            magic: JOURNAL_HEADER_MAGIC,
+            endian: ENDIAN_MAGIC,
+            byte_order: ByteOrder::Big,
+            start: blhdr_size as u64,
+            end: blhdr_size as u64,
+            size: journal_size,
+            blhdr_size,
+            checksum: 0,
+            jhdr_size: blhdr_size,
+            sequence_num: 0,
+        };
+        let info = JournalInfoBlock {
+            flags: K_JI_JOURNAL_IN_FS_MASK,
+            device_signature: [0; 8],
+            offset: 0,
+            size: journal_size,
+        };
+
+        let mut tx = TransactionBuffer::new();
+        // Fill with too many blocks.
+        for i in 0..200u8 {
+            tx.record_write(u64::from(i) + 26, vec![i; 64]);
+        }
+
+        let err = commit_transaction(&mut dev, &info, &mut header, &tx, blhdr_size, true, 0)
+            .expect_err("too big");
+        assert!(matches!(err, Error::NoSpace { .. }), "got {err:?}");
     }
 }

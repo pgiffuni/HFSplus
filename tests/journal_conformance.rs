@@ -627,6 +627,7 @@ fn a_block_list_header_size_too_small_to_hold_one_is_refused() {
     let mut header = hfsplus::journal::info::JournalHeader {
         magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
         endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        byte_order: hfsplus::journal::ByteOrder::Big,
         start: 4096,
         end: 12288,
         size: 524288,
@@ -671,6 +672,7 @@ fn a_journal_header_pointing_at_its_own_header_is_refused() {
         let header = hfsplus::journal::info::JournalHeader {
             magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
             endian: hfsplus::journal::info::ENDIAN_MAGIC,
+            byte_order: hfsplus::journal::ByteOrder::Big,
             start,
             end,
             size: 524288,
@@ -694,6 +696,7 @@ fn a_journal_header_pointing_at_its_own_header_is_refused() {
     let sound = hfsplus::journal::info::JournalHeader {
         magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
         endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        byte_order: hfsplus::journal::ByteOrder::Big,
         start: 4096,
         end: 12288,
         size: 524288,
@@ -885,6 +888,7 @@ fn a_journal_is_clean_exactly_when_start_equals_end() {
     let header = hfsplus::journal::info::JournalHeader {
         magic: hfsplus::journal::info::JOURNAL_HEADER_MAGIC,
         endian: hfsplus::journal::info::ENDIAN_MAGIC,
+        byte_order: hfsplus::journal::ByteOrder::Big,
         start: 4096,
         end: 4096,
         size: 524288,

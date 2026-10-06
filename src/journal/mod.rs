@@ -17,24 +17,30 @@
 //! volume header, and `core/hfs_journal.c` (`journal_open`) reads the info block
 //! and validates `flags`.
 //!
-//! # This crate reads journals and does not write them
+//! # This crate reads journals and writes transactions
 //!
-//! Everything here so far is the *recovery* side. Apple's writer does something
-//! quite different, and the difference is not a detail this module can defer.
+//! Everything below the transaction-committer level is the *recovery* side: it
+//! walks the block lists and overlays the recorded blocks. The writer side is
+//! the port of `end_transaction` + `write_journal_header` from `core/hfs_journal.c`,
+//! and it is built in three layers:
 //!
-//! On a journalled volume, **a writer does not write the catalog**. It opens a
-//! *transaction*, mutates, and commits; the journal captures the blocks the
-//! mutation touched and the filesystem structures are brought up to date
-//! afterwards. `hfs_start_transaction` and `hfs_end_transaction` bracket every
-//! mutating path in the kernel — `core/hfs_catalog.c`, `core/hfs_cnode.c`,
-//! `core/hfs_btreeio.c` and `core/hfs_cprotect.c` each call `hfs_start_transaction`
-//! before changing anything.
+//! - [`TransactionBuffer`] holds dirty block before-images in memory, porting
+//!   Apple's `block_list_header_in_memory` buffers — a block is copied into the
+//!   buffer before the home block is mutated, so the journal always carries the
+//!   original contents for replay.
+//! - [`commit_transaction`] encodes the buffer, writes the block data to the
+//!   journal ring (wrapping at `size`), syncs, advances `end`, bumps
+//!   `sequence_num`, then writes the header — the barrier ordering that makes a
+//!   torn transaction recoverable.
+//! - [`write_journal_header`] encodes and stores the header at byte zero of the
+//!   journal.
 //!
-//! So the direct block writes elsewhere in this crate reproduce the *recovery* path,
-//! not the writer's. That is coherent for a volume with no journal, and it is why
-//! [`crate::volume::WritableVolume`] refuses a journalled volume outright rather
-//! than pretending to write one — but it also means every volume this crate mutates
-//! is a **non-journalled** volume, which is a shape macOS does not produce.
+//! The commit path is wired in but not yet called by the mutating write paths:
+//! a volume this crate mutates stays **non-journalled**, and
+//! [`crate::volume::WritableVolume`] still refuses a journalled volume rather
+//! than pretending to write one — not from lack of machinery, but because
+//! every mutation must be re-expressed to write through the transaction buffer
+//! instead of the home block, which is a change to all of them at once.
 //!
 //! That has a measurable consequence for verification, and it is not a subtlety:
 //! `fsck.hfsplus` prints "Checking Journaled HFS Plus volume" or "Checking
@@ -83,7 +89,8 @@ pub mod info;
 pub mod replay;
 
 pub use checksum::{calc_checksum, BLHDR_CHECKSUM_SIZE, JOURNAL_HEADER_CKSUM_SIZE};
-pub use info::{JournalFlags, JournalHeader, JournalInfoBlock, END_BLK_NUM};
+pub use info::{ByteOrder, JournalFlags, JournalHeader, JournalInfoBlock, SpaceCheck, END_BLK_NUM};
 pub use replay::{
-    encode_block_list, Journal, RecordedWrite, ReplayedBlock, Transaction, MAX_BLOCKS_PER_LIST,
+    commit_transaction, encode_block_list, encode_transaction, write_journal_header, Journal,
+    RecordedWrite, ReplayedBlock, Transaction, TransactionBuffer, MAX_BLOCKS_PER_LIST,
 };

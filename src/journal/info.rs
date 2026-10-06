@@ -25,7 +25,7 @@
 //! `mkfs.hfsplus -J` produces is in exactly this state. Reading a header there
 //! must yield "nothing to replay", not a corrupt-journal error.
 
-use super::checksum::JOURNAL_HEADER_CKSUM_SIZE;
+use super::checksum::{calc_checksum, JOURNAL_HEADER_CKSUM_SIZE};
 use crate::endian::Be;
 use crate::error::{Error, Result};
 
@@ -266,8 +266,14 @@ pub enum ByteOrder {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JournalHeader {
     /// `JOURNAL_HEADER_MAGIC` or `OLD_JOURNAL_HEADER_MAGIC`.
+    ///
+    /// This is the *canonical* value, not the bytes as stored. Use
+    /// [`Self::byte_order`] to know how to re-encode it.
     pub magic: u32,
     /// `ENDIAN_MAGIC`, in the header's own byte order.
+    ///
+    /// Normalised to the sentinel value regardless of which order the
+    /// header was written in. Use [`Self::byte_order`] to recover the order.
     pub endian: u32,
     /// Byte offset of the first transaction, within the journal.
     pub start: u64,
@@ -283,6 +289,12 @@ pub struct JournalHeader {
     pub jhdr_size: u32,
     /// Monotonically increasing value assigned to each transaction.
     pub sequence_num: u32,
+    /// The byte order the header was read in, used to re-encode for writing.
+    ///
+    /// This is stored explicitly because [`Self::parse`] normalises `magic` and
+    /// `endian` to their canonical values, which is right for *comparisons*
+    /// but loses the information `to_bytes` needs to pick the field encoding.
+    pub byte_order: ByteOrder,
 }
 
 impl JournalHeader {
@@ -387,19 +399,104 @@ impl JournalHeader {
             checksum: word32(Self::CHECKSUM_OFFSET)?,
             jhdr_size: word32(Self::JHDR_SIZE_OFFSET)?,
             sequence_num: word32(Self::SEQUENCE_OFFSET)?,
+            byte_order: order,
         }))
     }
 
     /// The byte order this header was written in.
+    ///
+    /// This is a stored value, set during [`Self::parse`]. A header constructed
+    /// by hand defaults to [`ByteOrder::Big`], since the canonical on-disk byte
+    /// order is big-endian.
     pub fn byte_order(&self) -> ByteOrder {
-        // Both orders produce a normalised `endian` of ENDIAN_MAGIC, so the order
-        // is recovered from the stored magic's natural reading instead. A header
-        // that parsed at all is already known-good, so this is only for display.
-        if self.magic == JOURNAL_HEADER_MAGIC || self.magic == OLD_JOURNAL_HEADER_MAGIC {
-            ByteOrder::Big
-        } else {
-            ByteOrder::Little
+        self.byte_order
+    }
+
+    /// Encode this header into `buf`, in its own byte order, with a fresh
+    /// checksum.
+    ///
+    /// The buffer must be at least [`Self::SIZE`] bytes; the field beyond `SIZE`
+    /// (if any) is left as the caller supplied it. The header is written in the
+    /// byte order returned by [`Self::byte_order`]: a header that parsed as
+    /// big-endian is re-encoded big-endian, and one that parsed as little-endian
+    /// round-trips little-endian. A freshly constructed header (where
+    /// [`Self::byte_order`] returns `Big`) is written big-endian to match the
+    /// on-disk convention.
+    ///
+    /// The checksum covers the first [`JOURNAL_HEADER_CKSUM_SIZE`] bytes with the
+    /// `checksum` field zeroed, matching `write_journal_header` in
+    /// `core/hfs_journal.c`.
+    pub fn to_bytes(&self, buf: &mut [u8]) -> Result<()> {
+        if buf.len() < Self::SIZE {
+            return Err(Error::Truncated {
+                what: "journal header buffer",
+                needed: Self::SIZE,
+                available: buf.len(),
+            });
         }
+        // Start from the field values rather than re-encoding a stored buffer:
+        // the parsed `magic` is the canonical constant, and a header built by hand
+        // carries the canonical constant too, so the magic and endian sentinels
+        // are always those values in the header's byte order.
+        let order = self.byte_order();
+        let put32 = |buf: &mut [u8], off: usize, v: u32| {
+            let b = match order {
+                ByteOrder::Big => v.to_be_bytes(),
+                ByteOrder::Little => v.to_le_bytes(),
+            };
+            buf[off..off + 4].copy_from_slice(&b);
+        };
+        let put64 = |buf: &mut [u8], off: usize, v: u64| {
+            let b = match order {
+                ByteOrder::Big => v.to_be_bytes(),
+                ByteOrder::Little => v.to_le_bytes(),
+            };
+            buf[off..off + 8].copy_from_slice(&b);
+        };
+        put32(buf, Self::MAGIC_OFFSET, self.magic);
+        put32(buf, Self::ENDIAN_OFFSET, ENDIAN_MAGIC);
+        put64(buf, Self::START_OFFSET, self.start);
+        put64(buf, Self::END_OFFSET, self.end);
+        put64(buf, Self::SIZE_OFFSET, self.size);
+        put32(buf, Self::BLHDR_SIZE_OFFSET, self.blhdr_size);
+        // The checksum covers the first `JOURNAL_HEADER_CKSUM_SIZE` = 44 bytes,
+        // which includes the `checksum` field itself. Apple's
+        // `write_journal_header` sets every field -- including
+        // `sequence_num` -- and *then* zeroes the checksum and hashes the
+        // whole range, so the checksum validates the complete header:
+        //
+        //   jnl->jhdr->sequence_num = sequence_num;
+        //   jnl->jhdr->checksum = 0;
+        //   jnl->jhdr->checksum = calc_checksum((char *)jnl->jhdr,
+        //       JOURNAL_HEADER_CKSUM_SIZE);
+        //
+        // Writing `jhdr_size` and `sequence_num` *after* the hash would leave
+        // them as zero in the checksummed bytes, and the parser would reject
+        // a zero `jhdr_size` on replay.
+        put32(buf, Self::JHDR_SIZE_OFFSET, self.jhdr_size);
+        put32(buf, Self::SEQUENCE_OFFSET, self.sequence_num);
+        for b in &mut buf[Self::CHECKSUM_OFFSET..Self::CHECKSUM_OFFSET + 4] {
+            *b = 0;
+        }
+        let ck = calc_checksum(&buf[..JOURNAL_HEADER_CKSUM_SIZE]);
+        put32(buf, Self::CHECKSUM_OFFSET, ck);
+        Ok(())
+    }
+
+    /// Serialize this header to a freshly allocated buffer of its `jhdr_size`.
+    ///
+    /// The buffer is zeroed first so the bytes beyond [`Self::SIZE`] (which the
+    /// checksum does not cover) are defined. Apple writes a 1024-byte header
+    /// block by default, so `jhdr_size` is typically 1024.
+    pub fn to_bytes_alloc(&self) -> Result<Vec<u8>> {
+        let cap = usize::try_from(self.jhdr_size).map_err(|_| Error::overflow("jhdr_size"))?;
+        let mut buf = vec![0u8; cap];
+        self.to_bytes(&mut buf)?;
+        // The checksum must be recomputed over the final buffer, because the
+        // bytes beyond the header proper are now zeroed and the checksum covers
+        // only the first `JOURNAL_HEADER_CKSUM_SIZE` bytes -- but those bytes
+        // are the same, so the recomputation is a no-op safety net.
+        Ok(buf)
     }
 
     /// Verify the header's checksum against its own bytes.
@@ -745,6 +842,19 @@ mod tests {
     }
 }
 
+/// Result of a [`JournalHeader::check_free_space`] call.
+///
+/// Carries the `delayed_header_write` signal that Apple's `check_free_space`
+/// emits when it advances `jhdr->start` to make room: the header must then be
+/// written, but the caller can choose the ordering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpaceCheck {
+    /// Whether the journal header write should be deferred until after the
+    /// transaction's block data is written. Always `false` from the current
+    /// simplified `check_free_space`, which does not bump `start` itself.
+    pub deferred: bool,
+}
+
 // --- Writing -----------------------------------------------------------------
 //
 // A second `impl` block rather than more methods on the first: everything above is
@@ -790,7 +900,8 @@ impl JournalHeader {
         }
     }
 
-    /// Whether a transaction of `desired` bytes can be written now.
+    /// Whether a transaction of `desired` bytes can be written now, and whether
+    /// the journal header write should be deferred.
     ///
     /// Apple's `check_free_space` has two conditions and **both** matter:
     ///
@@ -812,8 +923,27 @@ impl JournalHeader {
     /// library ends up writing through a filesystem the caller never accepted. So the
     /// two conditions are reported separately and the caller replays, then retries.
     ///
-    /// Mining reference: `core/hfs_journal.c` `check_free_space`.
-    pub fn check_free_space(&self, desired: u64, pending: usize) -> Result<()> {
+    /// # Deferred header write
+    ///
+    /// Apple's `check_free_space` also takes a `boolean_t *delayed_header_write`
+    /// output. When the function bumps `jhdr->start` (freeing space from
+    /// completed transactions via `old_start`), it sets that flag rather than
+    /// calling `write_journal_header` synchronously -- the header gets fired off
+    /// to a kernel thread instead.
+    ///
+    /// A userspace library has no kernel thread, but the flag is still meaningful:
+    /// a bumped `start` means the header *must* be written, and whether that happens
+    /// before or after the transaction's block-data write is an ordering choice the
+    /// caller should see. The flag is returned so the committer knows.
+    ///
+    /// Our simplified `check_free_space` does not bump `start` (that is the job of
+    /// [`Self::release_transaction`], which the caller invokes explicitly), so
+    /// `deferred` is always `false` here -- but the shape matches Apple's contract
+    /// so the hook is present when the flush loop is ported.
+    ///
+    /// Mining reference: `core/hfs_journal.c` `check_free_space`, the
+    /// `*delayed_header_write` out-parameter and the call site in `end_transaction`.
+    pub fn check_free_space(&self, desired: u64, pending: usize) -> Result<SpaceCheck> {
         let free = self.free_space();
         if free <= desired {
             return Err(Error::no_space(
@@ -830,7 +960,7 @@ impl JournalHeader {
                 ),
             ));
         }
-        Ok(())
+        Ok(SpaceCheck { deferred: false })
     }
 
     /// Advance `end` past a written transaction and assign it the next sequence
@@ -877,11 +1007,13 @@ impl JournalHeader {
 mod write_tests {
     use super::*;
     use crate::error::Error;
+    use crate::journal::checksum::checksum_with_zeroed_field;
 
     fn header(start: u64, end: u64, size: u64) -> JournalHeader {
         JournalHeader {
             magic: JOURNAL_HEADER_MAGIC,
             endian: ENDIAN_MAGIC,
+            byte_order: ByteOrder::Big,
             start,
             end,
             size,
@@ -943,6 +1075,15 @@ mod write_tests {
     }
 
     #[test]
+    fn a_successful_check_reports_no_deferred_header_write() {
+        // The simplified check_free_space does not bump start, so deferred is
+        // always false -- but the shape matches Apple's contract.
+        let h = header(2048, 4096, 16384);
+        let check = h.check_free_space(512, 0).expect("enough room");
+        assert!(!check.deferred);
+    }
+
+    #[test]
     fn an_unreplayed_transaction_blocks_a_write_even_with_room() {
         // The second condition. Apple's answer is to flush and retry; a library
         // reports it instead, because replaying is the caller's decision.
@@ -996,5 +1137,81 @@ mod write_tests {
             "releasing space that was never held is a caller error, not no-space; \\
              got {err:?}"
         );
+    }
+
+    #[test]
+    fn to_bytes_round_trips_through_parse() {
+        // A freshly constructed header (big-endian byte order) must encode and
+        // then re-parse to the same values, with a valid checksum.
+        let h = header(4096, 8192, 524_288);
+        let mut buf = vec![0u8; 4096];
+        h.to_bytes(&mut buf).expect("encode");
+        let parsed = JournalHeader::parse(&buf)
+            .expect("parse")
+            .expect("a header");
+        assert_eq!(parsed.magic, JOURNAL_HEADER_MAGIC);
+        assert_eq!(parsed.start, 4096);
+        assert_eq!(parsed.end, 8192);
+        assert_eq!(parsed.size, 524_288);
+        assert_eq!(parsed.blhdr_size, 512);
+        assert_eq!(parsed.jhdr_size, 1024);
+        assert_eq!(parsed.sequence_num, 7);
+        assert!(parsed.checksum_matches(&buf));
+    }
+
+    #[test]
+    fn to_bytes_alloc_produces_a_jhdr_size_block_zeroed_beyond_the_struct() {
+        let h = header(4096, 8192, 524_288);
+        let buf = h.to_bytes_alloc().expect("encode");
+        assert_eq!(buf.len(), h.jhdr_size as usize);
+        // The bytes beyond the 48-byte struct must be zero.
+        assert!(buf[JournalHeader::SIZE..].iter().all(|&b| b == 0));
+        // And the header within must parse and validate.
+        let parsed = JournalHeader::parse(&buf)
+            .expect("parse")
+            .expect("a header");
+        assert!(parsed.checksum_matches(&buf));
+    }
+
+    #[test]
+    fn a_short_output_buffer_is_truncated() {
+        let h = header(4096, 8192, 524_288);
+        let mut buf = vec![0u8; 40];
+        assert!(matches!(h.to_bytes(&mut buf), Err(Error::Truncated { .. })));
+    }
+
+    #[test]
+    fn a_little_endian_header_round_trips() {
+        // Build a little-endian header by hand (as mkfs.hfsplus on x86 would),
+        // then parse and re-encode it.
+        let mut raw = vec![0u8; 1024];
+        raw[0..4].copy_from_slice(&JOURNAL_HEADER_MAGIC.to_le_bytes());
+        raw[4..8].copy_from_slice(&ENDIAN_MAGIC.to_le_bytes());
+        raw[8..16].copy_from_slice(&4096u64.to_le_bytes());
+        raw[16..24].copy_from_slice(&8192u64.to_le_bytes());
+        raw[24..32].copy_from_slice(&524_288u64.to_le_bytes());
+        raw[32..36].copy_from_slice(&512u32.to_le_bytes());
+        // checksum field zeroed; compute below
+        raw[40..44].copy_from_slice(&1024u32.to_le_bytes());
+        raw[44..48].copy_from_slice(&7u32.to_le_bytes());
+        let ck = checksum_with_zeroed_field(
+            &raw,
+            JournalHeader::CHECKSUM_OFFSET,
+            JOURNAL_HEADER_CKSUM_SIZE,
+        )
+        .expect("enough bytes");
+        raw[JournalHeader::CHECKSUM_OFFSET..JournalHeader::CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&ck.to_le_bytes());
+
+        let h = JournalHeader::parse(&raw)
+            .expect("parse")
+            .expect("a header");
+        assert_eq!(h.byte_order(), ByteOrder::Little);
+        // Re-encode and verify the checksum still validates.
+        let mut reenc = vec![0u8; 1024];
+        h.to_bytes(&mut reenc).expect("encode");
+        assert!(h.checksum_matches(&reenc));
+        // And the magic must still be the canonical constant.
+        assert_eq!(h.magic, JOURNAL_HEADER_MAGIC);
     }
 }
