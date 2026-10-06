@@ -746,6 +746,32 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 /// so a view handed out from here would be a way to read stale data while
 /// holding a writer. To read, drop this and open a new [`Volume`]. That is a
 /// small cost and it makes the invalidation impossible to forget.
+///
+/// # Journal transaction coverage
+///
+/// Every public mutation method opens a journal transaction, performs its
+/// writes through [`journal_write`](Self::journal_write) (which records a
+/// before-image before modifying a home block), and commits or abandons the
+/// transaction when the inner work returns. The coverage table below lists
+/// each mutation, the disk structures it can change, and the transaction
+/// boundary that protects them.
+///
+/// | Method | Home blocks | Bitmap | Volume hdr | Transaction |
+/// |---|---|---|---|---|
+/// | `write_file_contents` | catalog fork record, data fork blocks | no | no | open → commit/abort |
+/// | `create_file` | catalog leaf (file record + thread), parent folder record, volume header (next CNID) | no | `nextCatalogID` | open → commit/abort |
+/// | `create_folder` | catalog leaf (folder record + thread), parent folder record, volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open → commit/abort |
+/// | `remove` | catalog leaf (deletion), parent folder record (valence), allocation bitmap (freed blocks) | freed blocks | `freeBlocks` | open → commit/abort |
+/// | `rename` | catalog leaf (delete + insert), source and destination parent records (valence) | no | no | open → commit/abort |
+/// | `create_hard_link` | catalog leaf (inode + link records), parent folder record (valence), volume header (next CNID) | no | `nextCatalogID` | open → commit/abort |
+/// | `ensure_file_hardlinks_folder` | catalog leaf (folder + thread records), volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open (or reuse) → commit/abort |
+/// | `truncate_file` | catalog leaf (fork record), allocation bitmap (freed blocks) | freed blocks | `freeBlocks` | open → commit/abort |
+///
+/// All writes pass through [`journal_write`](Self::journal_write), which is the
+/// only path to the device. Internal helpers (`replace_catalog_record`,
+/// `release_blocks`, `write_allocation_bitmap`, `grow_fork`, B-tree leaf writes)
+/// are called from within the public method's transaction and therefore inherit
+/// its protection.
 pub struct WritableVolume<'d, D: ?Sized> {
     /// Exclusive access to the bytes, for as long as this exists.
     device: &'d mut D,
