@@ -926,6 +926,26 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         Ok(())
     }
 
+    /// Begin a journal transaction, returning whether this call started one.
+    ///
+    /// Like [`begin_transaction`](Self::begin_transaction) but reuses an already
+    /// open transaction instead of erroring, so a method that may run inside an
+    /// outer transaction can still guarantee its writes are journaled when called
+    /// directly. The caller must pass the return value to
+    /// [`end_transaction`](Self::end_transaction) or
+    /// [`abandon_transaction`](Self::abandon_transaction) only when it is `true`.
+    fn maybe_begin_transaction(&mut self) -> Result<bool> {
+        let jnl = match &mut self.journal {
+            Some(j) => j,
+            None => return Ok(false),
+        };
+        if jnl.tx.is_some() {
+            return Ok(false);
+        }
+        jnl.tx = Some(TransactionBuffer::new());
+        Ok(true)
+    }
+
     /// Commit the current journal transaction, if one is open.
     ///
     /// On a non-journaled volume this is a no-op -- there is nothing to commit
@@ -1886,13 +1906,19 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// about.
     ///
     /// Idempotent: a second call finds the existing folder rather than making a
+    /// Idempotent: a second call finds the existing folder rather than making a
     /// second one, because two folders with the same name is a catalog with two
     /// answers to every question about it.
+    ///
+    /// On a journaled volume, a folder creation is wrapped in a journal
+    /// transaction. When called from [`Self::create_hard_link`], a transaction is
+    /// already open and is reused rather than started again.
     pub fn ensure_file_hardlinks_folder(&mut self) -> Result<u32> {
         use crate::catalog::lookup::Catalog;
 
         let root = ROOT_FOLDER_ID;
         let name: Vec<u16> = FILE_HARDLINKS_FOLDER.encode_utf16().collect();
+        let started_own = self.maybe_begin_transaction()?;
         // The lookup and the create are separate borrows: `Catalog` holds a shared
         // reborrow of the device, and `create_folder` needs it mutably.
         let existing = {
@@ -1904,7 +1930,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             )?;
             catalog.lookup(root, &name)?
         };
-        match existing {
+        let result = match existing {
             Some(crate::catalog::record::CatalogRecord::Folder(f)) => Ok(f.folder_id.0),
             Some(other) => Err(Error::invalid(
                 "catalog",
@@ -1914,7 +1940,15 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 ),
             )),
             None => self.create_folder_inner(root.0, &name),
+        };
+        if started_own {
+            if result.is_ok() {
+                self.end_transaction()?;
+            } else {
+                self.abandon_transaction();
+            }
         }
+        result
     }
 
     /// Create an empty folder called `name` in `parent`, and return its CNID.
