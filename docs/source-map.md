@@ -302,8 +302,8 @@ open-sourced), but their numeric assignments are established by macOS practice:
 |-------|---------|-------------|
 | 1 | uncompressed (inline in xattr) | returns raw bytes |
 | 2 | ZLIB (RFC 1950/1951) | `src/compression/zlib.rs` |
-| 3 | LZFSE | unsupported |
-| 4 | LZVN | unsupported |
+| 3 | LZFSE | `src/compression/lzfse.rs` (V1, V2, LZVN-in-LZFSE) |
+| 4 | LZVN | `src/compression/lzvn.rs` |
 | 5 | BZIP2 | unsupported |
 | 6 | LZMA | unsupported |
 | 7 | LZ4 frame | `src/compression/lz4.rs` |

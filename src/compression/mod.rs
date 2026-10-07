@@ -40,8 +40,8 @@
 //! | 1    | uncompressed (inline)                  | handled |
 //! | 2    | ZLIB (RFC 1950/1951)                  | implemented |
 //! | 7    | LZ4 frame                             | implemented |
-//! | 3    | LZFSE (Apple's Lempel–Ziv–FS entropy) | unsupported |
-//! | 4    | LZVN                                | unsupported |
+//! | 3    | LZFSE (Apple's Lempel–Ziv–FS entropy) | implemented (V1, V2, LZVN) |
+//! | 4    | LZVN                                | implemented |
 //! | 6    | LZMA                                | unsupported |
 //! | 5    | BZIP2                               | unsupported |
 //!
@@ -74,16 +74,24 @@
 //!   decoder handles the frame format; LZ4 block decompression is a small,
 //!   well-specified subset.
 //!
-//! - **LZFSE / LZVN**: Apple open-sources the C implementations under
-//!   Apache-2.0 (`bsd/sys/lzfse.h`, `bsd/sys/lzvn.h` in XNU). Vendoring them
-//!   would require either a C toolchain at build time or a Rust port. No
-//!   suitable license-compatible pure-Rust implementation was found in the
-//!   crate registry cache.
+//! - **LZFSE / LZVN**: Implementations in pure Rust, decoding V1/V2 compressed
+//!   blocks and LZVN blocks. These cover the subset of Apple's format used by
+//!   `com.apple.decmpfs`.
+//!
+//! - **BZIP2 / LZMA**: Types 5 (BZIP2) and 6 (LZMA) are still unsupported.
+//!   Apple's kernel uses the C `libbz2` (BSD-2-Clause) and C `liblzma`
+//!   (Public Domain) libraries. Rust wrapper candidates include the `bzip2`
+//!   crate (MIT OR Apache-2.0, wraps C) and `rust-lzma`
+//!   (GPL-compatible wrapper). These depend on C toolchains at build time,
+//!   which conflicts with the "pure Rust, no dependencies" policy. They may be
+//!   reconsidered if a pure-Rust decoder gains maturity.
 
 use crate::endian::Le;
 use crate::error::{Error, Result};
 
 mod lz4;
+mod lzfse;
+mod lzvn;
 mod zlib;
 
 /// The `0x636d7066` literal Apple writes in `compression_magic`.
@@ -277,10 +285,9 @@ pub fn decompress(
             }
             Ok(data.to_vec())
         }
-        CompressionType::Lzfse
-        | CompressionType::Lzvn
-        | CompressionType::Bzip2
-        | CompressionType::Lzma => Err(Error::unsupported(format!(
+        CompressionType::Lzfse => lzfse::decode(data, uncompressed_size),
+        CompressionType::Lzvn => lzvn::decode(data, uncompressed_size),
+        CompressionType::Bzip2 | CompressionType::Lzma => Err(Error::unsupported(format!(
             "compression type {compression_type:?} is not yet implemented"
         ))),
         CompressionType::Dataless | CompressionType::DatalessPkg => Err(Error::invalid(

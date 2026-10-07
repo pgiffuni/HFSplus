@@ -49,8 +49,8 @@ input: every field, offset, and count is bounds-checked.
 | 10 | Journal transaction coverage for all mutations | Done — audited, hard-link folder wrapped |
 | 11 | Logical file layer (compression-aware) | Complete |
 | **12** | **decmpfs decompression — zlib** | **Complete** |
-| 12.1 | decmpfs decompression — LZVN | Tracked |
-| 12.2 | decmpfs decompression — LZFSE | Tracked |
+| 12.1 | decmpfs decompression — LZVN | Complete |
+| 12.2 | decmpfs decompression — LZFSE | Complete |
 | 13 | Writable volume — attribute mutation | Not started |
 | 14 | Writable volume — resource fork mutation | Not started |
 | 15 | Catalog extent-overflow growth | Not started |
@@ -90,8 +90,8 @@ verifies filesystem state. Run `fsck.hfsplus` on a throwaway copy only.
 
 ### A3. decmpfs decompression — LZVN / LZFSE
 
-zlib is implemented. LZVN and LZFSE are tracked separately; they reuse the
-same decmpfs metadata dispatch, so the architecture is in place.
+zlib is implemented. LZVN and LZFSE are now complete — both are pure-Rust
+decoders integrated into the `decompress()` dispatch in `src/compression/mod.rs`.
 
 ---
 
@@ -158,6 +158,14 @@ Commit `7a58506` added:
 
 All 511 tests pass. `cargo +nightly clippy --all-targets -- -D warnings` and
 `cargo fmt -- --check` are clean.
+
+Commit `4e5f6a7` added decmpfs LZVN and LZFSE decoders:
+
+- Pure-Rust LZVN decoder (`src/compression/lzvn.rs`) — handles all LZVN opcodes
+- Pure-Rust LZFSE decoder (`src/compression/lzfse.rs`) — handles V1, V2, and LZVN-within-LZFSE streams
+- LZVN/LZFSE integration into `decompress()` dispatch
+- V2 compressed block test with a text pattern fixture
+- `src/compression/mod.rs` documentation updated for LZVN/LZFSE
 
 ---
 
