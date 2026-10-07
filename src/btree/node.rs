@@ -767,20 +767,31 @@ pub fn free_space(node: &[u8]) -> Result<usize> {
 /// Records occupy a contiguous run starting just after the descriptor, in
 /// ascending address order, and the offset array at the node's end maps slot `i`
 /// to record `i`'s address. Inserting therefore has to open a hole: everything from
-/// `index` onwards slides right by `record.len()`, the offsets of those records
+/// `index` onwards slides right by the record's size, the offsets of those records
 /// move with them, and a new offset slot appears for the free offset. The new
 /// record lands at the *old* address of record `index`, which is why slot `index`
 /// itself does not change — the slot is still correct, it just describes different
 /// bytes.
 ///
-/// Afterwards, with `n` the original record count:
+/// # Even-pad rule
+///
+/// Apple's `InsertKeyRecord` pads both key and record sizes to an even byte
+/// count (`if (M_IsOdd(keySize)) ++keySize`), so a record occupies an even number
+/// of bytes on disk. `fsck.hfsplus` enforces this by rejecting an odd free offset
+/// in `hfs_swap_BTNode`: a node whose records would leave an odd free offset fails
+/// verification with "Invalid node structure." This function rounds the padded
+/// size up before any shift or offset arithmetic, and writes only the real
+/// `record.len()` bytes into the node — the trailing pad byte (if any) is left
+/// as zero in the node from the original state or a prior operation.
+///
+/// Afterwards, with `n` the original record count and `padded` the padded size:
 ///
 /// | slot | value |
 /// | --- | --- |
 /// | `0..index` | unchanged |
 /// | `index` | unchanged (the new record took record `index`'s address) |
-/// | `index+1 ..= n` | the old slot below it, plus `record.len()` |
-/// | `n+1` | the old free offset, plus `record.len()` |
+/// | `index+1 ..= n` | the old slot below it, plus `padded` |
+/// | `n+1` | the old free offset, plus `padded` |
 ///
 /// # Errors
 ///
@@ -790,8 +801,9 @@ pub fn free_space(node: &[u8]) -> Result<usize> {
 ///
 /// Mining reference: `InsertRecord` and `InsertKeyRecord` in
 /// `core/BTreeNodeOps.c` — `GetNodeFreeSize`, the `MoveRecordsRight`, the
-/// `InsertOffset`, then the copy. `InsertKeyRecord` splits key and record; this
-/// takes one already-encoded blob, because the caller has the key bytes.
+/// `InsertOffset`, then the copy. `InsertKeyRecord` splits key and record and
+/// pads both with `if (M_IsOdd(keySize)) ++keySize`; this takes one already-encoded
+/// blob and applies the same even-padding to its total size.
 ///
 /// # A note on the source, unresolved
 ///
@@ -814,7 +826,11 @@ pub fn insert_record(node: &mut [u8], index: usize, record: &[u8]) -> Result<()>
             count as u64,
         ));
     }
-    let need = record.len() + OFFSET_SIZE;
+    // Apple's InsertKeyRecord pads each component (key, rec) to even bytes with
+    // `if (M_IsOdd(keySize)) ++keySize`. We receive the full record (key+body)
+    // already concatenated, so we pad the whole thing to an even size.
+    let padded = record.len().wrapping_add(record.len() & 1);
+    let need = padded + OFFSET_SIZE;
     let available = free_space(node)?;
     if available < need {
         return Err(Error::no_space(need as u32, available as u64));
@@ -826,19 +842,19 @@ pub fn insert_record(node: &mut [u8], index: usize, record: &[u8]) -> Result<()>
 
     // Slide the tail right, from the back so the overlap is never read as stale.
     //
-    // `at + record.len() + moved` must not exceed the free offset's new position:
-    // the node's used region grows by exactly `record.len()`, and `free_space`
+    // `at + padded + moved` must not exceed the free offset's new position:
+    // the node's used region grows by exactly `padded`, and `free_space`
     // already proved the offset array has room for one more slot.
-    let end = at + record.len() + moved;
+    let end = at + padded + moved;
     if end > node_size - (count + 2) * OFFSET_SIZE {
         return Err(Error::no_space(need as u32, available as u64));
     }
-    node.copy_within(at..free_at, at + record.len());
+    node.copy_within(at..free_at, at + padded);
 
     // Offsets. Walk from the last one down so each read is still the old value.
     for i in (index + 1..=count + 1).rev() {
         let below = read_offset(node, i - 1)?;
-        write_offset(node, i, below + record.len())?;
+        write_offset(node, i, below + padded)?;
     }
     set_num_records(node, count as u16 + 1)?;
     node.get_mut(at..at + record.len())
@@ -1053,6 +1069,47 @@ mod mutation_tests {
                 "removing index {index}: the used region must shrink by exactly one record"
             );
         }
+    }
+
+    #[test]
+    fn an_odd_length_record_is_padded_to_even() {
+        // Apple's InsertKeyRecord pads odd key/record sizes to even bytes, and
+        // fsck.hfsplus rejects a node whose free offset ends up odd. An
+        // odd-length record must therefore consume an even number of bytes
+        // from the free space, leaving the free offset even.
+        let mut node = build(512, 40, 3);
+        let before = free_space(&node).expect("free space");
+        // 39 bytes is odd; the padded size is 40.
+        insert_record(&mut node, 3, &[0xABu8; 39]).expect("insert");
+        let after = free_space(&node).expect("after");
+        assert_eq!(
+            before - after,
+            42,
+            "39 bytes of record + 1 byte pad + 2 bytes of offset slot"
+        );
+        // The record occupies 40 bytes on disk (39 bytes of content + 1 zero pad),
+        // since the offset array reflects the padded size.
+        let got = record_at(&node, 3);
+        assert_eq!(got.len(), 40);
+        assert_eq!(&got[..39], &vec![0xABu8; 39]);
+        assert_eq!(got[39], 0, "pad byte is zero");
+        // The free offset must be even.
+        let free_off = read_offset(&node, 4).expect("free offset");
+        assert_eq!(free_off % 2, 0, "free offset must be even");
+    }
+
+    #[test]
+    fn an_even_length_record_is_not_padded() {
+        let mut node = build(512, 40, 3);
+        let before = free_space(&node).expect("free space");
+        insert_record(&mut node, 3, &[0xCDu8; 40]).expect("insert");
+        let after = free_space(&node).expect("after");
+        assert_eq!(
+            before - after,
+            42,
+            "40 bytes of record + 0 bytes of pad + 2 bytes of offset slot"
+        );
+        assert_eq!(&record_at(&node, 3), &vec![0xCDu8; 40]);
     }
 
     #[test]
