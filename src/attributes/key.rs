@@ -182,6 +182,28 @@ impl AttrKey {
         }
         Ok(out)
     }
+
+    /// Compare two attribute keys, as Apple's `BTCompareBl` would for this tree.
+    ///
+    /// The order is: file_id, then name (binary comparison of the UTF-16 code
+    /// units), then start_block as a tiebreaker for forked attributes whose
+    /// continuation records share a name.
+    ///
+    /// Apple's `core/hfs_catalog.c` `attrkeycmp` compares the key bytes with
+    /// `memcmp` over the name portion only, falling back to `startBlock` when
+    /// the names are equal -- which is exactly the order the formatter's own
+    /// output produces for continuation records.
+    pub fn compare(a: &AttrKey, b: &AttrKey) -> std::cmp::Ordering {
+        match a.file_id.cmp(&b.file_id) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        match a.name.as_bytes().cmp(b.name.as_bytes()) {
+            std::cmp::Ordering::Equal => {}
+            ord => return ord,
+        }
+        a.start_block.cmp(&b.start_block)
+    }
 }
 
 #[cfg(test)]

@@ -998,16 +998,27 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             // The journal addresses blocks in jhdr_size units, which on every
             // volume Apple writes today is the volume block size.
             let blk = u64::from(self.header.block_size);
-            let block_start = offset / blk * blk;
-            let block_num = block_start / blk;
-            // Only record the before-image the first time a block is touched in
-            // this transaction; later writes to the same block are covered by the
-            // initial record.
-            if !tx.writes().iter().any(|w| w.bnum == block_num) {
-                let mut before =
-                    vec![0u8; usize::try_from(blk).map_err(|_| Error::overflow("block size"))?];
-                self.device.read_at(block_start, &mut before)?;
-                tx.record_write(block_num, before);
+            let blk_sz = usize::try_from(blk).map_err(|_| Error::overflow("block size"))?;
+            // A single write can span several blocks (e.g. an 8 KiB B-tree node
+            // on a 4 KiB block volume). Each block must get its own before-image
+            // record so that replay restores the full original contents; recording
+            // only the first block's before-image would leave the second block
+            // with the post-crash data and the journal unable to undo it.
+            let end = offset
+                .checked_add(data.len() as u64)
+                .ok_or(Error::overflow("journal write range"))?;
+            let mut pos = offset;
+            while pos < end {
+                let block_start = pos / blk * blk;
+                let block_num = block_start / blk;
+                if !tx.writes().iter().any(|w| w.bnum == block_num) {
+                    let mut before = vec![0u8; blk_sz];
+                    self.device.read_at(block_start, &mut before)?;
+                    tx.record_write(block_num, before);
+                }
+                // Advance to the next block boundary, or to `end` if sooner.
+                let next = (block_start + blk).min(end);
+                pos = next;
             }
         }
         self.device.write_at(offset, data)
@@ -4193,6 +4204,328 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         self.write_allocation_bitmap(&map, free_blocks)
     }
 
+    /// Set an extended attribute `name` to `value` on the file identified by `cnid`.
+    ///
+    /// If the attribute already exists, its value is replaced in place. The
+    /// value must fit inline (typically under ~3700 bytes for 4 KB nodes);
+    /// larger values are refused with a clear error.
+    ///
+    /// Mining reference: Apple `core/hfs_xattr.c` `hfs_vnop_setxattr` /
+    /// `setxattr__tame` paths, and `BTInsertRecord` for the insertion.
+    pub fn setxattr(&mut self, cnid: u32, name: &str, value: &[u8]) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.setxattr_inner(cnid, name, value);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn setxattr_inner(&mut self, cnid: u32, name: &str, value: &[u8]) -> Result<()> {
+        use crate::attributes::key::AttrKey;
+        use crate::attributes::record::AttrRecord;
+
+        let max_inline = self.attributes_inline_limit()?;
+        if value.len() > max_inline {
+            return Err(Error::invalid(
+                "setxattr",
+                format!(
+                    "value of {} bytes exceeds the inline limit of {} bytes; forked attributes are not yet supported",
+                    value.len(),
+                    max_inline,
+                ),
+            ));
+        }
+
+        let key = AttrKey {
+            file_id: cnid,
+            start_block: 0,
+            name: name.to_string(),
+        };
+        let attr = AttrRecord::Inline {
+            value: value.to_vec(),
+        };
+
+        let record = {
+            let key_bytes = key.to_record()?;
+            let attr_bytes = attr.to_record()?;
+            let mut r = Vec::with_capacity(key_bytes.len() + attr_bytes.len());
+            r.extend_from_slice(&key_bytes);
+            r.extend_from_slice(&attr_bytes);
+            r
+        };
+
+        self.insert_attribute_record(&record)
+    }
+
+    /// Highest inline value size that fits in the attributes tree's nodes.
+    fn attributes_inline_limit(&self) -> Result<usize> {
+        let header = self.attributes_btree_header()?;
+        let node_size = header.node_size as usize;
+        // Key overhead: 2 (length) + 2 (pad) + 4 (fileID) + 4 (startBlock) +
+        // 2 (attrNameLen) + 2 (minimum name), and a typical short name of ~20 chars.
+        // Record overhead: 4 (type) + 8 (reserved) + 4 (attrSize).
+        Ok(node_size.saturating_sub(46 + 20 + 12))
+    }
+
+    fn attributes_btree_header(&self) -> Result<crate::btree::header::BTreeHeader> {
+        let bt = crate::btree::io::BTreeFile::open(
+            &*self.device,
+            &self.header.attributes_file,
+            self.header.block_size,
+            true,
+        )?;
+        Ok(*bt.header())
+    }
+
+    /// Insert a full attribute record (key + body) into the attributes B-tree,
+    /// replacing any existing record with the same fileID + name.
+    fn insert_attribute_record(&mut self, record: &[u8]) -> Result<()> {
+        use crate::attributes::key::AttrKey;
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::{insert_record, NodeKind};
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.attributes_file,
+            self.header.block_size,
+            true,
+        )?;
+        let btree_header = *bt.header();
+        let max_key_length = btree_header.max_key_length as usize;
+        let first_leaf = btree_header.first_leaf_node;
+
+        let incoming = AttrKey::from_record(record, max_key_length)
+            .map_err(|e| Error::invalid("attribute key", e.to_string()))?;
+
+        let node_num = self.attributes_leaf_for(&incoming, first_leaf)?;
+        let bytes = bt.read_node_bytes(node_num)?;
+        let node = bt.parse_node(&bytes)?;
+        if node.kind() != NodeKind::Leaf {
+            return Err(Error::invalid("attributes", "expected a leaf node"));
+        }
+
+        let mut at = node.num_records();
+        let mut existing_index: Option<usize> = None;
+        for index in 0..node.num_records() {
+            let node_record = node.record(index)?;
+            let Some(existing_key) = attr_key_from_record(node_record, max_key_length) else {
+                continue;
+            };
+            match AttrKey::compare(&existing_key, &incoming) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    existing_index = Some(index as usize);
+                    at = index;
+                    break;
+                }
+                std::cmp::Ordering::Greater => {
+                    at = index;
+                    break;
+                }
+            }
+        }
+
+        let mut buf = bytes.clone();
+        match existing_index {
+            Some(idx) => {
+                // Replace in place if same size (inline overwrite).
+                let old_record = node.record(u16::try_from(idx).unwrap_or(0))?;
+                if old_record.len() == record.len() {
+                    let offset = node.record_offset(idx as u16)?;
+                    buf[offset..offset + record.len()].copy_from_slice(record);
+                } else {
+                    // Different size: remove old, insert new.
+                    crate::btree::node::remove_record(&mut buf, idx)?;
+                    insert_record(&mut buf, at as usize, record)
+                        .map_err(|e| Error::invalid("attributes insertion", e.to_string()))?;
+                }
+            }
+            None => {
+                insert_record(&mut buf, at as usize, record)
+                    .map_err(|e| Error::invalid("attributes insertion", e.to_string()))?;
+            }
+        }
+
+        let at_offset = bt.node_offset(node_num)?;
+        let header_at = bt.node_offset(0)?;
+        drop(bt);
+
+        self.journal_write(at_offset, &buf)?;
+
+        // Update leaf record count in the attributes B-tree header.
+        let leaf_records = if existing_index.is_some() {
+            btree_header.leaf_records
+        } else {
+            btree_header.leaf_records + 1
+        };
+        self.journal_write(
+            header_at
+                + crate::btree::header::HEADER_RECORD_OFFSET as u64
+                + crate::btree::header::LEAF_RECORDS_OFFSET,
+            &leaf_records.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
+    /// Find the leaf node that should contain a key, walking the attributes tree.
+    fn attributes_leaf_for(
+        &self,
+        target: &crate::attributes::key::AttrKey,
+        first_leaf: u32,
+    ) -> Result<u32> {
+        use crate::attributes::key::AttrKey;
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.attributes_file,
+            self.header.block_size,
+            true,
+        )?;
+        let btree_header = *bt.header();
+        let max_key_length = btree_header.max_key_length as usize;
+
+        let mut node_num = btree_header.root_node;
+        let mut budget = btree_header.total_nodes;
+
+        while budget > 0 && node_num != 0 {
+            budget -= 1;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+
+            if node.kind() == NodeKind::Leaf {
+                return Ok(node_num);
+            }
+            if node.kind() != NodeKind::Index {
+                break;
+            }
+
+            // Walk the index node's keys looking for the child that bounds our key.
+            let mut child = 0u32;
+            for index in 0..node.num_records() {
+                let rec = node.record(index)?;
+                // Index record: keyLength(2) + key body + childPtr(4)
+                let key_len = usize::from(u16::from_be_bytes([rec[0], rec[1]]));
+                let key_end = 2 + key_len;
+                if rec.len() < key_end + 4 {
+                    continue;
+                }
+                let key_bytes = &rec[2..key_end];
+                let child_ptr = u32::from_be_bytes([
+                    rec[key_end],
+                    rec[key_end + 1],
+                    rec[key_end + 2],
+                    rec[key_end + 3],
+                ]);
+                let Ok(idx_key) =
+                    crate::attributes::key::AttrKey::from_record(key_bytes, max_key_length)
+                else {
+                    child = child_ptr;
+                    continue;
+                };
+                if AttrKey::compare(&idx_key, target) == std::cmp::Ordering::Greater {
+                    break;
+                }
+                child = child_ptr;
+            }
+            if child == 0 {
+                child = first_leaf;
+            }
+            node_num = child;
+        }
+        Ok(first_leaf)
+    }
+
+    /// Remove an extended attribute from the file identified by `cnid`.
+    ///
+    /// Returns `Ok(())` if an attribute was present and removed, or
+    /// `Error::NotFound` if the file has no such attribute.
+    pub fn removexattr(&mut self, cnid: u32, name: &str) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.removexattr_inner(cnid, name);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn removexattr_inner(&mut self, cnid: u32, name: &str) -> Result<()> {
+        use crate::attributes::key::AttrKey;
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.attributes_file,
+            self.header.block_size,
+            true,
+        )?;
+        let btree_header = *bt.header();
+        let max_key_length = btree_header.max_key_length as usize;
+        let first_leaf = btree_header.first_leaf_node;
+
+        let target = AttrKey {
+            file_id: cnid,
+            start_block: 0,
+            name: name.to_string(),
+        };
+
+        let node_num = self.attributes_leaf_for(&target, first_leaf)?;
+        let bytes = bt.read_node_bytes(node_num)?;
+        let node = bt.parse_node(&bytes)?;
+        if node.kind() != NodeKind::Leaf {
+            return Err(Error::invalid("attributes", "expected a leaf node"));
+        }
+
+        let mut found: Option<usize> = None;
+        for index in 0..node.num_records() {
+            let rec = node.record(index)?;
+            let Some(existing_key) = attr_key_from_record(rec, max_key_length) else {
+                continue;
+            };
+            match AttrKey::compare(&existing_key, &target) {
+                std::cmp::Ordering::Less => continue,
+                std::cmp::Ordering::Equal => {
+                    found = Some(index as usize);
+                    break;
+                }
+                std::cmp::Ordering::Greater => break,
+            }
+        }
+
+        let Some(index) = found else {
+            return Err(Error::NotFound {
+                what: "extended attribute",
+            });
+        };
+
+        let mut buf = bytes.clone();
+        crate::btree::node::remove_record(&mut buf, index)?;
+        let at = bt.node_offset(node_num)?;
+        let header_at = bt.node_offset(0)?;
+        drop(bt);
+
+        self.journal_write(at, &buf)?;
+
+        let new_count = btree_header
+            .leaf_records
+            .checked_sub(1)
+            .ok_or(Error::invalid("attributes", "leaf record count underflow"))?;
+        self.journal_write(
+            header_at
+                + crate::btree::header::HEADER_RECORD_OFFSET as u64
+                + crate::btree::header::LEAF_RECORDS_OFFSET,
+            &new_count.to_be_bytes(),
+        )?;
+        Ok(())
+    }
+
     /// Read the allocation bitmap as a mutable map.
     fn load_allocation_map(&self) -> Result<crate::alloc::AllocationMap> {
         use crate::alloc::AllocationMap;
@@ -4978,6 +5311,26 @@ fn file_times(f: &FileRecord, volume_expanded: bool) -> Times {
         accessed: f.timestamp(f.access_date, volume_expanded),
         backed_up: f.timestamp(f.backup_date, volume_expanded),
     }
+}
+
+/// Extract the attribute key from a node record, splitting the length
+/// prefix from the key body.
+///
+/// This is the attribute-tree analogue of `catalog::lookup::split_record`.
+/// Returns `None` if the record is too short or the key fails to parse.
+fn attr_key_from_record(
+    record: &[u8],
+    max_key_length: usize,
+) -> Option<crate::attributes::key::AttrKey> {
+    use crate::attributes::key::AttrKey;
+    if record.len() < 2 {
+        return None;
+    }
+    let declared = usize::from(u16::from_be_bytes([record[0], record[1]]));
+    if declared > max_key_length || declared + 2 > record.len() {
+        return None;
+    }
+    AttrKey::from_record(&record[0..2 + declared.min(max_key_length)], max_key_length).ok()
 }
 
 /// Volume statistics, as `statfs` would report them.
