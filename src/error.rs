@@ -124,6 +124,15 @@ pub enum Error {
     /// The operation requires write access but the device was opened
     /// read-only.
     ReadOnly,
+
+    /// The requested feature or compression type is not implemented.
+    ///
+    /// Used where Apple's code would `return (ENOTSUP)` — for example, a
+    /// compression type this reader does not yet decode.
+    Unsupported {
+        /// What was asked for.
+        what: String,
+    },
 }
 
 impl Error {
@@ -158,6 +167,11 @@ impl Error {
             requested,
             available,
         }
+    }
+
+    /// Convenience constructor for [`Error::Unsupported`].
+    pub fn unsupported(what: impl Into<String>) -> Self {
+        Error::Unsupported { what: what.into() }
     }
 }
 
@@ -204,6 +218,9 @@ impl fmt::Display for Error {
                 "no space: {requested} blocks requested, {available} free"
             ),
             Error::ReadOnly => write!(f, "filesystem opened read-only"),
+            Error::Unsupported { what } => {
+                write!(f, "not supported: {what}")
+            }
         }
     }
 }

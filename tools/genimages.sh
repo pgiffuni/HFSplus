@@ -245,6 +245,12 @@ if [[ -f tests/images/generated/journal-with-files.img ]]; then
   python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
     tests/images/generated/journal-with-attributes.img --add-attributes
 
+  # A file with a com.apple.decmpfs xattr (zlib-compressed). This exercises the
+  # decmpfs decompression path end-to-end: the reader must detect the xattr,
+  # read the resource fork, and inflate the zlib payload.
+  python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \
+    tests/images/generated/journal-with-compressed.img --add-compressed-file
+
   # A stale B-tree node map: the tree still reads, but has stopped claiming one of
   # its own nodes. What an edit-in-place writer leaves behind.
   python3 tools/mkfiles.py tests/images/generated/journal-with-files.img \

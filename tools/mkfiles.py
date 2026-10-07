@@ -44,6 +44,7 @@ import argparse
 import os
 import struct
 import sys
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -542,9 +543,247 @@ def break_fork_extent(img, args):
         f.write(bytes(img))
 
 
+CMPFS_MAGIC_LE = struct.pack("<I", 0x636D7066)
+K_HFS_HAS_ATTRIBUTES_MASK = 0x0004
+CMP_TYPE_ZLIB = 2
+
+
+def add_compressed_file(img: bytearray, args) -> None:
+    """Add a file compressed with decmpfs (zlib, type 2) to the image.
+
+    Creates `compressed.bin` in the root folder:
+      - data fork: empty (decmpfs hides the real contents behind decompression)
+      - resource fork: holds the zlib-compressed bytes
+      - xattr `com.apple.decmpfs`: 16-byte header (magic, type, uncompressed_size)
+
+    The file's logical size (what readers report via the catalog) is the
+    decompressed size — stored in the decmpfs header, not the data fork.
+    fsck.hfsplus must accept the result as sound.
+
+    Mining reference: `bsd/sys/decmpfs.h` `decmpfs_disk_header`;
+    `core/hfs_readwrite.c` `hfs_read` redirects reads through the resource fork
+    when the decmpfs attribute is present.
+    """
+    bs = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 40)[0]
+    total_blocks = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 44)[0]
+    allocation_block = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 112 + 16)[0]
+    attrs_start = struct.unpack_from(">I", img, VOLUME_HEADER_OFFSET + 352 + 16)[0]
+
+    # The decompressed payload: a recognizable pattern.
+    original = b"HFS+ decmpfs zlib compression test data. " * 10
+    original_size = len(original)
+
+    # Compress with zlib (RFC 1950). Use Python's zlib, which is a wrapper around
+    # the standard C library — generating the test vector, not a runtime dependency.
+    compressed = zlib.compress(original, level=1)
+
+    # Take a free block for the compressed data (resource fork).
+    free = free_blocks(img, total_blocks)
+    if not free:
+        sys.exit("error: not enough free blocks for compressed file")
+    rf_block = free[-1]
+    free.remove(rf_block)
+
+    # Write compressed data into the resource fork block.
+    rf_offset = rf_block * bs
+    img[rf_offset:rf_offset + len(compressed)] = compressed
+
+    # Build the decmpfs xattr value: 16-byte header only (type 2 is fork-backed).
+    decmpfs_attr = CMPFS_MAGIC_LE
+    decmpfs_attr += struct.pack("<I", CMP_TYPE_ZLIB)
+    decmpfs_attr += struct.pack("<Q", original_size)
+
+    # Add the file to the catalog using the Writer.
+    w = Writer(img)
+    added_before = len(w.records)
+    # Data fork is empty; resource fork holds the compressed data.
+    file_cnid = w.add_file(
+        "compressed.bin",
+        S_IFREG | 0o644,
+        [(0, 0)],  # data fork: no extents (empty)
+        0,         # data fork logical size = 0
+        total_blocks=0)  # no data fork blocks
+
+    # Patch the file record in w.records to set the resource fork.
+    # The file record body is: key + body. The body starts at 2 + keyLength.
+    # We need to find it in w.records and patch the resource fork fork data.
+    # Resource fork starts at file record offset 104 (after the 88-byte data fork).
+    # HFSPlusCatalogFile layout:
+    #   recordType (4), flags (2), reserved1 (2), fileID (4) = 12 bytes
+    #   then createModDates (20 bytes) = offset 12-31
+    #   BSDInfo (32 bytes) = offset 32-63
+    #   ... wait, let me check the actual layout
+
+    # Actually from mktorn.py: THREAD_RECORD_FIXED_SIZE = 8, and FILE_RECORD_BSD_INFO_OFFSET = 32
+    # So the layout is:
+    #   0-3: recordType (4)
+    #   4-5: flags (2)
+    #   6-7: reserved1 (2)
+    #   8-11: fileID (4)
+    #   12-31: four dates (20 bytes)
+    #   32-63: BSDInfo (32 bytes)
+    #   64-87: finderInfo (24 bytes)? No...
+
+    # From build_file_body in mktorn.py:
+    # The HFSPlusCatalogFile struct has data fork at offset 88.
+    # Resource fork would be at 88 + sizeof(ForkData) = 88 + 80 = 168.
+
+    # ForkData layout (80 bytes): logicalSize(8), clumpSize(4), totalBlocks(4), extents[8*8]
+    RF_FORK_OFFSET = 168  # 88 (data fork) + 80 (ForkData size)
+
+    # Patch the resource fork in the record that was just added.
+    # w.records contains the raw key+body bytes for each catalog entry.
+    for idx, record in enumerate(w.records):
+        if len(record) < 2 + RF_FORK_OFFSET:
+            continue
+        # body starts at offset 2 + keyLength
+        key_len = struct.unpack_from(">H", record, 0)[0]
+        record_type = struct.unpack_from(">h", record, 2 + key_len)[0]
+        cnid = struct.unpack_from(">I", record, 2 + key_len + 8)[0]
+        if record_type == 2 and cnid == file_cnid:
+            body = bytearray(record)
+            rf_off = 2 + key_len + RF_FORK_OFFSET
+            # logicalSize (8), clumpSize (4), totalBlocks (4), extent[0] (8)
+            struct.pack_into(">Q", body, rf_off + 0, len(compressed))
+            struct.pack_into(">I", body, rf_off + 8, bs)
+            struct.pack_into(">I", body, rf_off + 12, 1)
+            struct.pack_into(">II", body, rf_off + 16, rf_block, 1)
+            w.records[idx] = bytes(body)
+            # Also set the has-attributes flag (kHFSHasAttributesMask).
+            # HFSPlusCatalogFile: recordType(2) + flags(2) + reserved1(4),
+            # so flags is at body offset 2 within the record.
+            flags = struct.unpack_from(">H", body, 2 + key_len + 2)[0]
+            struct.pack_into(">H", body, 2 + key_len + 2, flags | K_HFS_HAS_ATTRIBUTES_MASK)
+            w.records[idx] = bytes(body)
+            print(f"  catalog record {file_cnid}: resource fork -> block {rf_block}, "
+                  f"flags 0x{flags:04x} -> 0x{flags | K_HFS_HAS_ATTRIBUTES_MASK:04x}")
+            break
+
+    # Add the com.apple.decmpfs attribute to the attributes B-tree.
+    if attrs_start == 0:
+        sys.exit("error: the volume has no attributes file fork")
+    add_decmpfs_xattr_to_tree(img, w, file_cnid, decmpfs_attr, allocation_block, rf_block, bs, attrs_start)
+
+    # Update volume header.
+    put32(img, VOLUME_HEADER_OFFSET + NEXT_CATALOG_ID_OFFSET, file_cnid + 1)
+    put32(img, VOLUME_HEADER_OFFSET + FILE_COUNT_OFFSET, be32(img, FILE_COUNT_OFFSET) + 1)
+
+    w.bump_root_valence(1)
+    w._added = len(w.records) - added_before
+    w.finish()
+
+    # Mark the block as allocated.
+    set_allocated(img, allocation_block, [rf_block], True)
+
+    # Update the free block count.
+    before = u32_from_be(img, VOLUME_HEADER_OFFSET + 48)
+    put32(img, VOLUME_HEADER_OFFSET + 48, before - 1)
+
+    with open(args.dest, "wb") as f:
+        f.write(bytes(img))
+
+    print(f"  compressed.bin  CNID {file_cnid}")
+    print(f"  original size: {original_size}, compressed: {len(compressed)}")
+    print(f"  decmpfs xattr: {len(decmpfs_attr)} bytes (16-byte header, type 2/zlib)")
+    print(f"  resource fork: block {rf_block}, {len(compressed)} bytes")
+
+
+def add_decmpfs_xattr_to_tree(img: bytearray, w: Writer, cnid: int,
+                              attr_value: bytes, allocation_block: int,
+                              rf_block: int, bs: int, attrs_start: int) -> None:
+    """Insert a com.apple.decmpfs inline xattr into the attributes B-tree."""
+    if attrs_start == 0:
+        sys.exit("error: the volume has no attributes file fork")
+
+    base = attrs_start * bs
+    hdr = 14  # BTNodeDescriptor size
+    node_size = be16(img, base + hdr + 18)  # btNodeSize at offset 18 in BTHeaderRec
+
+    # Node 1 is the first leaf (one node per block at this size).
+    leaf_base = base + node_size
+
+    leaf = bytearray(img[leaf_base:leaf_base + node_size])
+
+    num_records = be16(leaf, 10)
+    # Collect existing offsets.
+    offsets = []
+    for i in range(num_records):
+        offsets.append(be16(leaf, node_size - 2 * (i + 1)))
+
+    # The free-offset slot: the entry just past the last record's
+    # offset in the offset array tells us where the next record goes.
+    # In a freshly-initialised empty leaf this is 0 (mkfs leaves the
+    # array blank), so fall back to right after the BTNodeDescriptor.
+    free_off = be16(leaf, node_size - 2 * (num_records + 1))
+    if free_off == 0:
+        free_off = 14
+
+    # Build the HFSPlusAttrKey for com.apple.decmpfs.
+    name_bytes = b"com.apple.decmpfs"
+    name_units = name_bytes.decode("utf-8").encode("utf-16-be")
+
+    key_len = 2 + 4 + 4 + 2 + len(name_units)  # keyLength excludes itself
+    key = struct.pack(">H", key_len)
+    key += struct.pack(">H", 0)        # pad
+    key += struct.pack(">I", cnid)     # fileID
+    key += struct.pack(">I", 0)        # startBlock (inline attribute = 0)
+    key += struct.pack(">H", len(name_units) // 2)
+    key += name_units
+
+    # HFSPlusAttrData (kHFSPlusAttrInlineData = 0x10) from core/hfs_format.h:
+    #   recordType (UInt32, 4 bytes)
+    #   reserved[2] (UInt32[2], 8 bytes)  -- must be zero
+    #   attrSize (UInt32, 4 bytes)       -- size of attrData that follows
+    #   attrData (variable)
+    record_body = struct.pack(">I", 0x10)  # kHFSPlusAttrInlineData
+    record_body += struct.pack(">II", 0, 0)  # reserved[2]
+    record_body += struct.pack(">I", len(attr_value))
+    record_body += attr_value
+
+    new_record = key + record_body
+    offsets.append(free_off)
+    num_records += 1
+
+    # Check there's room.
+    end_of_records = free_off + len(new_record)
+    if end_of_records + 2 * (num_records + 1) > node_size:
+        sys.exit(f"error: attributes leaf node {node_size}B too small for decmpfs xattr")
+
+    # Write the new record.
+    new_leaf = bytearray(leaf)
+    new_leaf[free_off:free_off + len(new_record)] = new_record
+
+    # Update record count.
+    struct.pack_into(">H", new_leaf, 10, num_records)
+    # Set leaf node descriptor: kind = kBTLeafNode (0xFF), height = 1.
+    new_leaf[8] = 0xFF
+    new_leaf[9] = 1
+
+    # Rewrite offset array.
+    for i, off in enumerate(offsets):
+        struct.pack_into(">H", new_leaf, node_size - 2 * (i + 1), off)
+    struct.pack_into(">H", new_leaf, node_size - 2 * (num_records + 1),
+                     free_off + len(new_record))
+
+    # Update the tree header.
+    struct.pack_into(">H", img, base + hdr + 0, 1)                # treeDepth
+    struct.pack_into(">I", img, base + hdr + 2, 1)                 # rootNode
+    struct.pack_into(">I", img, base + hdr + 6, num_records)       # leafRecords
+    struct.pack_into(">I", img, base + hdr + 10, 1)                # firstLeafNode
+    struct.pack_into(">I", img, base + hdr + 14, 1)                # lastLeafNode
+    struct.pack_into(">I", img, base + hdr + 22,
+                     be32(img, base + hdr + 22))             # totalNodes (unchanged)
+    struct.pack_into(">I", img, base + hdr + 26,
+                     be32(img, base + hdr + 26) - 1)         # freeNodes
+
+    # Mark node 0 and 1 as in use in the node map (node 1 is the leaf).
+    img[base + 248] |= 0xC0
+
+    img[leaf_base:leaf_base + node_size] = new_leaf
+
+
 def add_attributes(img, args):
     """Put real attribute records into the volume's attributes B-tree.
-
     `mkfs.hfsplus` allocates the attributes fork and builds an empty tree, so a
     volume it makes has no attributes at all and nothing in the corpus can exercise
     the reader. This fills in the leaf node the tree already has room for:
@@ -913,6 +1152,8 @@ def main() -> None:
                     help="clear a bit in the catalog's B-tree node map")
     ap.add_argument("--break-symlink", dest="break_symlink", action="store_true",
                     help="empty the symlink's data fork, leaving it with no target")
+    ap.add_argument("--add-compressed-file", dest="add_compressed", action="store_true",
+                    help="add a file with com.apple.decmpfs xattr (zlib-compressed)")
     ap.add_argument("--unused", type=int, default=19,
                     help=argparse.SUPPRESS)
     args = ap.parse_args()
@@ -934,6 +1175,8 @@ def main() -> None:
         return stale_node_map(img, args)
     if args.break_symlink:
         return break_symlink(img, args)
+    if args.add_compressed:
+        return add_compressed_file(img, args)
 
     w = Writer(img)
     bs = w.block_size

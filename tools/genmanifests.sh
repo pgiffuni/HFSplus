@@ -128,9 +128,8 @@ else:
     expected_error = ""
     note = "HFS+/HFSX read-only support is the milestone under test"
 
-# Most images are pure mkfs.hfsplus output. One is not: journal-with-files has
-# real files added afterwards by tools/mkfiles.py, and its provenance must say so
-# rather than credit mkfs.hfsplus for content that formatter never wrote.
+# Images modified by tools/mkfiles.py need their provenance to reflect that:
+# mkfs.hfsplus did not write the added files and attributes.
 if name == "journal-with-files":
     source_tool = "mkfs.hfsplus, then tools/mkfiles.py"
     source_command = ("mkfs.hfsplus -J -v Journaled "
@@ -138,6 +137,13 @@ if name == "journal-with-files":
                       "tools/mkfiles.py")
     description = ("Journaled volume with files added by tools/mkfiles.py: "
                    "fragmented extents and a symlink.")
+elif name == "journal-with-compressed":
+    source_tool = "mkfs.hfsplus, then tools/mkfiles.py"
+    source_command = ("mkfs.hfsplus -J -v Journaled "
+                      "tests/images/generated/journaled-hfsplus.img, then "
+                      "tools/mkfiles.py --add-compressed-file")
+    description = ("Journaled HFS+ volume with a file compressed via decmpfs "
+                   "(zlib type 2), exercising the decompression read path.")
 else:
     source_tool = "mkfs.hfsplus"
     source_command = "see tools/genimages.sh"
@@ -184,10 +190,10 @@ journal = {str(journaled).lower()}
 unicode = true
 hard_links = false
 directory_hard_links = false
-resource_forks = false
-xattrs = false
+ resource_forks = false
+xattrs = {str(name == "journal-with-compressed").lower()}
 finder_info = false
-compression = false
+compression = {str(name == "journal-with-compressed").lower()}
 sparse_files = false
 
 [expect]

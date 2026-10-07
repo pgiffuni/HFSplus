@@ -165,6 +165,17 @@ for i in range(8):
     struct.pack_into(">II", data, base + 16 + i * 8, i * 2 + 1, 1)
 '
 
+# 13. A catalog B-tree header whose totalNodes is zero. BTreeHeader::validate
+#     rejects this (every referenced node number >= 0 total nodes), so mounting
+#     the volume fails immediately.
+patch_with_python "${OUT_DIR}/stale-attr-node-map.img" '
+import struct
+cat_start = struct.unpack_from(">I", data, 1024 + 272 + 16)[0]
+bs = struct.unpack_from(">I", data, 1024 + 40)[0]
+cat_base = cat_start * bs
+struct.pack_into(">I", data, cat_base + 14 + 22, 0)  # totalNodes = 0
+'
+
 echo
 # IMPORTANT: fsck.hfsplus REPAIRS rather than merely reports.
 #

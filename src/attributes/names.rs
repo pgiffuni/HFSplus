@@ -52,7 +52,7 @@ pub const CONTENT_PROTECTION_NAME: &str = "com.apple.system.cprotect";
 /// The quarantine flag macOS sets on a downloaded file.
 pub const QUARANTINE_NAME: &str = "com.apple.quarantine";
 
-/// The decmpfs compression metadata.
+/// The decmpfs compression metadata, which this crate reads.
 ///
 /// Present on a compressed file, and **hidden from the extended-attribute
 /// interface**: `listxattr` and `getxattr` filter it out, so a reader that
@@ -62,23 +62,14 @@ pub const QUARANTINE_NAME: &str = "com.apple.quarantine";
 /// Two consequences worth stating, because both produce wrong answers rather than
 /// errors:
 ///
-/// - "This file's data fork is shorter than its logical size" can mean the file is
+/// - "the data fork is shorter than the logical size" can mean the file is
 ///   compressed, not truncated.
-/// - "This file has no attributes" can mean it has compression metadata that was
+/// - "this file has no attributes" can mean it has compression metadata that was
 ///   hidden.
 ///
-/// The name is corroborated rather than mined: `core/` uses the macro
-/// `DECMPFS_XATTR_NAME` but its definition is in a decmpfs header this tree does
-/// not vendor. `livefiles_hfs_plugin/lf_hfs_vnode.c` spells the same literal,
-/// which is a second implementation agreeing rather than the authority.
-///
-/// # Not implemented
-///
-/// Nothing here decodes a decmpfs payload. That is deliberate and it is the
-/// roadmap's instruction: do not implement compression mutation merely because
-/// the metadata can be parsed. The correct behaviour for a reader that meets a
-/// compressed file is to say so rather than to serve compressed bytes as if they
-/// were the file.
+/// Decompression is handled in `src/compression/mod.rs`. The HFS+ metadata layer
+/// (this name, `is_compressed`) is native to the crate; the compression
+/// algorithms beneath it are custom pure-Rust decoders.
 pub const DECOMPRESSION_NAME: &str = "com.apple.decmpfs";
 
 /// Every attribute name HFS+ writes for its own bookkeeping.

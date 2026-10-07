@@ -45,6 +45,7 @@ use crate::timestamp::HfsTimestamp;
 pub use bitmap::{bytes_for_blocks, AllocationBitmap};
 
 use crate::attributes::AttributesFile;
+use crate::compression::{CompressionType, DecmpfsHeader, CMP_MAGIC};
 
 /// A mounted, read-only HFS+ or HFSX volume.
 pub struct Volume<'a, D: ?Sized> {
@@ -370,17 +371,94 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     }
 
     /// Read `len` bytes from a file's data fork at `offset`.
+    ///
+    /// For a compressed file (one carrying the `com.apple.decmpfs` attribute),
+    /// the data fork does not hold the file's logical contents — it holds
+    /// decmpfs data. This method detects that case and decompresses instead.
     pub fn read(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>> {
         let f = file.as_file()?;
+
+        if let Some(decompressed) = self.try_decompress(file)? {
+            let end = (offset + len as u64).min(decompressed.len() as u64);
+            let start = offset.min(decompressed.len() as u64);
+            return Ok(decompressed[start as usize..end as usize].to_vec());
+        }
+
         self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
             .read(offset, len)
     }
 
     /// Read the whole data fork, bounded by `limit` bytes.
+    ///
+    /// For a compressed file, this returns the decompressed contents rather
+    /// than the raw decmpfs data.
     pub fn read_file(&self, file: &Object, limit: usize) -> Result<Vec<u8>> {
+        if let Some(decompressed) = self.try_decompress(file)? {
+            if decompressed.len() > limit {
+                return Err(Error::out_of_range(
+                    "decompressed size",
+                    decompressed.len() as u64,
+                    limit as u64,
+                ));
+            }
+            return Ok(decompressed);
+        }
+
         let f = file.as_file()?;
         self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
             .read_all(limit)
+    }
+
+    /// If `file` carries a `com.apple.decmpfs` attribute, decompress its
+    /// contents and return `Some(decompressed_bytes)`. Returns `Ok(None)`
+    /// when the file is not compressed.
+    ///
+    /// Mining reference: Apple `core/hfs_readwrite.c` `hfs_read` checks
+    /// `ap->a_is_compressed` and redirects the read to the decmpfs path.
+    fn try_decompress(&self, file: &Object) -> Result<Option<Vec<u8>>> {
+        // The decmpfs attribute is present iff the file is compressed.
+        // `getxattr` filters it from listxattr but we can read it directly.
+        let Some(attr_value) = self.getxattr(file, crate::attributes::names::DECOMPRESSION_NAME)?
+        else {
+            return Ok(None);
+        };
+
+        let header = DecmpfsHeader::from_bytes(&attr_value)?;
+        if header.compression_magic != CMP_MAGIC {
+            return Ok(None);
+        }
+
+        // For type 1 (uncompressed), the data is inline in the xattr.
+        // For types 2–7, the compressed bytes live in the resource fork.
+        let compressed: Vec<u8> = match header.compression_type {
+            CompressionType::Uncompressed => attr_value[DecmpfsHeader::SIZE..].to_vec(),
+            _ => {
+                // For types 1–7, the compressed data lives in the resource fork.
+                // Read the entire resource fork.
+                let f = file.as_file()?;
+                if f.record.resource_fork.logical_size == 0 {
+                    return Err(Error::invalid(
+                        "compressed file",
+                        "resource fork is empty but compression type is not uncompressed",
+                    ));
+                }
+                let rf_size = f.record.resource_fork.logical_size as usize;
+                self.fork_reader(
+                    &f.record.resource_fork,
+                    ExtentKey::RESOURCE_FORK,
+                    file_id(f),
+                )
+                .read_all(rf_size.max(1))?
+            }
+        };
+
+        let decompressed = crate::compression::decompress(
+            &compressed,
+            header.compression_type,
+            header.uncompressed_size,
+        )?;
+
+        Ok(Some(decompressed))
     }
 
     /// SEEK_DATA: the byte offset of the next allocated region at or after

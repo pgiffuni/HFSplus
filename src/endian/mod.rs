@@ -327,3 +327,179 @@ pub fn read_u32(bytes: &[u8], off: usize) -> Result<u32> {
 pub fn read_u64(bytes: &[u8], off: usize) -> Result<u64> {
     Be::new(bytes).u64(off)
 }
+
+/// A little-endian byte slice that can be decoded field by field.
+///
+/// This exists for the decmpfs compression header, which Apple stores in
+/// **little-endian** byte order even though the surrounding HFS+ structures
+/// (volume header, B-tree nodes, catalog records) are big-endian. Apple's
+/// decmpfs lives in `bsd/sys/decmpfs.h`: `struct decmpfs_header` is defined
+/// with natural alignment on x86, so on-disk it is little-endian.
+///
+/// The same safety rules apply as for [`Be`]: no `unsafe` pointer casts over
+/// image bytes, no trusted length fields.
+///
+/// ```
+/// use hfsplus::endian::Le;
+/// let le = Le::new(&[0x78, 0x56, 0x34, 0x12]);
+/// assert_eq!(le.u32(0).unwrap(), 0x12345678);
+/// assert!(le.u32(4).is_err());
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct Le<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Le<'a> {
+    /// Wrap a byte slice.
+    #[inline]
+    pub const fn new(bytes: &'a [u8]) -> Self {
+        Le { bytes }
+    }
+
+    /// The underlying bytes.
+    #[inline]
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Total length in bytes.
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Whether the slice is empty.
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    /// Decode a little-endian `u16` at `off`.
+    #[inline]
+    pub fn u16(&self, off: usize) -> Result<u16> {
+        let s = self.slice(off, 2, "le16")?;
+        Ok(u16::from_le_bytes([s[0], s[1]]))
+    }
+
+    /// Decode a little-endian `u32` at `off`.
+    #[inline]
+    pub fn u32(&self, off: usize) -> Result<u32> {
+        let s = self.slice(off, 4, "le32")?;
+        Ok(u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+
+    /// Decode a little-endian `u64` at `off`.
+    #[inline]
+    pub fn u64(&self, off: usize) -> Result<u64> {
+        let s = self.slice(off, 8, "le64")?;
+        Ok(u64::from_le_bytes([
+            s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+        ]))
+    }
+
+    /// Borrow `len` bytes at `off`.
+    #[inline]
+    pub fn slice(&self, off: usize, len: usize, what: &'static str) -> Result<&'a [u8]> {
+        let end = off.checked_add(len).ok_or(Error::overflow(what))?;
+        self.bytes.get(off..end).ok_or(Error::Truncated {
+            what,
+            needed: end,
+            available: self.bytes.len(),
+        })
+    }
+
+    /// Decode a single byte at `off`.
+    #[inline]
+    pub fn u8(&self, off: usize) -> Result<u8> {
+        self.slice(off, 1, "le8").map(|s| s[0])
+    }
+
+    /// Decode a little-endian `i32` at `off`.
+    #[inline]
+    pub fn i32(&self, off: usize) -> Result<i32> {
+        Ok(self.u32(off)? as i32)
+    }
+}
+
+/// A forward cursor with bounds checking for sequential little-endian decoding.
+#[derive(Clone, Debug)]
+pub struct LeCursor<'a> {
+    le: Le<'a>,
+    pos: usize,
+    what: &'static str,
+}
+
+impl<'a> LeCursor<'a> {
+    /// Start a cursor at `off` within `bytes`.
+    pub fn at(bytes: &'a [u8], off: usize, what: &'static str) -> Self {
+        LeCursor {
+            le: Le::new(bytes),
+            pos: off,
+            what,
+        }
+    }
+
+    /// Start a cursor at the beginning of `bytes`.
+    pub fn new(bytes: &'a [u8], what: &'static str) -> Self {
+        LeCursor::at(bytes, 0, what)
+    }
+
+    /// Current byte offset of the cursor.
+    #[inline]
+    pub const fn pos(&self) -> usize {
+        self.pos
+    }
+
+    /// Number of bytes remaining from the cursor to the end of the buffer.
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.le.len().saturating_sub(self.pos)
+    }
+
+    /// Read a little-endian `u16` and advance.
+    #[inline]
+    pub fn u16(&mut self) -> Result<u16> {
+        let v = self.le.u16(self.pos)?;
+        self.pos += 2;
+        Ok(v)
+    }
+
+    /// Read a little-endian `u32` and advance.
+    #[inline]
+    pub fn u32(&mut self) -> Result<u32> {
+        let v = self.le.u32(self.pos)?;
+        self.pos += 4;
+        Ok(v)
+    }
+
+    /// Read a little-endian `i32` and advance.
+    #[inline]
+    pub fn i32(&mut self) -> Result<i32> {
+        let v = self.le.i32(self.pos)?;
+        self.pos += 4;
+        Ok(v)
+    }
+
+    /// Read a little-endian `u64` and advance.
+    #[inline]
+    pub fn u64(&mut self) -> Result<u64> {
+        let v = self.le.u64(self.pos)?;
+        self.pos += 8;
+        Ok(v)
+    }
+
+    /// Advance without reading.
+    #[inline]
+    pub fn skip(&mut self, len: usize) -> Result<&'a [u8]> {
+        let out = self.le.slice(self.pos, len, self.what)?;
+        self.pos += len;
+        Ok(out)
+    }
+
+    /// Borrow the next `len` bytes without decoding them.
+    #[inline]
+    pub fn peek_bytes(&mut self, len: usize) -> Result<&'a [u8]> {
+        self.le.slice(self.pos, len, self.what)
+    }
+}

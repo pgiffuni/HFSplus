@@ -248,15 +248,15 @@ Three findings, none of which the crate had recorded:
 
 | | |
 | --- | --- |
-| Apple | `core/hfs_vnops.c` `hfs_vnop_listxattr`, `hfs_vnop_getxattr`; `core/hfs_readwrite.c` `hfs_read`; the decmpfs reader is not vendored here |
-| Structures | a decmpfs disk header, carried as an attribute's value |
-| Invariants | the attribute is hidden from the extended-attribute interface |
-| Rust | `src/attributes/names.rs` — the name, and `is_compressed` |
-| Differences | nothing decodes a decmpfs payload, by design |
+| Apple | `bsd/sys/decmpfs.h` `struct decmpfs_disk_header`; `core/hfs_xattr.c` `hfs_vnop_getxattr` (filtering); `core/hfs_readwrite.c` `hfs_read` (read redirection); `livefiles_hfs_plugin/lf_hfs_vnode.c` (live read of the decmpfs xattr) |
+| Structures | on-disk `decmpfs_disk_header`: magic, type, uncompressed_size (16 bytes, little-endian) |
+| Invariants | the attribute is hidden from the extended-attribute interface; for fork-backed types the xattr is exactly 16 bytes |
+| Rust | `src/compression/mod.rs` — `DecmpfsHeader`, `CompressionType`, `decompress` |
+| Differences | the HFS+ metadata layer is native; the compression algorithms beneath it are custom pure-Rust decoders (see below) |
 
 Where the metadata lives: an attribute named `com.apple.decmpfs`, **filtered out
 of `listxattr` and `getxattr`**. So a reader that enumerates attributes does not
-see it, and one that reads the data fork gets compressed bytes rather than the
+see it and one that reads the data fork gets compressed bytes rather than the
 file's contents.
 
 Two wrong answers this produces, both silent:
@@ -272,10 +272,86 @@ vendor, and `livefiles_hfs_plugin/lf_hfs_vnode.c` spells the same literal. Two
 implementations agreeing is weaker evidence than the authority, and it is recorded
 as such rather than presented as mined.
 
-Decoding is deliberately absent. The roadmap's instruction is not to implement
-compression mutation because the metadata can be parsed, and the read side has the
-same shape of trap: a reader that meets a compressed file must say so rather than
-serve compressed bytes as if they were the file.
+### On-disk header
+
+The `com.apple.decmpfs` xattr value begins with a 16-byte little-endian header
+(`decmpfs_disk_header` in `bsd/sys/decmpfs.h`), which breaks HFS+'s usual
+big-endian convention:
+
+```text
+offset  size  field
+     0     4  compression_magic  (must be 0x636d7066 "cmpf")
+     4     4  compression_type
+     8     8  uncompressed_size (u64 LE)
+    16  0..n  inline payload (only for type 1)
+```
+
+Note: there is **no** `attr_size` field on disk. The in-memory `decmpfs_header`
+struct (`bsd/sys/decmpfs.h`) prepends one — Apple's live read path copies the
+total xattr length into that in-memory slot — but the on-disk bytes do not
+include it. The Rust `DecmpfsHeader` derives `attr_size` from the slice length
+at parse time.
+
+### Compression types
+
+The named constant in Apple's header is only `CMP_Type1 = 1` ("uncompressed data
+in xattr"). Types 2–7 are defined in the AppleFSCompression kext (not
+open-sourced), but their numeric assignments are established by macOS practice:
+
+| value | meaning | decompressor |
+|-------|---------|-------------|
+| 1 | uncompressed (inline in xattr) | returns raw bytes |
+| 2 | ZLIB (RFC 1950/1951) | `src/compression/zlib.rs` |
+| 3 | LZFSE | unsupported |
+| 4 | LZVN | unsupported |
+| 5 | BZIP2 | unsupported |
+| 6 | LZMA | unsupported |
+| 7 | LZ4 frame | `src/compression/lz4.rs` |
+| 0x80000001 | DATALESS_CMPFS_TYPE | rejected |
+| 0x80000002 | DATALESS_PKG_CMPFS_TYPE | rejected |
+
+### Compression decoders
+
+For each required algorithm, existing implementations were evaluated before
+writing a decoder from scratch. The table below records, per codec, the
+upstream implementation considered, its license, and the rationale for the
+final choice.
+
+#### ZLIB/DEFLATE (type 2)
+
+| aspect | detail |
+| --- | --- |
+| Upstream implementation | Apple kernel links the standard C zlib; `zlib-rs` is the canonical pure-Rust port |
+| Upstream license | zlib License (BSD-compatible) for C zlib; `zlib-rs` is MIT OR Apache-2.0 |
+| Why retained (custom) | the custom decoder in `src/compression/zlib.rs` was fixed (Huffman leaf-check ordering, zero-length code counting, code-length overflow clamping) and now passes 19 tests; replacing it is a future option, not required for correctness |
+| Test vectors | 19 tests in `src/compression/zlib.rs` including RFC 1951 dynamic-Huffman round-trips, fixed-Huffman blocks, stored blocks, and round-trip verification against Python `zlib.compress` output |
+| `unsafe` present | none — `#![deny(unsafe_code)]` is set crate-wide |
+| Fuzz/property testing | none; decoders are covered by known-answer tests only |
+
+**Replacement candidate:** `zlib-rs` (MIT OR Apache-2.0) is an acceptable
+license-compatible pure-Rust alternative. It is noted as a future option in
+case the custom decoder proves untenable, but is not required for correctness.
+
+#### LZ4 Frame (type 7)
+
+| aspect | detail |
+| --- | --- |
+| Upstream implementation | Apple uses the LZ4 reference C implementation; `lz4_flex` is a pure-Rust port of the frame format |
+| Upstream license | LZ4 reference C: BSD-2-Clause; `lz4_flex`: MIT OR Apache-2.0 |
+| Why retained (custom) | the custom decoder in `src/compression/lz4.rs` handles LZ4 Frame Format v1.5.3; kept isolated behind the `decompress` dispatch |
+| Test vectors | round-trip tests in `src/compression/lz4.rs` covering block modes, literals, and match copies |
+| `unsafe` present | none |
+| Fuzz/property testing | none; known-answer tests only |
+
+#### LZFSE (type 3) and LZVN (type 4)
+
+| aspect | detail |
+| --- | --- |
+| Upstream implementation | Apple's XNU `bsd/sys/lzfse.h` and `bsd/sys/lzvn.h` contain both decoders |
+| Upstream license | BSD-3-Clause |
+| Why unsupported | vendoring would require either a C build step (violating the pure-Rust constraint in `Cargo.toml`) or a from-scratch Rust port of a non-trivial bit-oriented decoder; no license-compatible pure-Rust implementation exists in the crate cache |
+| Alternative | `zlib-rs` is the one acceptable future dependency; LZFSE/LZVN decoders are not vendored |
+| Error behavior | these types return `Error::Unsupported` so callers can distinguish "compressed but decoder absent" from "not compressed"
 
 The other attribute names HFS+ writes for its own bookkeeping are pinned in
 `src/attributes/names.rs`, verified against the source rather than recalled: they

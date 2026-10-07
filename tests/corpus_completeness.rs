@@ -59,6 +59,7 @@ const FIXTURES: &[(&str, &str)] = &[
     // tools/mkfiles.py
     ("generated", "journal-with-files"),
     ("generated", "journal-with-attributes"),
+    ("generated", "journal-with-compressed"),
     ("generated", "bootstrapped-catalog"),
     ("generated", "bootstrapped-with-file"),
     // tools/makejournal.py, journal replay
@@ -98,6 +99,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ("malformed", "journal-info-block-out-of-volume"),
     ("malformed", "journal-info-block-huge"),
     ("malformed", "journal-start-at-header"),
+    ("malformed", "stale-attr-node-map"),
 ];
 
 fn fixture_path(dir: &str, name: &str) -> PathBuf {

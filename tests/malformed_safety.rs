@@ -99,6 +99,9 @@ fn cases() -> Vec<(&'static str, Level, &'static str)> {
             Level::Mount,
             "journal_header.start",
         ),
+        // totalNodes = 0 in the catalog B-tree header: every node reference
+        // exceeds the node count, so BTreeHeader::validate rejects it at mount.
+        ("stale-attr-node-map", Level::Mount, "totalNodes"),
     ]
 }
 
