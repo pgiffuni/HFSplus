@@ -45,8 +45,8 @@ input: every field, offset, and count is bounds-checked.
 | 7B.2 | Compression metadata (detection, hiding) | Complete |
 | 7E | Mutation invariants | Complete |
 | 8 | Writable volume — basic mutations | Complete |
-| 9 | Journal transaction assembly | Done — see notes |
-| 10 | Journal transaction coverage for all mutations | In progress |
+| 9 | Journal transaction assembly | Complete |
+| 10 | Journal transaction coverage for all mutations | Done — audited, hard-link folder wrapped |
 | 11 | Logical file layer (compression-aware) | Complete |
 | **12** | **decmpfs decompression — zlib** | **Complete** |
 | 12.1 | decmpfs decompression — LZVN | Tracked |
@@ -83,16 +83,10 @@ Current mutations: `write_file_contents`, `truncate_file`, `create_file`,
 
 ### A2. Journal transaction tests
 
-For each mutation family:
-
-1. Create a known-good image
-2. Perform exactly one operation
-3. Simulate interruption before home-block completion
-4. Reopen / replay
-5. Verify filesystem state
-6. Run `fsck.hfsplus` on a throwaway copy
-
-Never run `fsck.hfsplus` on a golden test image — it modifies them.
+Ongoing: crash/replay coverage for every mutation family. Each test
+creates a known-good image, performs one operation, simulates
+interruption before home-block completion, then reopens/replays and
+verifies filesystem state. Run `fsck.hfsplus` on a throwaway copy only.
 
 ### A3. decmpfs decompression — LZVN / LZFSE
 
@@ -164,6 +158,20 @@ Commit `7a58506` added:
 
 All 511 tests pass. `cargo +nightly clippy --all-targets -- -D warnings` and
 `cargo fmt -- --check` are clean.
+
+---
+
+## Recent journal work
+
+Since the last roadmap update, journal write-side support has been completed:
+
+- **Transaction assembly** — `journal: assemble a whole transaction, walked by the reader's own arithmetic` (`da772f5`)
+- **Block-list encoding** — `journal: encode a block list, checked by the decoder that must accept it` (`5c54aa9`)
+- **Free-space rule and header advancement** — `journal: the free-space rule, and advancing the header` (`308b853`)
+- **Header, buffer, and commit path** — `journal: write the header, the transaction buffer, and commit path` (`de13125`)
+- **Transaction wrapping** — `journal: wrap ensure_file_hardlinks_folder in a transaction` (`700ff62`), `journal: journaled volumes accept writes through WritableVolume::open` (`d73010c`)
+- **Crash/replay tests** — `journal: fix blhdr_size clamp and add crash/replay tests` (`c554cbe`)
+- **Coverage audit** — `docs: journal transaction coverage table for WritableVolume mutations` (`260e24b`)
 
 ---
 
