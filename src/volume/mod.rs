@@ -4257,7 +4257,16 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             r
         };
 
-        self.insert_attribute_record(&record)
+        self.insert_attribute_record(&record)?;
+
+        // Set kHFSHasAttributesMask on the catalog record so fsck.hfsplus
+        // sees the attribute we just wrote. A file with attributes must
+        // declare them or fsck reports a mismatch between the catalog
+        // claim and the tree's contents.
+        let mut file_record = self.read_file_record(cnid)?;
+        file_record.flags |= crate::catalog::record::K_HFS_HAS_ATTRIBUTES_MASK;
+        self.touch_record(&mut file_record)?;
+        self.replace_catalog_record(cnid, &file_record)
     }
 
     /// Highest inline value size that fits in the attributes tree's nodes.
@@ -4523,6 +4532,25 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 + crate::btree::header::LEAF_RECORDS_OFFSET,
             &new_count.to_be_bytes(),
         )?;
+
+        // Clear kHFSHasAttributesMask on the catalog record if this was the
+        // last attribute, so the catalog claim matches the tree's contents.
+        // fsck.hfsplus compares the two and rejects a mismatch.
+        let still_has = {
+            let attrs = crate::attributes::AttributesFile::open(
+                &*self.device,
+                &self.header.attributes_file,
+                self.header.block_size,
+                true,
+            )?;
+            !attrs.attributes_for(cnid)?.is_empty()
+        };
+        if !still_has {
+            let mut file_record = self.read_file_record(cnid)?;
+            file_record.flags &= !crate::catalog::record::K_HFS_HAS_ATTRIBUTES_MASK;
+            self.touch_record(&mut file_record)?;
+            self.replace_catalog_record(cnid, &file_record)?;
+        }
         Ok(())
     }
 
