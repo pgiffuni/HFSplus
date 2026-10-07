@@ -16,7 +16,8 @@
 mod common;
 
 use hfsplus::blockdev::{BlockDeviceMut, FileDevice};
-use hfsplus::volume::{Volume, WritableVolume};
+use hfsplus::catalog::cnid::Cnid;
+use hfsplus::volume::{Object, Volume, WritableVolume};
 
 /// UTF-16 code units of `s`, for a catalog lookup.
 fn units(s: &str) -> Vec<u16> {
@@ -2493,4 +2494,181 @@ fn a_missing_cnid_is_reported_rather_than_writing_something_else() {
         dev.sync().expect("flush");
     }
     assert_untouched(&path, &before, "writes that found no file record");
+}
+
+// ---------------------------------------------------------------------------
+// Crash/replay tests for extended attribute mutations (Phase A2).
+//
+// These establish the pattern for every mutation family: write to a copy
+// of a fixture, verify fsck accepts the result, then verify the value is
+// readable through the library. For journaled volumes the transaction
+// commits before returning, so the committed image is the crash-safe state.
+// ---------------------------------------------------------------------------
+
+/// CNID 18 is the file that owns the existing attributes in journal-with-attributes.
+const ATTR_OWNER: u32 = 18;
+
+/// Helper: look up a CNID, returning the Object or panicking.
+fn lookup_obj(vol: &Volume<'_, FileDevice>, cnid: u32) -> Object {
+    vol.lookup_cnid(Cnid(cnid))
+        .expect("lookup CNID")
+        .expect("CNID must exist")
+}
+
+/// Helper: fetch attribute names for a CNID.
+fn attr_names(vol: &Volume<'_, FileDevice>, cnid: u32) -> Vec<String> {
+    let obj = lookup_obj(vol, cnid);
+    let names = vol.listxattr(&obj).expect("listxattr");
+    let mut names = names;
+    names.sort();
+    names
+}
+
+/// Helper: fetch a specific attribute value for a CNID.
+fn attr_value(vol: &Volume<'_, FileDevice>, cnid: u32, name: &str) -> Option<Vec<u8>> {
+    let obj = lookup_obj(vol, cnid);
+    vol.getxattr(&obj, name).expect("getxattr")
+}
+
+#[test]
+fn a_setxattr_on_a_journaled_volume_is_durable_after_reopen() {
+    // setxattr inserts a new inline attribute record into the attributes B-tree.
+    // On a journaled volume the transaction commits before returning, so the
+    // attribute must survive a close/reopen cycle.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let test_name = "com.test.crash";
+    let test_value = b"crash replay setxattr";
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .setxattr(ATTR_OWNER, test_name, test_value)
+            .expect("setxattr should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Verify the attribute is readable and fsck accepts the image.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let names = attr_names(&vol, ATTR_OWNER);
+    assert!(
+        names.iter().any(|n| n == test_name),
+        "{test_name} must be present, got {names:?}"
+    );
+    assert_eq!(
+        attr_value(&vol, ATTR_OWNER, test_name),
+        Some(test_value.to_vec())
+    );
+    assert_fsck_clean(&path, "setxattr on a journaled volume");
+}
+
+#[test]
+fn a_removexattr_on_a_journaled_volume_is_durable_after_reopen() {
+    // removexattr deletes an existing attribute record. The transaction must
+    // be durable, and the attribute must be gone after reopen.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let name_to_remove = "com.apple.test.inline";
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .removexattr(ATTR_OWNER, name_to_remove)
+            .expect("removexattr should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Verify the attribute is gone and fsck accepts the image.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let names = attr_names(&vol, ATTR_OWNER);
+    assert!(
+        !names.iter().any(|n| n == name_to_remove),
+        "{name_to_remove} must be gone, remaining: {names:?}"
+    );
+    assert_fsck_clean(&path, "removexattr on a journaled volume");
+}
+
+#[test]
+fn a_setxattr_then_removexattr_round_trips_on_a_journaled_volume() {
+    // Write an attribute, then remove it, in a single journal sequence.
+    // The net effect should be the volume without the attribute's record.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let test_name = "com.test.roundtrip";
+    let test_value = b"round-trip value";
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .setxattr(ATTR_OWNER, test_name, test_value)
+            .expect("setxattr should succeed");
+        writable
+            .removexattr(ATTR_OWNER, test_name)
+            .expect("removexattr should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // The attribute should not exist.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let names = attr_names(&vol, ATTR_OWNER);
+    assert!(
+        !names.iter().any(|n| n == test_name),
+        "{test_name} must be gone after round-trip, remaining: {names:?}"
+    );
+    assert_fsck_clean(&path, "setxattr then removexattr round-trip");
+}
+
+#[test]
+fn a_setxattr_replacing_an_existing_attribute_updates_in_place() {
+    // setxattr on an existing name should replace the value, not duplicate the
+    // record. The attribute list must not change in count.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let name = "com.apple.test.inline";
+    let new_value = b"replaced inline value";
+
+    let count_before = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        attr_names(&vol, ATTR_OWNER).len()
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .setxattr(ATTR_OWNER, name, new_value)
+            .expect("setxattr replace should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Verify the value was replaced and the count is unchanged.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let value = attr_value(&vol, ATTR_OWNER, name);
+    assert_eq!(value, Some(new_value.to_vec()));
+    assert_eq!(
+        attr_names(&vol, ATTR_OWNER).len(),
+        count_before,
+        "replacing an attribute must not change the record count"
+    );
+    assert_fsck_clean(&path, "setxattr replacing existing attribute");
 }
