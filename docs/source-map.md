@@ -347,10 +347,20 @@ case the custom decoder proves untenable, but is not required for correctness.
 
 | aspect | detail |
 | --- | --- |
-| Upstream implementation | Apple's XNU `bsd/sys/lzfse.h` and `bsd/sys/lzvn.h` contain both decoders |
+| Upstream implementation | Apple's `lzfse` library (https://github.com/lzfse/lzfse), `src/lzfse_decode_base.c`, `src/lzfse_fse.c`, `src/lzfse_internal.h`, `src/lzfse_fse.h`, BSD-3-Clause |
 | Upstream license | BSD-3-Clause |
-| Why unsupported | vendoring would require either a C build step (violating the pure-Rust constraint in `Cargo.toml`) or a from-scratch Rust port of a non-trivial bit-oriented decoder; no license-compatible pure-Rust implementation exists in the crate cache |
-| Alternative | `zlib-rs` is the one acceptable future dependency; LZFSE/LZVN decoders are not vendored |
+| Why retained (custom) | vendoring would require a C build step (violating the pure-Rust constraint in `Cargo.toml`); the reference implementation is a complete from-scratch port in `src/compression/lzfse.rs` and `src/compression/lzvn.rs`, written with bounds-checking and no `unsafe` |
+| Test vectors | 6 tests in `src/compression/lzfse.rs` (empty input, end-of-stream marker, unknown magic, uncompressed round-trip, V2 compressed decompression, LZVN-within-LZFSE) and 6 tests in `src/compression/lzvn.rs` (empty input, undefined opcode, literal round-trip, small literal+match, undefined opcode errors) |
+| `unsafe` present | none — `#![deny(unsafe_code)]` is set crate-wide |
+| Differences | the decoder is a streaming, `unsafe`-free port that allocates with `Vec<u8>` (the reference uses a fixed-size `dst_end` buffer with `LZFSE_STATUS_DST_FULL` for partial decoding); the reference uses `FSE_IOSTREAM_64` for 64-bit systems which is the only mode used here; the reference `lzfse_decode_v1` has a final validation check `if (accum_nbits >= 8 || src != src_end) return -1` after decoding frequency tables — our implementation matches this check |
+
+#### BZIP2 (type 5) and LZMA (type 6)
+
+| aspect | detail |
+| --- | --- |
+| Upstream implementation | Apple uses the C `libbz2` (BSD-2-Clause) and C `liblzma` (Public Domain) libraries |
+| Upstream license | BSD-2-Clause for libbz2; Public Domain for liblzma |
+| Why unsupported | no license-compatible pure-Rust decoder exists in the crate cache; vendoring would require a C build step (violating the pure-Rust constraint in `Cargo.toml`) |
 | Error behavior | these types return `Error::Unsupported` so callers can distinguish "compressed but decoder absent" from "not compressed"
 
 The other attribute names HFS+ writes for its own bookkeeping are pinned in
