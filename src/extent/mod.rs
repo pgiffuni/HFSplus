@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Extent mapping: translating fork-relative blocks to physical blocks.
 //!
 //! Mining reference: Apple `core/FileExtentMapping.c` (`MapFileBlockC`)

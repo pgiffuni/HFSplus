@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The two command-line tools, driven as processes.
 //!
 //! Everything else in the suite drives the library directly, which means the

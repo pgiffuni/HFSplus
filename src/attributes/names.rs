@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The attribute names HFS+ itself stores.
 //!
 //! Not user attributes. The attributes file holds several entries that are part

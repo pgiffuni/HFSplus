@@ -36,11 +36,42 @@ Currently derived files:
 
 | File | Apple reference |
 | --- | --- |
-| `src/format/volume_header.rs` | `core/hfs_format.h` (`struct HFSPlusVolumeHeader`), `core/hfs_vfsutils.c` (`hfs_ValidateHFSPlusVolumeHeader`) |
-| `src/format/fork.rs` | `core/hfs_format.h` (`struct HFSPlusForkData`, `struct HFSPlusExtentDescriptor`) |
-| `src/format/extents.rs` | `core/hfs_format.h` (`struct HfsPlusExtentRecord`) |
-| `src/timestamp.rs` | `core/MacOSStubs.c` (`to_bsd_time`, `to_hfs_time`), `core/hfs_format.h` (`kHFSExpandedTimesBit`) |
+| `src/catalog/cnid.rs` | `core/hfs_format.h` (`kHFSPlusCatalogNodeIDs`), `core/hfs_catalog.c` |
+| `src/catalog/key.rs` | `core/hfs_format.h` (`struct HFSPlusCatalogKey`), `core/hfs_catalog.c` (`cat_binarykeycompare`) |
+| `src/catalog/lookup.rs` | `core/BTree.c` (`BTSearchRecord`, `BTIterateRecords`), `core/hfs_catalog.c` (`cat_lookup`, `cat_idlookup`) |
+| `src/catalog/mod.rs` | `core/hfs_catalog.c` namespace and CNID ranges |
+| `src/catalog/record.rs` | `core/hfs_format.h` (`struct HFSPlusCatalogFile`, `HFSPlusCatalogFolder`, `HFSPlusCatalogThread`) |
+| `src/alloc/mod.rs` | `core/VolumeAllocation.c` (`BlockFindAny`, bit ordering) |
+| `src/attributes/key.rs` | `core/hfs_format.h` (`struct HFSPlusAttrKey`) |
+| `src/attributes/mod.rs` | `core/hfs_attrlist.c` attribute-list construction |
+| `src/attributes/names.rs` | `core/hfs_format.h` (`FIRST_LINK_XATTR_NAME`), `core/hfs_xattr.c` |
+| `src/attributes/record.rs` | `core/hfs_format.h` (`kHFSPlusAttrInlineData`) |
+| `src/blockdev/mod.rs` | `core/hfs_format.h` (`struct HFSMasterDirectoryBlock`), `core/hfs_vfsutils.c` |
+| `src/blockdev/view.rs` | `core/hfs_vfsutils.c` (`hfsPlusIOPosOffset`), `core/FileExtentMapping.c` |
+| `src/btree/header.rs` | `core/hfs_format.h` (`struct BTHeaderRec`), `core/BTreesInternal.h`, `core/BTreeMiscOps.c` |
+| `src/btree/io.rs` | `core/BTree.c` (`BTOpenPath`, `GetNode`), `core/BTreesInternal.h` |
+| `src/btree/key.rs` | `core/hfs_format.h` (`struct HFSPlusCatalogKey`) |
+| `src/btree/mod.rs` | `core/BTree.c` and the `BTree*` family |
+| `src/btree/node.rs` | `core/BTreeNodeOps.c` (`BTNodeDescriptor`), `core/hfs_format.h` |
+| `src/compression/mod.rs` | `bsd/sys/decmpfs.h` (`struct decmpfs_disk_header`, `CMP_MAGIC`) |
 | `src/endian/mod.rs` | `core/hfs_endian.c`, `core/hfs_endian.h` |
+| `src/extent/mapper.rs` | `core/hfs_extents.c` (`hfs_ext_iter_next_group`) |
+| `src/extent/mod.rs` | `core/FileExtentMapping.c` (`MapFileBlockC`), `core/hfs_extents.c` |
+| `src/file/mod.rs` | `core/FileExtentMapping.c` (`MapFileBlockC`) |
+| `src/format/extents.rs` | `core/hfs_format.h` (`struct HfsPlusExtentRecord`) |
+| `src/format/fork.rs` | `core/hfs_format.h` (`struct HFSPlusForkData`, `struct HFSPlusExtentDescriptor`) |
+| `src/format/volume_header.rs` | `core/hfs_format.h` (`struct HFSPlusVolumeHeader`), `core/hfs_vfsutils.c` |
+| `src/format/writer.rs` | `newfs_hfs/makehfs.c` (`MakeHFS`, `initVolume`), `core/hfs_vfsutils.c` |
+| `src/journal/checksum.rs` | `core/hfs_journal.c` (`calc_checksum`) |
+| `src/journal/info.rs` | `core/hfs_format.h` (`struct JournalInfoBlock`), `core/hfs_journal.h` (`struct journal_header`) |
+| `src/journal/mod.rs` | `core/hfs_journal.h`, `core/hfs_journal.c`, `core/hfs_vfsutils.c` |
+| `src/journal/replay.rs` | `core/hfs_journal.c` (`journal_replay`), `core/hfs_vfsutils.c` |
+| `src/timestamp.rs` | `core/MacOSStubs.c` (`to_bsd_time`, `to_hfs_time`), `core/hfs_format.h` (`kHFSExpandedTimesBit`) |
+| `src/unicode/compare.rs` | `core/UnicodeWrappers.c` (`FastUnicodeCompare`, `UnicodeBinaryCompare`) |
+| `src/unicode/mod.rs` | `core/UnicodeWrappers.c` |
+| `src/unicode/tables.rs` | `core/UCStringCompareData.h` |
+| `src/volume/bitmap.rs` | `core/VolumeAllocation.c` |
+| `src/volume/mod.rs` | `core/hfs_vfsutils.c` (`hfs_MountHFSPlusVolume`) |
 
 ## 3. Rules
 
@@ -67,7 +98,7 @@ Two distinct uses are permitted, and they carry different obligations:
 
 | Package / project | Licence | Role |
 | --- | --- | --- |
-| `hfsprogs` 540.1 (`mkfs.hfsplus`, `fsck.hfsplus`) | APSL-2.0, Apple Inc. | **Primary.** Image generation and the independent checker for differential testing. Apple-authored, so it also satisfies the Apple-source-first hierarchy. |
+| `hfsprogs` 540.1 (`mkfs.hfsplus`, `fsck.hfsplus`) | APSL-2.0, Apple Inc. | **Former primary, now regression oracle.** Image generation was formerly the primary use of `hfsprogs`; it has been superseded by the in-tree `hnewfs` binary, and `fsck.hfsplus` was formerly the primary checker but is now superseded by `hfsck`. `hfsprogs` is retained as an independent oracle for regression comparisons and is never read as a source. |
 | `apple-oss-distributions/hfs` (mirror: `pgiffuni/apple-hfs`) | APSL-1.2 | **Primary.** Structures, algorithms, semantics. Mined and cited. |
 | `hfsutils` 3.2.6 (`hmount`, `hls`, `hformat`, …) | GPL-2.0 | **Executable only.** May be run to build images. Never read as a reference; never vendored. |
 | `hfsplus` 1.0.4 (`hpmount`, `hpls`, libhfsp) | GPL-2.0 | **Executable only.** Same rule. |
@@ -84,14 +115,16 @@ authority is Apple's `core/` sources, then Apple's format documentation, then
 Only Apple-derived tooling is used to decide whether our output is *correct*:
 
 ```
-   mkfs.hfsplus (hfsprogs, Apple)          our Rust implementation
+   hnewfs (this crate)              our Rust implementation
             |                                       |
             v                                       v
-        image A  --->  modify  --->  image B  --->  fsck.hfsplus  --->  pass?
+         image A  --->  modify  --->  image B  --->  hfsck + fsck.hfsplus  --->  pass?
 ```
 
-`fsck.hfsplus` is the arbiter. A GPL tool is never the judge of correctness,
-because a disagreement with it is not evidence of a bug on our side.
+`hfsck` is the in-tree checker, modelled on Apple's `fsck_hfs`. `fsck.hfsplus`
+(from `hfsprogs`, Apple's own tool) is run as an independent second opinion to
+catch blind spots in our implementation. A GPL tool is never the judge of
+correctness, because a disagreement with it is not evidence of a bug on our side.
 
 
 `LICENSE-README.md` records this because it is easy to lose: both `hfsutils`

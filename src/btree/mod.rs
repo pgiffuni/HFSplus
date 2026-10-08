@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! A read-only HFS+ B-tree engine.
 //!
 //! The engine is deliberately independent of any particular tree. The catalog,

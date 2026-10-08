@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Reading and decoding decmpfs-compressed files.
 //!
 //! HFS+ supports transparent file compression through the `com.apple.decmpfs`

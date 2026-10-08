@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Reading file data through the volume API.
 //!
 //! Every corpus volume is created by `mkfs.hfsplus`, which cannot put a file in

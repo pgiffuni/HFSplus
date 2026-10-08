@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The B-tree header record and Apple's header validation rules.
 //!
 //! Mining reference: Apple `core/hfs_format.h` (`struct BTHeaderRec`), the

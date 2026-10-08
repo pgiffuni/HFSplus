@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Catalog records: folders, files and thread records.
 //!
 //! Mining reference: Apple `core/hfs_format.h` for the layouts, and

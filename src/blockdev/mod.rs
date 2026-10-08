@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Block device abstraction sitting below the HFS format layer.
 //!
 //! The HFS layers above this one must never learn whether they are talking to

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! A fork whose extents overflow into the Extents B-tree.
 //!
 //! A fork holds at most `kHFSPlusExtentDensity` — 8 — extents inline. A file

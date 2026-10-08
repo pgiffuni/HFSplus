@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Properties for extent accounting and B-tree record decoding.
 //!
 //! Both are places where an on-disk length is trusted far enough to index with,

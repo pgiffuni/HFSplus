@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Every structure size the parser depends on, checked against Apple's
 //! declarations.
 //!

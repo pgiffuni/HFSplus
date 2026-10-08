@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! `hnewfs` -- construct a new HFS+ file system.
 //!
 //! Implements the Darwin `newfs_hfs` command-line interface for creating

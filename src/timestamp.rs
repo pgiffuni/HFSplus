@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Mac OS timestamps and Apple's "expanded times" mode.
 //!
 //! # Why this is not just a subtraction

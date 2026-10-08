@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! `hfsck` -- HFS+/HFSX consistency check and repair.
 //!
 //! Implements the Darwin `fsck_hfs` command-line interface for checking and

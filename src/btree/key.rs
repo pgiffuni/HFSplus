@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! B-tree keys: length prefix, padding, and the three HFS+ key types.
 //!
 //! # Encoding

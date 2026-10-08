@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Catalog keys.
 //!
 //! Mining reference: Apple `core/hfs_format.h`, `struct HFSPlusCatalogKey`:

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Minimal TOML subset reader for the test-image manifests.
 //!
 //! The manifest format is part of the test specification, so it gets a parser —

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Volume-header conformance against the generated test corpus.
 //!
 //! Each test asserts a fact that was captured *independently* of this crate:

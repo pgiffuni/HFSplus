@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! B-tree I/O: turning a fork into addressable nodes.
 //!
 //! # The pipeline

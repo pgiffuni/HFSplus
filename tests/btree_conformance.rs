@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Reading the B-trees of real volumes.
 //!
 //! The unit tests build synthetic nodes because that makes the geometry easy to

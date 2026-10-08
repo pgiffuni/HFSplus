@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Read-only journal replay.
 //!
 //! # What replay is for

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The HFS+ / HFSX volume header.
 //!
 //! # Position on disk

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The empty-catalog bootstrap, piece by piece.
 //!
 //! `mkfs.hfsplus` builds a volume with no files, so its catalog already holds the

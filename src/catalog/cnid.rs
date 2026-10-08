@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Catalog node IDs, the identity type of the HFS+ filesystem.
 //!
 //! # CNIDs are the real identity

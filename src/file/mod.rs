@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Reading bytes out of a fork.
 //!
 //! Mining reference: Apple `core/FileExtentMapping.c` (`MapFileBlockC`,

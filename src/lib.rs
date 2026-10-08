@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Userspace HFS+/HFSX implementation in Rust.
 //!
 //! # Scope

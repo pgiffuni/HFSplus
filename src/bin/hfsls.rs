@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! `hfsls` — list an HFS+ or HFSX image without mounting it.
 //!
 //! The point of this tool is that it exercises the same library a FUSE mount

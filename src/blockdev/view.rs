@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! A bounded, optionally offset window onto another [`BlockDevice`].
 //!
 //! An HFS+ volume does not necessarily start at byte 0 of the thing it lives

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! `hfsinspect` — print HFS family volume header facts for an image.
 //!
 //! A standalone entry point to the format layer, so that the library can be

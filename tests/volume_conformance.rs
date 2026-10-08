@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Read-only filesystem conformance against the real corpus.
 //!
 //! This is the layer a FUSE adapter would sit on, so these tests exercise the

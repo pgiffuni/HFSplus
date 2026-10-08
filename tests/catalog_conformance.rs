@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Catalog conformance against the real corpus.
 //!
 //! These tests go past "it parses" and check what a caller actually depends on:

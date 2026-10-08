@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! B-tree node parsing and record addressing.
 //!
 //! # Node layout

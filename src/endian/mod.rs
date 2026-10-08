@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Big-endian decoding primitives and a bounds-checked cursor.
 //!
 //! Every multi-byte field in an HFS family on-disk structure is stored

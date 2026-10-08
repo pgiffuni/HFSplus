@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The allocator: deciding which blocks a file gets, and marking them used.
 //!
 //! This is the shared prerequisite for both directions. Writing a file has to

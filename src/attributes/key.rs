@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The Attributes File's B-tree key.
 //!
 //! # This is not a catalog key

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The first mutation: replacing a file's contents in place.
 //!
 //! Every test here writes to a *copy* of a fixture. A fixture that fails

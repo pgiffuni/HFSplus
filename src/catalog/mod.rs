@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The HFS+ catalog: the filesystem's namespace.
 //!
 //! # Where names really live

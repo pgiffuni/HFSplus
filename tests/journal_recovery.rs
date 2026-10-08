@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Crash-consistent recovery: a journalled metadata write that never reached
 //! the filesystem.
 //!

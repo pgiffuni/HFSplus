@@ -27,6 +27,7 @@
 // (mirror: 0x09/hfsfuse `src/lzvn_decode_base.c`, `src/lzvn_decode_base.h`,
 // BSD-3-Clause).
 // Translated to Rust with bounds-checking and no `unsafe`.
+// SPDX-License-Identifier: BSD-3-Clause
 
 //! LZVN bitstream decoder for decmpfs compression type 4.
 //!

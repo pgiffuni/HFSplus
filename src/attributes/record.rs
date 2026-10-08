@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! What an attribute record holds: the value inline, in allocation blocks, or
 //! continued.
 //!

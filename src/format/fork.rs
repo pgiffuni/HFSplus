@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Fork data: the on-disk description of a data fork, resource fork, or one of
 //! the volume's special files.
 //!

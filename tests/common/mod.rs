@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Shared helpers for the integration test suite.
 //!
 //! The integration tests deliberately drive the *real* corpus through the

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! HFS+ journaling.
 //!
 //! Mining reference: Apple `core/hfs_journal.h` and `core/hfs_journal.c`, plus

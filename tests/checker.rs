@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The checker against the corpus.
 //!
 //! These are the acceptance tests for the in-tree checker, and they are

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Volume creation: building the on-disk structures of a fresh HFS+ volume.
 //!
 //! This module constructs the special B-tree forks that bookend an HFS+

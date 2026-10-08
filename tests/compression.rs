@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Reading decmpfs-compressed files: the whole point of the fixture.
 //!
 //! `tools/mkfiles.py --add-compressed-file` writes `compressed.bin` with a

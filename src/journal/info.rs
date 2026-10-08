@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The journal info block and the journal header block.
 //!
 //! Mining reference: Apple `core/hfs_format.h` (`struct JournalInfoBlock`) and

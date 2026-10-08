@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Structured errors for HFS+ parsing and filesystem operations.
 //!
 //! Every value that originates on disk is untrusted, so the whole crate

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Malformed images must fail safely, never fatally.
 //!
 //! Every image in `tests/images/malformed/` is a good volume with a small,

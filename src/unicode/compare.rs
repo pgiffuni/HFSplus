@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! HFS name comparison.
 //!
 //! This is the compatibility heart of the filesystem. Getting it wrong does not

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Extent descriptors and inline extent records.
 //!
 //! # Terminology warning

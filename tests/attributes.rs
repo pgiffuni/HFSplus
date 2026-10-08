@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The Attributes File, read end to end.
 //!
 //! `src/attributes/key.rs` and `record.rs` are covered at the structure level by

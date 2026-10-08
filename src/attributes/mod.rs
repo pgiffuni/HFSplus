@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The Attributes File: a second B-tree, holding what is not in the catalog.
 //!
 //! # Four things that are not the same

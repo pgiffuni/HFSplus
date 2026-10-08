@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! HFS name comparison and Unicode tables.
 //!
 //! Mining reference: Apple `core/UnicodeWrappers.c` (`FastUnicodeCompare`,

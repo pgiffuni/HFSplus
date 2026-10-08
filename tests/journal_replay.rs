@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! End-to-end journal replay against images that contain real transactions.
 //!
 //! `tests/journal_conformance.rs` covers detection against the generated corpus,

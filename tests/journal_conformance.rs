@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Journal detection and read-only replay against the real corpus.
 //!
 //! # What this suite can and cannot prove

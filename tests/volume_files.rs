@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Reading files that actually have data: fragmented extents and a symlink.
 //!
 //! # Why this suite exists

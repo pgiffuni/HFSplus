@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Mapping a fork-relative block to a physical allocation block.
 //!
 //! # The mapping chain

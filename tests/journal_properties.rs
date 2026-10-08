@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Property tests for the arithmetic a journal read depends on.
 //!
 //! # Why properties rather than examples

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! A minimal inflate (RFC 1951) decoder with a zlib (RFC 1950) wrapper.
 //!
 //! This implements decompression of zlib-compressed decmpfs payloads. The

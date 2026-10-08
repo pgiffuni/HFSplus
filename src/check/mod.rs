@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Volume consistency checks, read-only.
 //!
 //! # What this is and is not

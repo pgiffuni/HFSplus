@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The read-only HFS+ filesystem.
 //!
 //! # What this type is

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The production implementation is provably read-only.
 //!
 //! After Milestone 5 this is an architectural property rather than an accident,

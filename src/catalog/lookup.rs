@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! Catalog lookup and enumeration.
 //!
 //! Mining reference: Apple `core/BTree.c` (`BTSearchRecord`,

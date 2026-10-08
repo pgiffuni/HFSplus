@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! [`BlockDevice`] over an in-memory buffer.
 //!
 //! Useful for building malformed images in unit tests: a synthetic volume can

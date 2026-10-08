@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! On-disk format structures for the HFS+ family.
 //!
 //! This layer is deliberately thin and deliberately paranoid. It decodes

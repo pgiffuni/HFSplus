@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! The generated corpus is complete, or the suite is lying.
 //!
 //! # The problem this exists to prevent

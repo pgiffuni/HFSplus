@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! [`BlockDevice`] over a regular file on the host filesystem.
 //!
 //! This is the only backend needed for image-based testing, which is why the

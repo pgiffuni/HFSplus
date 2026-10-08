@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! Every parser, fed truncated input, must return an error rather than panic.
 //!
 //! # Why this is a separate file

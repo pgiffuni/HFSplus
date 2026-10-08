@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 // GENERATED FILE -- do not edit by hand.
 //
 // Regenerate with:

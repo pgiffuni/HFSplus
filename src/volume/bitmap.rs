@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The volume allocation bitmap.
 //!
 //! Mining reference: Apple `core/VolumeAllocation.c` implements

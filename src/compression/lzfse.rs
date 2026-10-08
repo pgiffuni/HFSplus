@@ -28,6 +28,7 @@
 // (mirror: 0x09/hfsfuse `src/lzfse_decode_base.c`, `src/lzfse_fse.c`,
 // `src/lzfse_fse.h`, `src/lzfse_internal.h`, BSD-3-Clause).
 // Translated to Rust with bounds-checking and no `unsafe`.
+// SPDX-License-Identifier: BSD-3-Clause
 
 //! LZFSE (LZ-FSE) decoder for decmpfs compression type 3.
 //!

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: BSD-2-Clause
+
 //! LZ4 frame format decoder (v1.5).
 //!
 //! Apple's decmpfs uses `CMP_TYPE_LZ4` (7) for LZ4 compression. The on-disk

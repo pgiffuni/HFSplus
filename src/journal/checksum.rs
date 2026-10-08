@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: APSL-1.2
+
 //! The HFS+ journal checksum.
 //!
 //! Mining reference: Apple `core/hfs_journal.c` `calc_checksum`, reproduced in
