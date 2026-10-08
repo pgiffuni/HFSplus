@@ -142,17 +142,42 @@ fn a_file_with_no_attributes_yields_none_rather_than_failing() {
 
 #[test]
 fn the_independent_checker_accepts_the_attributes_image() {
-    // The fixture is only useful if it is a real volume. `fsck_hfs` is pointed at
-    // a copy: it repairs as well as reports, and would rewrite the original.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
-        return;
-    };
+    // The fixture is only useful if it is a real volume.
     let path = common::image("journal-with-attributes");
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
+
+    // Prefer the in-tree hfsck (read-only, no copy needed).
+    if let Some(hfsck) = common::hfsck_available() {
+        let out = common::run_hfsck(&hfsck, &path).expect("spawn hfsck");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "the attributes image must be a sound volume:\n{text}"
+        );
+        // hfsck is read-only: verify the image is untouched.
+        let after = std::fs::read(&path).expect("read after hfsck");
+        assert_eq!(
+            digest(&std::fs::read(&path).expect("read the original")),
+            digest(&after),
+            "hfsck modified the image:\n{text}"
+        );
+        return;
+    }
+
+    // Fall back to the external checker on a copy.
+    // fsck_hfs is pointed at a copy: it repairs as well as reports, and would
+    // rewrite the original.
+    let Some(fsck) = common::fsck_available() else {
+        eprintln!("skipping: neither hfsck binary nor fsck.hfsplus installed");
+        return;
+    };
     let mut probe = std::env::temp_dir();
     probe.push(format!("hfsplus-attrs-{}.img", std::process::id()));
     std::fs::copy(&path, &probe).expect("copy for fsck");

@@ -345,15 +345,39 @@ fn the_independent_checker_accepts_the_bootstrapped_volume() {
     // Run on a copy. It repairs as well as reports, and "the volume appears to be
     // OK" is only evidence if nothing was repaired on the way there -- so the
     // probe is compared byte for byte afterwards.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
-        return;
-    };
     let path = common::image(IMAGE);
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
+
+    // Prefer the in-tree hfsck (read-only, no copy needed).
+    if let Some(hfsck) = common::hfsck_available() {
+        let out = common::run_hfsck(&hfsck, &path).expect("spawn hfsck");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "the bootstrapped volume must be sound:\n{text}"
+        );
+        // hfsck is read-only: verify the image is untouched.
+        let after = std::fs::read(&path).expect("read after hfsck");
+        assert_eq!(
+            digest(&std::fs::read(&path).expect("read the original")),
+            digest(&after),
+            "hfsck modified the image:\n{text}"
+        );
+        return;
+    }
+
+    // Fall back to the external checker on a copy.
+    let Some(fsck) = common::fsck_available() else {
+        eprintln!("skipping: neither hfsck binary nor fsck.hfsplus installed");
+        return;
+    };
     let mut probe = std::env::temp_dir();
     probe.push(format!("bootstrap-{}.img", std::process::id()));
     std::fs::copy(&path, &probe).expect("copy for fsck");
