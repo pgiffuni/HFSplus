@@ -24,9 +24,9 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF NOT ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Mining reference: Apple `lzfse` library (0x09/lzfse),
-// `src/lzfse_decode_base.c`, `src/lzfse_fse.c`, `src/lzfse_fse.h`,
-// `src/lzfse_internal.h`, BSD-3-Clause.
+// Mining reference: Apple `lzfse` library, https://github.com/lzfse/lzfse
+// (mirror: 0x09/hfsfuse `src/lzfse_decode_base.c`, `src/lzfse_fse.c`,
+// `src/lzfse_fse.h`, `src/lzfse_internal.h`, BSD-3-Clause).
 // Translated to Rust with bounds-checking and no `unsafe`.
 
 //! LZFSE (LZ-FSE) decoder for decmpfs compression type 3.
@@ -518,6 +518,16 @@ fn decode_freq_stream(data: &[u8]) -> Result<(Vec<u16>, usize)> {
         accum_nbits -= nbits;
 
         *slot = decoded;
+    }
+
+    // Validate that all freq data was consumed cleanly: the accumulator must
+    // have fewer than 8 remaining bits, and we must have consumed all bytes.
+    // This mirrors the reference check `if (accum_nbits >= 8 || src != src_end)`.
+    if accum_nbits >= 8 || pos != data.len() {
+        return Err(Error::invalid(
+            "lzfse freq stream",
+            "frequency table data does not end cleanly",
+        ));
     }
 
     Ok((freq, pos))

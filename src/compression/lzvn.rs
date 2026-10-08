@@ -23,8 +23,9 @@
 // OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF NOT ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 //
-// Mining reference: Apple `lzfse` library (0x09/lzfse),
-// `src/lzvn_decode_base.c`, `src/lzvn_decode_base.h`, BSD-3-Clause.
+// Mining reference: Apple `lzfse` library, https://github.com/lzfse/lzfse
+// (mirror: 0x09/hfsfuse `src/lzvn_decode_base.c`, `src/lzvn_decode_base.h`,
+// BSD-3-Clause).
 // Translated to Rust with bounds-checking and no `unsafe`.
 
 //! LZVN bitstream decoder for decmpfs compression type 4.
