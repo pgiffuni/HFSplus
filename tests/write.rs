@@ -2672,3 +2672,63 @@ fn a_setxattr_replacing_an_existing_attribute_updates_in_place() {
     );
     assert_fsck_clean(&path, "setxattr replacing existing attribute");
 }
+
+#[test]
+fn removing_the_last_attribute_clears_the_has_attributes_flag() {
+    // When the last attribute for a CNID is removed, kHFSHasAttributesMask
+    // must be cleared on the catalog record. A file that declares attributes
+    // but has none in the tree fails fsck.hfsplus's count comparison.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    // CNID 18 has two attributes: "com.apple.test.forked" and
+    // "com.apple.test.inline". Remove both.
+    let names = ["com.apple.test.forked", "com.apple.test.inline"];
+
+    // Verify the flag is set before removal.
+    {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = lookup_obj(&vol, ATTR_OWNER);
+        let has_attrs = match &obj {
+            Object::File(f) => f.has_attributes,
+            _ => panic!("CNID {ATTR_OWNER} should be a file"),
+        };
+        assert!(
+            has_attrs,
+            "CNID {ATTR_OWNER} must have has_attributes flag set before removal"
+        );
+    }
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        for name in &names {
+            writable
+                .removexattr(ATTR_OWNER, name)
+                .unwrap_or_else(|e| panic!("removing {name}: {e}"));
+        }
+        dev.sync().expect("flush");
+    }
+
+    // After removing both, the flag should be cleared and fsck should accept it.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = lookup_obj(&vol, ATTR_OWNER);
+    let has_attrs = match &obj {
+        Object::File(f) => f.has_attributes,
+        _ => panic!("CNID {ATTR_OWNER} should be a file"),
+    };
+    assert!(
+        !has_attrs,
+        "CNID {ATTR_OWNER} must have has_attributes flag cleared after last removal"
+    );
+    let remaining = attr_names(&vol, ATTR_OWNER);
+    assert!(
+        remaining.is_empty(),
+        "no attributes should remain, got {remaining:?}"
+    );
+    assert_fsck_clean(&path, "removing the last attribute clears the flag");
+}
