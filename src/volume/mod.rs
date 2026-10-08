@@ -837,6 +837,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 /// | Method | Home blocks | Bitmap | Volume hdr | Transaction |
 /// |---|---|---|---|---|
 /// | `write_file_contents` | catalog fork record, data fork blocks | no | no | open → commit/abort |
+/// | `write_resource_fork` | catalog fork record, resource fork blocks | freed blocks on replace | `freeBlocks` | open → commit/abort |
+/// | `setxattr` | attributes B-tree leaf | no | no | open → commit/abort |
+/// | `removexattr` | attributes B-tree leaf, allocation bitmap (orphaned fork blocks on empty tree) | orphaned blocks | `freeBlocks` | open → commit/abort |
 /// | `create_file` | catalog leaf (file record + thread), parent folder record, volume header (next CNID) | no | `nextCatalogID` | open → commit/abort |
 /// | `create_folder` | catalog leaf (folder record + thread), parent folder record, volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open → commit/abort |
 /// | `remove` | catalog leaf (deletion), parent folder record (valence), allocation bitmap (freed blocks) | freed blocks | `freeBlocks` | open → commit/abort |
@@ -1247,6 +1250,128 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         record.content_mod_date = now;
         record.attribute_mod_date = now;
         self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Replace the resource fork of the file at `cnid` with `data`.
+    ///
+    /// Replaces the entire contents of the resource fork, growing or shrinking
+    /// it as needed. The fork's allocation blocks are released before reuse,
+    /// so the record's extent descriptors always describe the new data. The data
+    /// blocks are written before the catalog record, so a crash leaves either
+    /// the old content visible or the new, never a torn fork.
+    ///
+    /// Mining reference: Apple `core/hfs_file.c` `hfs_vnop_write` path,
+    /// extended for the resource fork rather than the data fork.
+    pub fn write_resource_fork(&mut self, cnid: u32, data: &[u8]) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.write_resource_fork_inner(cnid, data);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn write_resource_fork_inner(&mut self, cnid: u32, data: &[u8]) -> Result<()> {
+        let block_size = self.header.block_size;
+        let expanded = self.header.has_expanded_times();
+
+        let mut record = self.read_file_record(cnid)?;
+
+        // Release every block currently owned by the resource fork, so the
+        // extent descriptors start empty and growth allocates fresh.
+        self.release_resource_fork_blocks(&mut record)?;
+
+        // Allocate enough blocks for the new data, rounding up to whole blocks.
+        let needed = (data.len() + block_size as usize - 1) / block_size as usize;
+        if needed > 0 {
+            self.grow_resource_fork(&mut record, needed)?;
+        }
+
+        // Build the list of device block numbers for the resource fork, in
+        // logical order. Only inline extents are used (no overflow support),
+        // and the total block count cannot exceed the inline extent slots.
+        let blocks: Vec<u32> = record
+            .resource_fork
+            .extents
+            .iter()
+            .flat_map(|e| (0..e.block_count).map(move |o| e.start_block + o))
+            .collect();
+
+        if blocks.len() < needed {
+            return Err(Error::invalid(
+                "write_resource_fork",
+                format!(
+                    "the resource fork has {} block(s) but {} are needed; \
+                     the inline extent limit has been exceeded",
+                    blocks.len(),
+                    needed
+                ),
+            ));
+        }
+
+        // Write the data blocks first: until the record says so, a reader
+        // sees the old fork length, so the blocks must be in place before
+        // the record is.
+        for (i, block) in blocks.iter().enumerate() {
+            let start = i * block_size as usize;
+            let end = (start + block_size as usize).min(data.len());
+            if end <= start {
+                break;
+            }
+            let at = u64::from(*block) * u64::from(block_size);
+            self.journal_write(at, &data[start..end])?;
+        }
+
+        // Then the record: logicalSize and the timestamps a content change
+        // touches. One clock read for both, so the record does not disagree
+        // with itself across a second boundary.
+        record.resource_fork.logical_size = data.len() as u64;
+        let now = crate::timestamp::now_hfs(expanded).map_err(|e| Error::Io {
+            message: e.to_string(),
+        })?;
+        record.content_mod_date = now;
+        record.attribute_mod_date = now;
+        self.touch_record(&mut record)?;
+        self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Release every allocation block owned by the file at `cnid`'s resource
+    /// fork, then zero the fork's descriptors.
+    fn release_resource_fork_blocks(
+        &mut self,
+        record: &mut crate::catalog::record::FileRecord,
+    ) -> Result<()> {
+        let mut ranges: Vec<(u32, u32)> = Vec::new();
+        for ext in record.resource_fork.extents.iter() {
+            if ext.block_count == 0 {
+                break;
+            }
+            ranges.push((ext.start_block, ext.block_count));
+        }
+
+        if ranges.is_empty() {
+            return Ok(());
+        }
+
+        let mut map = self.load_allocation_map()?;
+        let mut freed = 0u32;
+        for (start, count) in ranges {
+            map.release(start, count)?;
+            freed += count;
+        }
+
+        // Zero the resource fork extents and counts.
+        record.resource_fork.extents = crate::format::extents::ExtentRecord::EMPTY;
+        record.resource_fork.total_blocks = 0;
+        record.resource_fork.logical_size = 0;
+
+        let free_blocks = self.header.free_blocks.checked_add(freed).ok_or_else(|| {
+            Error::overflow("volume_header.freeBlocks when releasing resource fork")
+        })?;
+        self.write_allocation_bitmap(&map, free_blocks)?;
+        Ok(())
     }
 
     /// Create an empty file called `name` inside folder `parent`, and return its CNID.
@@ -4716,17 +4841,34 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// writer could hand the same blocks to a second file. Leaking space is
     /// recoverable; two files sharing blocks is not.
     fn grow_fork(&mut self, record: &mut FileRecord, extra: usize) -> Result<()> {
+        self.grow_fork_of(&mut record.data_fork, extra, "data fork")
+    }
+
+    fn grow_resource_fork(&mut self, record: &mut FileRecord, extra: usize) -> Result<()> {
+        self.grow_fork_of(&mut record.resource_fork, extra, "resource fork")
+    }
+
+    /// Reserve `extra` allocation blocks on `fork` (a mutable view into either
+    /// the data or resource fork of `record`), extending the last extent in
+    /// place. The bitmap is written before the data blocks, so a crash leaves
+    /// either no new blocks or committed blocks with no stale references.
+    fn grow_fork_of(
+        &mut self,
+        fork: &mut crate::format::fork::ForkData,
+        extra: usize,
+        label: &str,
+    ) -> Result<()> {
         use crate::alloc::AllocationMap;
         use crate::format::extents::ExtentDescriptor;
 
-        if record.data_fork.extents.next_free().is_none() {
+        if fork.extents.next_free().is_none() {
             return Err(Error::invalid(
                 "write",
                 format!(
-                    "the file's data fork already uses all {} inline extents; a \
+                    "the file's {label} already uses all {} inline extents; a \
                      ninth extent has to go in the extents B-tree, which is not \
                      implemented",
-                    record.data_fork.extents.raw.len()
+                    fork.extents.raw.len()
                 ),
             ));
         }
@@ -4735,10 +4877,10 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // full allocation block on every volume, not merely the bytes the bitmap
         // needs. Same as the checker reads it, so the two cannot disagree about
         // which bits are set.
-        let fork = &self.header.allocation_file;
-        let limit = usize::try_from(fork.logical_size).unwrap_or(1 << 20);
+        let fork_data = &self.header.allocation_file;
+        let limit = usize::try_from(fork_data.logical_size).unwrap_or(1 << 20);
         let bytes = {
-            let reader = ForkReader::new(&*self.device, fork, self.header.block_size);
+            let reader = ForkReader::new(&*self.device, fork_data, self.header.block_size);
             reader.read(0, limit)?
         };
         let mut map = AllocationMap::from_bytes(&bytes, self.header.total_blocks)?
@@ -4766,27 +4908,25 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         // reason a growing file gets one extent instead of eight: the allocator is
         // told where the file already is, so first fit finds the block just after
         // it rather than the first gap anywhere on the volume.
-        let hint = record
-            .data_fork
+        let hint = fork
             .extents
             .iter()
             .last()
             .map_or(1, |e| e.end_block().map_or(1, |end| end as u32 + 1));
         let start = map.reserve(hint, extra as u32)?;
 
-        let slot = record
-            .data_fork
+        let slot = fork
             .extents
             .next_free()
             .expect("checked above that a slot is free");
-        record.data_fork.extents.set(
+        fork.extents.set(
             slot,
             ExtentDescriptor {
                 start_block: start,
                 block_count: extra as u32,
             },
         )?;
-        record.data_fork.total_blocks += extra as u32;
+        fork.total_blocks += extra as u32;
 
         // The bitmap goes to disk before the data blocks and before the record.
         // See the method doc for why that order and not the other.
