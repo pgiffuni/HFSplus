@@ -2732,3 +2732,153 @@ fn removing_the_last_attribute_clears_the_has_attributes_flag() {
     );
     assert_fsck_clean(&path, "removing the last attribute clears the flag");
 }
+
+#[test]
+fn writing_a_resource_fork_is_round_trip_safe() {
+    // A resource fork write must allocate blocks, update the fork record,
+    // and leave a volume that fsck.hfsplus accepts. The resource fork is a
+    // real HFS+ fork, stored as a ForkData in the catalog file record --
+    // the same structure as the data fork, just a different field.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    // CNID 18 (ATTR_OWNER) is a file with a data fork but no resource fork.
+    let test_data = b"resource fork test data".to_vec();
+
+    // Verify the resource fork is initially empty.
+    {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = lookup_obj(&vol, ATTR_OWNER);
+        let f = obj.as_file().expect("CNID {ATTR_OWNER} should be a file");
+        assert_eq!(
+            f.record.resource_fork.logical_size, 0,
+            "the resource fork should be empty before the write"
+        );
+    }
+
+    // Write the resource fork on the journaled volume.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_resource_fork(ATTR_OWNER, &test_data)
+            .expect("write_resource_fork should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Read it back through a fresh volume.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = lookup_obj(&vol, ATTR_OWNER);
+    let f = obj.as_file().expect("CNID {ATTR_OWNER} should be a file");
+    assert_eq!(
+        f.record.resource_fork.logical_size,
+        test_data.len() as u64,
+        "the resource fork length must match the data written"
+    );
+    assert_eq!(
+        f.record.resource_fork.total_blocks, 1,
+        "the resource fork must have allocated one block"
+    );
+    let back = vol
+        .read_resource(&obj, 0, test_data.len())
+        .expect("read resource fork");
+    assert_eq!(back, test_data, "the resource fork bytes must round-trip");
+    assert_fsck_clean(&path, "writing a resource fork");
+}
+
+#[test]
+fn writing_a_resource_fork_is_durable_after_reopen() {
+    // The data survives a close/reopen cycle on a journaled volume.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let test_data = b"durable resource fork data".to_vec();
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_resource_fork(ATTR_OWNER, &test_data)
+            .expect("write should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after reopen");
+    let obj = lookup_obj(&vol, ATTR_OWNER);
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        f.record.resource_fork.logical_size,
+        test_data.len() as u64,
+        "the resource fork must survive a reopen"
+    );
+    let back = vol
+        .read_resource(&obj, 0, test_data.len())
+        .expect("read resource fork");
+    assert_eq!(
+        back, test_data,
+        "the resource fork bytes must survive a reopen"
+    );
+    assert_fsck_clean(&path, "durability of resource fork write");
+}
+
+#[test]
+fn a_journaled_resource_fork_write_advances_the_journal_sequence() {
+    // A resource fork write must be captured in a journal transaction.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let (seq_before, end_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let journal = vol.journal().expect("read journal");
+        match journal {
+            Some(j) => match j.header() {
+                Some(h) => (h.sequence_num, h.end),
+                None => (0, 0),
+            },
+            None => (0, 0),
+        }
+    };
+
+    let test_data = b"journaled resource fork data".to_vec();
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_resource_fork(ATTR_OWNER, &test_data)
+            .expect("write should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let journal = vol.journal().expect("read journal after write");
+    let Some(journal) = journal else {
+        panic!("a journaled volume must still have a journal after a write");
+    };
+    let header = journal
+        .header()
+        .expect("journal should have a header after a write");
+    assert!(
+        header.sequence_num > seq_before || header.end != end_before,
+        "the journal header must advance after a committed resource fork write: \
+         before seq={} end={} vs after seq={} end={}",
+        seq_before,
+        end_before,
+        header.sequence_num,
+        header.end
+    );
+    assert_fsck_clean(
+        &path,
+        "journaled resource fork write advances journal sequence",
+    );
+}
