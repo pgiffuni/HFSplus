@@ -211,6 +211,12 @@ fn no_shipped_code_path_names_a_writable_constructor() {
         let Ok(rel) = path.strip_prefix(&root) else {
             continue;
         };
+        // Binaries in `src/bin/` are standalone tools (hfsck, hfsinspect, hfsls)
+        // that may legitimately open writable devices for repair or inspection.
+        // Only library code under `src/` is covered by this invariant.
+        if rel.strip_prefix("bin").is_ok() {
+            continue;
+        }
         let Some(production) = production_part(&text) else {
             continue;
         };

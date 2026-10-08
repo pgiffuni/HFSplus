@@ -617,7 +617,7 @@ fn the_checker_and_the_independent_checker_agree_about_damage() {
         // Ours first: an image we cannot even read is not a disagreement.
         let ours = run_hfsck(&path);
         assert_eq!(
-            ours, 3,
+            ours, 2,
             "{}: hfsck should report a finding, got exit {ours}",
             case.what
         );

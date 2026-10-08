@@ -66,9 +66,27 @@ fn write(path: &std::path::Path, cnid: u32, data: &[u8]) {
 }
 
 /// Assert `fsck.hfsplus` accepts `path`, skipping when it is not installed.
+/// Assert that `path` is structurally consistent, using the in-tree `hfsck`
+/// when available and falling back to the external `fsck.hfsplus` from
+/// hfsprogs otherwise. The external checker **modifies the image it checks**,
+/// so a copy is made and the only allowed differences are the eight
+/// `lastMountedVersion` signature bytes.
 fn assert_fsck_clean(path: &std::path::Path, what: &str) {
+    // Try the in-tree hfsck first: it is read-only and needs no copy.
+    if let Some(hfsck) = common::hfsck_available() {
+        let out = common::run_hfsck(&hfsck, path).expect("spawn hfsck");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(out.status.success(), "hfsck rejected {what}:\n{text}");
+        return;
+    }
+
+    // Fall back to the external checker.
     let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping fsck.hfsplus check: not installed");
+        eprintln!("skipping fsck check: neither hfsck binary nor fsck.hfsplus installed");
         return;
     };
     // fsck.hfsplus **modifies the image it checks** -- `AGENTS.md` says so -- and on

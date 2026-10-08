@@ -84,6 +84,20 @@ pub fn fsck_available() -> Option<String> {
     None
 }
 
+/// Whether the in-tree `hfsck` binary is available (always present in debug
+/// builds, since it is compiled from this crate).
+pub fn hfsck_available() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let root = exe.parent()?;
+    let candidates = [root.join("hfsck"), root.join("..").join("hfsck")];
+    candidates.into_iter().find(|c| c.exists())
+}
+
+/// Run `hfsck` on an image and return whether it was clean.
+pub fn run_hfsck(hfsck: &Path, image: &Path) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(hfsck).arg(image).output()
+}
+
 /// Run `fsck.hfsplus` on an image and return its combined output.
 pub fn run_fsck(fsck: &str, image: &Path) -> std::process::Output {
     std::process::Command::new(fsck)
