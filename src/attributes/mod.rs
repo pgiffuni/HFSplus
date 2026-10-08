@@ -413,7 +413,7 @@ fn collect_extents(fork: &ForkData, continuation: &[ExtentRecord]) -> Vec<Extent
 /// attribute key with the catalog's layout. The two trees share B-tree machinery
 /// and nothing else, and routing one through the other's parser is precisely the
 /// conflation this module exists to prevent.
-fn split_attr_record(record: &[u8]) -> Option<(&[u8], &[u8])> {
+pub fn split_attr_record(record: &[u8]) -> Option<(&[u8], &[u8])> {
     if record.len() < 2 {
         return None;
     }

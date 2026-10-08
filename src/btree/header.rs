@@ -390,6 +390,44 @@ pub fn set_map_bit(node: &mut [u8], index: usize, node_number: u32) -> Result<()
     Ok(())
 }
 
+/// Clear the bit for `node_number` in the node map of `header_node`, marking
+/// that node as available for reuse.
+///
+/// This is the inverse of `allocate_node`'s bit-setting inside `GetMapNode`:
+/// a bit is 1 when in use, 0 when free. When a B-tree shrinks to the point
+/// where a leaf node is emptied, the checker expects that node to be returned
+/// to the free list and `freeNodes` to be incremented, otherwise the header
+/// and the map disagree and `fsck.hfsplus` reports "Invalid node structure".
+pub fn free_node(header_node: &mut [u8], free_nodes: &mut u32, node_number: u32) -> Result<()> {
+    let records = super::node::num_records(header_node)? as usize;
+
+    let mut base = 0u32;
+    for index in 2..records {
+        let at = super::node::read_offset(header_node, index)?;
+        let end = super::node::read_offset(header_node, index + 1)?;
+        let Some(map) = header_node.get_mut(at..end) else {
+            continue;
+        };
+        let bits = (map.len() as u32) * 8;
+        if node_number < base + bits {
+            let relative = node_number - base;
+            let byte_idx = relative as usize / 8;
+            let bit_idx = relative as usize % 8;
+            if let Some(b) = map.get_mut(byte_idx) {
+                *b &= !(0x80 >> bit_idx);
+            }
+            *free_nodes = free_nodes.saturating_add(1);
+            return Ok(());
+        }
+        base += bits;
+    }
+
+    Err(Error::invalid(
+        "node map",
+        format!("node {node_number} is not described by any map record in the header node"),
+    ))
+}
+
 /// Byte offset of `treeDepth` within the header record. A `u16`.
 pub const TREE_DEPTH_OFFSET: u64 = 0;
 

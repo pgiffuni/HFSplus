@@ -4492,46 +4492,156 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             return Err(Error::invalid("attributes", "expected a leaf node"));
         }
 
-        let mut found: Option<usize> = None;
+        let mut found: Vec<usize> = Vec::new();
+        let mut freed_ranges: Vec<(u32, u32)> = Vec::new();
         for index in 0..node.num_records() {
             let rec = node.record(index)?;
             let Some(existing_key) = attr_key_from_record(rec, max_key_length) else {
                 continue;
             };
-            match AttrKey::compare(&existing_key, &target) {
-                std::cmp::Ordering::Less => continue,
-                std::cmp::Ordering::Equal => {
-                    found = Some(index as usize);
-                    break;
+            // Match on file_id and name only; start_block distinguishes
+            // continuation records for forked attributes.
+            if existing_key.file_id == cnid && existing_key.name == target.name {
+                found.push(index as usize);
+                // Collect extent descriptors from Fork and Extents records so
+                // the allocation blocks they point at can be freed in the bitmap.
+                if let Some((_key, body)) = crate::attributes::split_attr_record(rec) {
+                    if let Ok(attr_rec) = crate::attributes::record::AttrRecord::from_record(body) {
+                        match attr_rec {
+                            crate::attributes::record::AttrRecord::Fork { fork } => {
+                                for ext in fork.extents.iter() {
+                                    freed_ranges.push((ext.start_block, ext.block_count));
+                                }
+                            }
+                            crate::attributes::record::AttrRecord::Extents { extents } => {
+                                for ext in extents.iter() {
+                                    freed_ranges.push((ext.start_block, ext.block_count));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
-                std::cmp::Ordering::Greater => break,
+            } else if AttrKey::compare(&existing_key, &target) == std::cmp::Ordering::Greater {
+                break;
             }
         }
 
-        let Some(index) = found else {
+        if found.is_empty() {
             return Err(Error::NotFound {
                 what: "extended attribute",
             });
-        };
+        }
 
         let mut buf = bytes.clone();
-        crate::btree::node::remove_record(&mut buf, index)?;
+        // Remove from the highest index first so lower indices stay valid.
+        for &idx in found.iter().rev() {
+            crate::btree::node::remove_record(&mut buf, idx)?;
+        }
+        let removed_count = found.len();
         let at = bt.node_offset(node_num)?;
         let header_at = bt.node_offset(0)?;
+        let node_size = btree_header.node_size as usize;
         drop(bt);
-
-        self.journal_write(at, &buf)?;
 
         let new_count = btree_header
             .leaf_records
-            .checked_sub(1)
+            .checked_sub(removed_count as u32)
             .ok_or(Error::invalid("attributes", "leaf record count underflow"))?;
-        self.journal_write(
-            header_at
-                + crate::btree::header::HEADER_RECORD_OFFSET as u64
-                + crate::btree::header::LEAF_RECORDS_OFFSET,
-            &new_count.to_be_bytes(),
-        )?;
+
+        if new_count == 0 {
+            // The tree is now empty. fsck.hfsplus validates that an empty
+            // B-tree has treeDepth=0, rootNode=0, firstLeafNode=0,
+            // lastLeafNode=0, and that the leaf node is returned to the free
+            // list (freeNodes incremented, node-map bit cleared, node erased).
+            let mut header_node = self.device.read_vec(header_at, node_size)?;
+            let hdr = crate::btree::header::HEADER_RECORD_OFFSET;
+            let mut free_nodes = btree_header.free_nodes;
+
+            // Erase the leaf node (zero it) so the checker sees a clean free node.
+            self.journal_write(at, &vec![0u8; node_size])?;
+
+            // Reset the header record fields that describe a non-empty tree.
+            // treeDepth (u16) at offset 0
+            let tree_depth = header_node.get_mut(hdr..hdr + 2).ok_or(Error::invalid(
+                "attributes",
+                "header node too short for treeDepth",
+            ))?;
+            tree_depth.copy_from_slice(&0u16.to_be_bytes());
+            // rootNode (u32) at offset 2
+            let root_node = header_node.get_mut(hdr + 2..hdr + 6).ok_or(Error::invalid(
+                "attributes",
+                "header node too short for rootNode",
+            ))?;
+            root_node.copy_from_slice(&0u32.to_be_bytes());
+            // firstLeafNode (u32) at offset 10
+            let first_leaf = header_node
+                .get_mut(hdr + 10..hdr + 14)
+                .ok_or(Error::invalid(
+                    "attributes",
+                    "header node too short for firstLeafNode",
+                ))?;
+            first_leaf.copy_from_slice(&0u32.to_be_bytes());
+            // lastLeafNode (u32) at offset 14
+            let last_leaf = header_node
+                .get_mut(hdr + 14..hdr + 18)
+                .ok_or(Error::invalid(
+                    "attributes",
+                    "header node too short for lastLeafNode",
+                ))?;
+            last_leaf.copy_from_slice(&0u32.to_be_bytes());
+
+            // Clear the leaf node's bit in the node map and bump freeNodes.
+            crate::btree::header::free_node(
+                &mut header_node,
+                &mut free_nodes,
+                btree_header.root_node,
+            )?;
+
+            // Write freeNodes (u32 at header offset 26) into the header node.
+            let free_off = hdr + crate::btree::header::FREE_NODES_OFFSET as usize;
+            let free_nodes_field =
+                header_node
+                    .get_mut(free_off..free_off + 4)
+                    .ok_or(Error::invalid(
+                        "attributes",
+                        "header node too short for freeNodes",
+                    ))?;
+            free_nodes_field.copy_from_slice(&free_nodes.to_be_bytes());
+
+            // Write the modified header node back in one journal transaction.
+            self.journal_write(header_at, &header_node)?;
+        } else {
+            // Still has records. Update leaf_records count and write the
+            // updated leaf node.
+            self.journal_write(at, &buf)?;
+            self.journal_write(
+                header_at
+                    + crate::btree::header::HEADER_RECORD_OFFSET as u64
+                    + crate::btree::header::LEAF_RECORDS_OFFSET,
+                &new_count.to_be_bytes(),
+            )?;
+        }
+
+        // Free any allocation blocks owned by the removed attribute records.
+        // A forked attribute carries its value in data fork blocks described by
+        // extent records in the attributes B-tree; removing the records must
+        // also release those blocks in the allocation bitmap.
+        if !freed_ranges.is_empty() {
+            let mut map = self.load_allocation_map()?;
+            for (start, count) in &freed_ranges {
+                map.release(*start, *count)?;
+            }
+            let freed_total = freed_ranges.iter().map(|(_, c)| c).sum::<u32>();
+            let free_blocks = self
+                .header
+                .free_blocks
+                .checked_add(freed_total)
+                .ok_or_else(|| {
+                    Error::overflow("volume_header.freeBlocks when freeing attribute blocks")
+                })?;
+            self.write_allocation_bitmap(&map, free_blocks)?;
+        }
 
         // Clear kHFSHasAttributesMask on the catalog record if this was the
         // last attribute, so the catalog claim matches the tree's contents.
