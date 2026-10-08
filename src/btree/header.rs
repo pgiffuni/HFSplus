@@ -184,6 +184,29 @@ impl BTreeHeader {
         })?)
     }
 
+    /// Encode this header record into a 106-byte array.
+    ///
+    /// The inverse of [`BTreeHeader::parse`]. Writes into a fixed array so a
+    /// header record can be serialized without allocation.
+    pub fn to_bytes(&self) -> [u8; HEADER_RECORD_SIZE] {
+        let mut out = [0u8; HEADER_RECORD_SIZE];
+        out[0..2].copy_from_slice(&self.tree_depth.to_be_bytes());
+        out[2..6].copy_from_slice(&self.root_node.to_be_bytes());
+        out[6..10].copy_from_slice(&self.leaf_records.to_be_bytes());
+        out[10..14].copy_from_slice(&self.first_leaf_node.to_be_bytes());
+        out[14..18].copy_from_slice(&self.last_leaf_node.to_be_bytes());
+        out[18..20].copy_from_slice(&self.node_size.to_be_bytes());
+        out[20..22].copy_from_slice(&self.max_key_length.to_be_bytes());
+        out[22..26].copy_from_slice(&self.total_nodes.to_be_bytes());
+        out[26..30].copy_from_slice(&self.free_nodes.to_be_bytes());
+        // reserved1 at 30..32 stays zero.
+        out[32..36].copy_from_slice(&self.clump_size.to_be_bytes());
+        out[36] = self.btree_type;
+        out[37] = self.key_compare_type.code();
+        out[38..42].copy_from_slice(&self.attributes.to_be_bytes());
+        out
+    }
+
     /// Bytes occupied by the whole tree, `totalNodes * nodeSize`.
     pub fn tree_bytes(&self) -> Option<u64> {
         u64::from(self.total_nodes).checked_mul(u64::from(self.node_size))

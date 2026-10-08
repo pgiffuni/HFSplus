@@ -23,7 +23,9 @@
 pub mod extents;
 pub mod fork;
 pub mod volume_header;
+pub mod writer;
 
 pub use extents::{ExtentDescriptor, ExtentRecord, INLINE_EXTENT_COUNT};
 pub use fork::{ForkData, ForkType};
 pub use volume_header::{FileSystemKind, VolumeAttributes, VolumeHeader};
+pub use writer::format_volume;

@@ -131,6 +131,9 @@ pub const K_HFS_VOLUME_INCONSISTENT_MASK: u32 = 0x0000_4000;
 /// `kHFSVolumeSoftwareLockBit` — bit 15: the volume is locked by software.
 pub const K_HFS_VOLUME_SOFTWARE_LOCK_MASK: u32 = 0x0000_8000;
 
+/// `kHFSVolumeNewFsBit` — bit 31: indicates a freshly formatted volume.
+pub const K_HFS_VOLUME_NEW_FS_MASK: u32 = 0x8000_0000;
+
 /// `kHFSExpandedTimesMask` — bit 29: timestamps are Unix seconds.
 ///
 /// Mining reference: `kHFSExpandedTimesMask = 0x20000000` in Apple
