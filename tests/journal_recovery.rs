@@ -246,17 +246,41 @@ fn the_on_disk_filesystem_is_accepted_by_the_independent_checker() {
     // that complained would be wrong about what it found. See docs/dev-tools.md
     // for what the hfsprogs port does and does not examine.
     //
-    // Run on a COPY. `fsck_hfs` repairs as well as reports, and pointing it at a
-    // fixture would rewrite it.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
-        return;
-    };
+    // Run on a COPY. `fsck.hfsplus` repairs as well as reports, and pointing it
+    // at a fixture would rewrite it. `hfsck` is read-only and can run directly.
     let path = image_path(TORN);
     if !path.exists() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
+
+    if let Some(hfsck) = common::hfsck_available() {
+        let out = common::run_hfsck(&hfsck, &path).expect("spawn hfsck");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            out.status.success(),
+            "the stale on-disk filesystem must still be sound by hfsck:\n{text}"
+        );
+        // hfsck is read-only: the image must be byte-identical.
+        let original = std::fs::read(&path).expect("read the original");
+        let after = std::fs::read(&path).expect("read after hfsck");
+        assert_eq!(
+            digest(&original),
+            digest(&after),
+            "hfsck modified the image:\n{text}"
+        );
+        return;
+    }
+
+    // Fall back to the external checker on a copy.
+    let Some(fsck) = common::fsck_available() else {
+        eprintln!("skipping: neither hfsck binary nor fsck.hfsplus installed");
+        return;
+    };
     let mut probe = std::env::temp_dir();
     probe.push(format!("hfsplus-torn-{}-{}.img", TORN, std::process::id()));
     std::fs::copy(&path, &probe).expect("copy for fsck");
