@@ -61,13 +61,13 @@ pub struct Volume<'a, D: ?Sized> {
     /// it, and on such a volume it may not even exist. Held here rather than
     /// built per read because a `ForkOverflow` borrows the tree it resolves
     /// against.
-    extents: std::cell::OnceCell<TreeOverflow<'a, D>>,
+    extents: std::sync::OnceLock<TreeOverflow<'a, D>>,
     /// The attributes B-tree, opened on first use.
     ///
     /// Opened lazily for the same reason as `extents`: a volume whose files
     /// have no extended attributes never touches it, and the tree may be empty
     /// on a formatted volume.
-    attributes: std::cell::OnceCell<AttributesFile<'a, D>>,
+    attributes: std::sync::OnceLock<AttributesFile<'a, D>>,
 }
 
 impl<'a, D: BlockDevice + ?Sized> std::fmt::Debug for Volume<'a, D> {
@@ -174,8 +174,8 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             header,
             catalog,
             kind,
-            extents: std::cell::OnceCell::new(),
-            attributes: std::cell::OnceCell::new(),
+            extents: std::sync::OnceLock::new(),
+            attributes: std::sync::OnceLock::new(),
         })
     }
 
@@ -377,7 +377,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// For a compressed file (one carrying the `com.apple.decmpfs` attribute),
     /// the data fork does not hold the file's logical contents — it holds
     /// decmpfs data. This method detects that case and decompresses instead.
-    pub fn read(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>>
+    where
+        D: Sync,
+    {
         let f = file.as_file()?;
 
         if let Some(decompressed) = self.try_decompress(file)? {
@@ -394,7 +397,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     ///
     /// For a compressed file, this returns the decompressed contents rather
     /// than the raw decmpfs data.
-    pub fn read_file(&self, file: &Object, limit: usize) -> Result<Vec<u8>> {
+    pub fn read_file(&self, file: &Object, limit: usize) -> Result<Vec<u8>>
+    where
+        D: Sync,
+    {
         if let Some(decompressed) = self.try_decompress(file)? {
             if decompressed.len() > limit {
                 return Err(Error::out_of_range(
@@ -417,7 +423,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     ///
     /// Mining reference: Apple `core/hfs_readwrite.c` `hfs_read` checks
     /// `ap->a_is_compressed` and redirects the read to the decmpfs path.
-    fn try_decompress(&self, file: &Object) -> Result<Option<Vec<u8>>> {
+    fn try_decompress(&self, file: &Object) -> Result<Option<Vec<u8>>>
+    where
+        D: Sync,
+    {
         // The decmpfs attribute is present iff the file is compressed.
         // `getxattr` filters it from listxattr but we can read it directly.
         let Some(attr_value) = self.getxattr(file, crate::attributes::names::DECOMPRESSION_NAME)?
@@ -469,7 +478,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Returns `None` when no extent covers or follows the offset. This is a
     /// wrapper around [`ForkReader::seek_data`] that resolves the file's fork
     /// (including overflow extents) before delegating.
-    pub fn seek_data(&self, file: &Object, offset: u64) -> Result<Option<u64>> {
+    pub fn seek_data(&self, file: &Object, offset: u64) -> Result<Option<u64>>
+    where
+        D: Sync,
+    {
         let f = file.as_file()?;
         self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
             .seek_data(offset)
@@ -481,7 +493,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Returns `None` when the entire fork is allocated past the offset. This is
     /// a wrapper around [`ForkReader::seek_hole`] that resolves the file's fork
     /// before delegating.
-    pub fn seek_hole(&self, file: &Object, offset: u64) -> Result<Option<u64>> {
+    pub fn seek_hole(&self, file: &Object, offset: u64) -> Result<Option<u64>>
+    where
+        D: Sync,
+    {
         let f = file.as_file()?;
         self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
             .seek_hole(offset)
@@ -497,7 +512,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Mining reference: Apple `core/FileExtentMapping.c` `MapFileBlockC`
     /// performs this same fork-block to device-offset translation for the
     /// kernel's BMAP path.
-    pub fn bmap(&self, file: &Object, offset: u64) -> Result<u64> {
+    pub fn bmap(&self, file: &Object, offset: u64) -> Result<u64>
+    where
+        D: Sync,
+    {
         let f = file.as_file()?;
         self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
             .bmap(offset)
@@ -507,7 +525,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     ///
     /// A file with no resource fork reads empty rather than failing, because the
     /// absence of a fork is normal and not an error condition.
-    pub fn read_resource(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>> {
+    pub fn read_resource(&self, file: &Object, offset: u64, len: usize) -> Result<Vec<u8>>
+    where
+        D: Sync,
+    {
         let f = file.as_file()?;
         if f.record.resource_fork.logical_size == 0 {
             return Ok(Vec::new());
@@ -591,7 +612,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// Mining reference: HFS stores a symlink as a file whose data fork holds
     /// the target path. `core/hfs_vfsops.c` reads it there; there is no separate
     /// on-disk structure.
-    pub fn read_link(&self, file: &Object) -> Result<String> {
+    pub fn read_link(&self, file: &Object) -> Result<String>
+    where
+        D: Sync,
+    {
         let f = file.as_file()?;
         if !f.record.is_symlink() {
             return Err(Error::invalid("readlink", "not a symbolic link"));
@@ -726,7 +750,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     /// extents up in the extents B-tree by CNID. `core/hfs_vfsops.c` reads
     /// through that mapping, so a file that overflows is a normal file, not a
     /// special case.
-    fn fork_reader(&self, fork: &ForkData, fork_type: u8, file_id: u32) -> ForkReader<'_, D> {
+    fn fork_reader(&self, fork: &ForkData, fork_type: u8, file_id: u32) -> ForkReader<'_, D>
+    where
+        D: Sync,
+    {
         if !fork.needs_overflow() {
             return ForkReader::new(self.device, fork, self.header.block_size);
         }
@@ -751,7 +778,10 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         &self,
         fork_type: u8,
         file_id: u32,
-    ) -> Option<Box<dyn OverflowResolver + '_>> {
+    ) -> Option<Box<dyn OverflowResolver + Send + Sync + '_>>
+    where
+        D: Sync,
+    {
         let fork = &self.header.extents_file;
         if fork.logical_size == 0 {
             return None;
@@ -908,7 +938,7 @@ struct LeafInfo {
     has_room: bool,
 }
 
-impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
+impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
     /// Resolve all allocation blocks for a fork into a flat `Vec<u32>` of
     /// device block numbers, using inline extents first and the overflow
     /// B-tree for any groups beyond the inline density.

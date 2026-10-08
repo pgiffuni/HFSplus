@@ -57,7 +57,7 @@ pub struct ExtentMapper<'a> {
     /// Total allocation blocks claimed by the fork, inline and overflow together.
     total_blocks: u32,
     block_size: u32,
-    overflow: Option<Box<dyn OverflowResolver + 'a>>,
+    overflow: Option<Box<dyn OverflowResolver + Send + Sync + 'a>>,
 }
 
 impl std::fmt::Debug for ExtentMapper<'_> {
@@ -89,7 +89,7 @@ impl<'a> ExtentMapper<'a> {
     /// lookup for other forks depends on it. Note that the Extents B-tree's own
     /// fork is opened *without* a resolver: it is not allowed to overflow into
     /// itself.
-    pub fn with_overflow(mut self, resolver: Box<dyn OverflowResolver + 'a>) -> Self {
+    pub fn with_overflow(mut self, resolver: Box<dyn OverflowResolver + Send + Sync + 'a>) -> Self {
         self.overflow = Some(resolver);
         self
     }

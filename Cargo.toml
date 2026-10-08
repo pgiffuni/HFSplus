@@ -1,8 +1,18 @@
-[package]
-name = "hfsplus"
+[workspace]
+members = ["hfsplus-fuse"]
+resolver = "3"
+
+[workspace.package]
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.70"
+publish = false
+
+[package]
+name = "hfsplus"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 description = "Userspace HFS+/HFSX filesystem implementation in Rust, initially exposed through FUSE"
 license = "BSD-2-Clause AND APSL-1.2"
 publish = false

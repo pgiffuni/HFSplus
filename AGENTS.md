@@ -70,6 +70,8 @@ far, all recorded in `docs/hfs-format.md`:
 
 - `docs/hfs-format.md` — the on-disk format, and the disagreements between sources
 - `docs/source-map.md` — where each translated item came from, and what is not yet mined
+- `docs/fuse-source-map.md` — the FUSE adapter's translation boundaries
+- `docs/fuse.md` — FUSE adapter architecture, supported operations, and limitations
 - `docs/mutation-invariants.md` — the rules a mutation must preserve
 - `docs/dev-tools.md` — the tools, and what each can and cannot establish
 - `docs/roadmap-write-fsck.md` — superseded; kept for the record

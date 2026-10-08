@@ -70,7 +70,7 @@ impl<'a, D: BlockDevice + ?Sized> ForkReader<'a, D> {
         device: &'a D,
         fork: &ForkData,
         block_size: u32,
-        resolver: Box<dyn OverflowResolver + 'a>,
+        resolver: Box<dyn OverflowResolver + Send + Sync + 'a>,
     ) -> Self {
         ForkReader {
             mapper: ExtentMapper::new(fork, block_size).with_overflow(resolver),

@@ -1,0 +1,19 @@
+[package]
+name = "hfsplus-fuse"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "FUSE adapter for the hfsplus library"
+license = "BSD-2-Clause"
+publish = false
+
+[dependencies]
+hfsplus = { path = "..", version = "0.1" }
+
+# fuser is MIT licensed; it is the only third-party dependency in the adapter.
+fuser = "0.18"
+
+[features]
+default = []
+# Enables FreeBSD-specific mount paths.
+freebsd = []

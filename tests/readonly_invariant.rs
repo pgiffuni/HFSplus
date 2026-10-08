@@ -27,7 +27,7 @@
 
 mod common;
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use hfsplus::blockdev::BlockDevice;
 use hfsplus::format::volume_header::VolumeHeader;
@@ -42,19 +42,19 @@ use hfsplus::volume::Volume;
 #[derive(Debug)]
 struct CountingDevice<'a> {
     inner: &'a MemoryDevice,
-    writes: RefCell<Vec<(u64, usize)>>,
+    writes: Mutex<Vec<(u64, usize)>>,
 }
 
 impl<'a> CountingDevice<'a> {
     fn new(inner: &'a MemoryDevice) -> Self {
         CountingDevice {
             inner,
-            writes: RefCell::new(Vec::new()),
+            writes: Mutex::new(Vec::new()),
         }
     }
 
     fn writes(&self) -> usize {
-        self.writes.borrow().len()
+        self.writes.lock().unwrap().len()
     }
 }
 
@@ -77,7 +77,7 @@ impl hfsplus::blockdev::BlockDeviceMut for CountingDevice<'_> {
     fn sync(&mut self) -> hfsplus::error::Result<()> {
         // Recorded too: a flush is a write in everything but name, and one
         // sneaking onto the read path would be just as wrong.
-        self.writes.borrow_mut().push((u64::MAX, 0));
+        self.writes.lock().unwrap().push((u64::MAX, 0));
         Ok(())
     }
 
@@ -85,7 +85,7 @@ impl hfsplus::blockdev::BlockDeviceMut for CountingDevice<'_> {
         // The attempt is recorded and nothing is written: the inner device is
         // immutable, so a real write here would fail rather than corrupt a
         // fixture.
-        self.writes.borrow_mut().push((offset, buf.len()));
+        self.writes.lock().unwrap().push((offset, buf.len()));
         Err(hfsplus::error::Error::ReadOnly)
     }
 }
@@ -142,7 +142,7 @@ fn mounting_and_reading_a_volume_never_attempts_a_write() {
         0,
         "the read path attempted {} writes: {:?}",
         counting.writes(),
-        counting.writes.borrow()
+        counting.writes.lock().unwrap()
     );
 }
 
