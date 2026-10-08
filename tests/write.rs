@@ -2934,3 +2934,125 @@ fn writing_a_resource_fork_that_overflows_extents() {
     );
     assert_fsck_clean(&path, "writing a resource fork that overflows extents");
 }
+
+#[test]
+fn a_journaled_truncate_is_durable_after_reopen() {
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+
+    let old_size = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists");
+        let f = obj.as_file().expect("a file");
+        f.record.data_fork.logical_size
+    };
+
+    let new_len = 1024u64;
+    assert!(
+        new_len < old_size,
+        "truncate test requires shrinking the file from {old_size} to {new_len}"
+    );
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .truncate_file(cnid, new_len)
+            .expect("truncate should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after truncate");
+    let vol = Volume::open(&dev).expect("mount after truncate");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after truncate");
+    let f = obj.as_file().expect("should be a file");
+    assert_eq!(
+        f.record.data_fork.logical_size, new_len,
+        "truncate must reduce the file to {new_len} bytes"
+    );
+    assert_fsck_clean(&path, "journaled truncate after reopen");
+}
+
+#[test]
+fn writing_a_data_fork_that_overflows_extents() {
+    // A data fork that grows beyond eight inline extents must spill into
+    // the Extents B-tree. With a 4 KiB block size, writing 9+ blocks
+    // (36 KiB) forces a ninth extent descriptor into the overflow tree.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+
+    let block_size = 4096u64;
+    let block_count = 9;
+    let total_bytes = (block_count * block_size) as usize;
+    let test_data = vec![0xCDu8; total_bytes];
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_file_contents(cnid, &test_data)
+            .expect("write_file_contents should succeed with overflow");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after write");
+    let f = obj.as_file().expect("should be a file");
+    assert_eq!(
+        f.record.data_fork.logical_size,
+        test_data.len() as u64,
+        "the data fork length must match the data written"
+    );
+    assert_eq!(
+        f.record.data_fork.total_blocks,
+        u32::try_from(block_count).unwrap(),
+        "the data fork must have allocated {} blocks",
+        block_count
+    );
+
+    let back = vol.read_file(&obj, test_data.len()).expect("read file");
+    assert_eq!(
+        back, test_data,
+        "the data fork bytes must round-trip through the extents B-tree"
+    );
+    assert_fsck_clean(&path, "writing a data fork that overflows extents");
+}
