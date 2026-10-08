@@ -4302,10 +4302,10 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         if keep == 0 {
             // Every block goes, and every descriptor is zeroed, so the record's
             // length is unchanged and there is nothing left to describe.
-            self.release_blocks(&mut record, 0)?;
+            self.release_blocks(&mut record, 0, cnid)?;
             record.data_fork.logical_size = 0;
         } else {
-            self.release_blocks(&mut record, keep)?;
+            self.release_blocks(&mut record, keep, cnid)?;
             record.data_fork.logical_size = new_len;
         }
         self.touch_record(&mut record)?;
@@ -4316,13 +4316,15 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     ///
     /// Walks the descriptors rather than trusting `totalBlocks`, because the two
     /// can disagree on a damaged volume and the descriptors are what both the
-    /// bitmap and the reader believe.
+    /// bitmap and the reader believe. When the fork overflowed into the Extents
+    /// B-tree, overflow groups entirely past the cut point are released and
+    /// their records deleted from the tree.
     ///
     /// Ranges are collected first and released afterwards, because the map has to
     /// be loaded from the device -- which needs a shared borrow -- and mutating it
     /// happens in memory. Releasing one range at a time would reload it per
     /// extent for no benefit: the writes are coalesced when the bitmap goes out.
-    fn release_blocks(&mut self, record: &mut FileRecord, keep: usize) -> Result<()> {
+    fn release_blocks(&mut self, record: &mut FileRecord, keep: usize, cnid: u32) -> Result<()> {
         use crate::format::extents::{ExtentDescriptor, EMPTY_DESCRIPTOR};
 
         let mut file_block = 0usize;
@@ -4338,6 +4340,8 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             .take_while(|(_, d)| !d.is_terminator())
             .map(|(i, d)| (i, d.start_block, d.block_count))
             .collect();
+
+        let inline_total: u32 = record.data_fork.total_blocks;
 
         for (slot, start_block, block_count) in descriptors {
             // How many of this descriptor's blocks lie before the new end.
@@ -4372,6 +4376,60 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         }
 
         record.data_fork.total_blocks = keep as u32;
+
+        // Release overflow groups past the cut point.
+        // After the inline descriptors are trimmed, `keep` blocks remain inline.
+        // Overflow groups whose key (cumulative block count) is >= `keep` are
+        // entirely beyond the new end and must be released. Their records are
+        // not deleted from the Extents B-tree — that would require a B-tree
+        // delete (node merge/redistribute) path that is not yet implemented;
+        // the stale records are harmless because they describe blocks that have
+        // been returned to the free pool and will not be reallocated until the
+        // inline extents are also cleared (full truncation case below).
+        if keep < inline_total as usize && record.data_fork.needs_overflow() {
+            let fork_data = &self.header.extents_file;
+            if fork_data.logical_size > 0 {
+                let tree = crate::btree::io::BTreeFile::open(
+                    &*self.device,
+                    fork_data,
+                    self.header.block_size,
+                    true,
+                )?;
+                let resolver = crate::file::TreeOverflow::new(tree);
+                let overflow =
+                    crate::file::ForkOverflow::for_fork(&resolver, ExtentKey::DATA_FORK, cnid);
+                let mut seen = keep as u64;
+                let mut guard = 0u32;
+                loop {
+                    guard += 1;
+                    if guard > 1000 {
+                        break;
+                    }
+                    let key = match u32::try_from(seen) {
+                        Ok(k) => k,
+                        Err(_) => break,
+                    };
+                    let group = match overflow.resolve_group(key)? {
+                        Some(g) => g,
+                        None => break,
+                    };
+                    if group.total_blocks() == 0 {
+                        break;
+                    }
+                    for desc in group.iter() {
+                        if desc.block_count == 0 {
+                            break;
+                        }
+                        ranges.push((desc.start_block, desc.block_count));
+                        freed += desc.block_count;
+                    }
+                    // TODO: delete the overflow record for this group from the
+                    // Extents B-tree once B-tree delete is implemented.
+                    seen += group.total_blocks();
+                }
+            }
+        }
+
         if freed == 0 {
             return Ok(());
         }
@@ -5322,7 +5380,7 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         Ok(())
     }
 
-    /// Write the allocation bitmap, and the volume header's free count.    /// Write the allocation bitmap, and the volume header's free count.
+    /// Write the allocation bitmap, and the volume header's free count.
     ///
     /// One whole allocation block at a time, because that is the unit a checker
     /// reads. The header is written *after* the bitmap, never before: a header

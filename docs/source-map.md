@@ -462,7 +462,7 @@ compression metadata (7B.2) are done and appear above.
 | **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | Milestone 10 |
 | **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
 | **Unlinking** through a link | `cat_delete` refusing a record with siblings | Milestone 10 |
-| Extents overflow | `core/hfs_extents.c` `extents_search`; overflow records | Milestone 8D |
+| Extents overflow | `core/hfs_extents.c` `extents_search` for lookup, `hfs_ext_iter_next_group` for traversal; overflow records | Milestone 15 |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
 | Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | Milestone 10D |
