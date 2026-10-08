@@ -32,7 +32,7 @@ use crate::catalog::record::{
     BsdInfo, CatalogRecord, FileRecord, FolderRecord, S_IFDIR, S_IFLNK, S_IFREG,
 };
 use crate::error::{Error, Result};
-use crate::extent::OverflowResolver;
+use crate::extent::{ExtentMapper, OverflowResolver};
 use crate::file::{ForkOverflow, ForkReader, TreeOverflow};
 use crate::format::fork::ForkData;
 use crate::format::volume_header::{FileSystemKind, VolumeHeader};
@@ -894,7 +894,52 @@ impl<D: ?Sized> std::fmt::Debug for WritableVolume<'_, D> {
     }
 }
 
+/// Data collected from a leaf node during descent, used after the borrow
+/// on the B-tree is released.
+struct LeafInfo {
+    leaf_num: u32,
+    leaf_offset: u64,
+    leaf_bytes: Vec<u8>,
+    desc: crate::btree::node::NodeDescriptor,
+    insert_at: usize,
+    existing: Option<usize>,
+    has_room: bool,
+}
+
 impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
+    /// Resolve all allocation blocks for a fork into a flat `Vec<u32>` of
+    /// device block numbers, using inline extents first and the overflow
+    /// B-tree for any groups beyond the inline density.
+    fn fork_blocks(&self, fork: &ForkData, cnid: u32, fork_type: u8) -> Result<Vec<u32>> {
+        let block_size = self.header.block_size;
+        let total = fork.total_blocks as usize;
+
+        if !fork.needs_overflow() {
+            let mut blocks = Vec::with_capacity(total);
+            for desc in fork.extents.iter() {
+                if desc.block_count == 0 {
+                    break;
+                }
+                for offset in 0..desc.block_count {
+                    blocks.push(desc.start_block + offset);
+                }
+            }
+            return Ok(blocks);
+        }
+
+        let fork_data = &self.header.extents_file;
+        let tree = crate::btree::io::BTreeFile::open(&*self.device, fork_data, block_size, true)?;
+        let resolver = crate::file::TreeOverflow::new(tree);
+        let overflow = crate::file::ForkOverflow::for_fork(&resolver, fork_type, cnid);
+        let mapper = ExtentMapper::new(fork, block_size).with_overflow(Box::new(overflow));
+
+        let mut blocks = Vec::with_capacity(total);
+        for fork_block in 0..fork.total_blocks {
+            blocks.push(mapper.map_block(fork_block)?);
+        }
+        Ok(blocks)
+    }
+
     /// Validate `device` for mutation and take it.
     ///
     /// `BlockDeviceMut` rather than `BlockDevice`, because opening for mutation
@@ -1199,33 +1244,20 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
         let block_size = self.header.block_size;
         let expanded = self.header.has_expanded_times();
 
-        // The fork's blocks, as device block numbers, in logical order. No overflow
-        // here: a fork that overflowed needs the extents tree, which is allocation
-        // work rather than a serialisation change.
         let mut record = self.read_file_record(cnid)?;
 
         let owned = record.data_fork.total_blocks as usize;
         let capacity = owned * block_size as usize;
         if data.len() > capacity {
-            // Round up to whole blocks, the way `AddExtents` computes
-            // `blocksToAdd` with `howmany`. A request of one byte over a block
-            // boundary needs a whole extra block, and rounding down would leave
-            // the file with fewer blocks than its logical size requires.
-            // `howmany(n, d)` rather than `div_ceil`, which is 1.73 and this crate
-            // is 1.70.
             let needed = (data.len() + block_size as usize - 1) / block_size as usize;
             let extra = needed - owned;
-            self.grow_fork(&mut record, extra)?;
+            self.grow_fork(cnid, &mut record, extra)?;
         }
 
-        // The fork's blocks, as device block numbers, in logical order. Built after
-        // any growth, so a newly allocated extent is written like any other.
-        let blocks: Vec<u32> = record
-            .data_fork
-            .extents
-            .iter()
-            .flat_map(|e| (0..e.block_count).map(move |o| e.start_block + o))
-            .collect();
+        // Build the list of device block numbers for the data fork, in logical
+        // order. When the fork overflows its inline extents, resolve the overflow
+        // groups through the Extents B-tree.
+        let blocks = self.fork_blocks(&record.data_fork, cnid, ExtentKey::DATA_FORK)?;
 
         // The data blocks first: until the record says so, the old length is
         // still what a reader will ask for, so writing the blocks before the
@@ -1240,9 +1272,6 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             self.journal_write(at, &data[start..end])?;
         }
 
-        // Then the record: logicalSize, and the two timestamps a content change
-        // touches. One clock read for both, so the record does not disagree with
-        // itself across a second boundary.
         record.data_fork.logical_size = data.len() as u64;
         let now = crate::timestamp::now_hfs(expanded).map_err(|e| Error::Io {
             message: e.to_string(),
@@ -1279,25 +1308,17 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
 
         let mut record = self.read_file_record(cnid)?;
 
-        // Release every block currently owned by the resource fork, so the
-        // extent descriptors start empty and growth allocates fresh.
-        self.release_resource_fork_blocks(&mut record)?;
+        self.release_resource_fork_blocks(&mut record, cnid)?;
 
-        // Allocate enough blocks for the new data, rounding up to whole blocks.
         let needed = (data.len() + block_size as usize - 1) / block_size as usize;
         if needed > 0 {
-            self.grow_resource_fork(&mut record, needed)?;
+            self.grow_resource_fork(cnid, &mut record, needed)?;
         }
 
         // Build the list of device block numbers for the resource fork, in
-        // logical order. Only inline extents are used (no overflow support),
-        // and the total block count cannot exceed the inline extent slots.
-        let blocks: Vec<u32> = record
-            .resource_fork
-            .extents
-            .iter()
-            .flat_map(|e| (0..e.block_count).map(move |o| e.start_block + o))
-            .collect();
+        // logical order. When the fork overflows its inline extents, resolve
+        // the overflow groups through the Extents B-tree.
+        let blocks = self.fork_blocks(&record.resource_fork, cnid, ExtentKey::RESOURCE_FORK)?;
 
         if blocks.len() < needed {
             return Err(Error::invalid(
@@ -1311,9 +1332,6 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             ));
         }
 
-        // Write the data blocks first: until the record says so, a reader
-        // sees the old fork length, so the blocks must be in place before
-        // the record is.
         for (i, block) in blocks.iter().enumerate() {
             let start = i * block_size as usize;
             let end = (start + block_size as usize).min(data.len());
@@ -1324,9 +1342,6 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             self.journal_write(at, &data[start..end])?;
         }
 
-        // Then the record: logicalSize and the timestamps a content change
-        // touches. One clock read for both, so the record does not disagree
-        // with itself across a second boundary.
         record.resource_fork.logical_size = data.len() as u64;
         let now = crate::timestamp::now_hfs(expanded).map_err(|e| Error::Io {
             message: e.to_string(),
@@ -1338,10 +1353,12 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     }
 
     /// Release every allocation block owned by the file at `cnid`'s resource
-    /// fork, then zero the fork's descriptors.
+    /// fork, then zero the fork's descriptors. Overflow extents beyond the
+    /// inline density are released through the Extents B-tree.
     fn release_resource_fork_blocks(
         &mut self,
         record: &mut crate::catalog::record::FileRecord,
+        cnid: u32,
     ) -> Result<()> {
         let mut ranges: Vec<(u32, u32)> = Vec::new();
         for ext in record.resource_fork.extents.iter() {
@@ -1349,6 +1366,48 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
                 break;
             }
             ranges.push((ext.start_block, ext.block_count));
+        }
+
+        // If the fork overflowed into the Extents B-tree, release those blocks
+        // too before clearing the inline record.
+        if record.resource_fork.needs_overflow() && !ranges.is_empty() {
+            let total_inline: u32 = ranges.iter().map(|(_, c)| *c).sum();
+            // The overflow key is the cumulative block count already described
+            // inline. Walk groups from there until the overflow is exhausted.
+            let fork_data = &self.header.extents_file;
+            if fork_data.logical_size > 0 {
+                let tree = crate::btree::io::BTreeFile::open(
+                    &*self.device,
+                    fork_data,
+                    self.header.block_size,
+                    true,
+                )?;
+                let resolver = crate::file::TreeOverflow::new(tree);
+                let overflow =
+                    crate::file::ForkOverflow::for_fork(&resolver, ExtentKey::RESOURCE_FORK, cnid);
+                let mut seen = total_inline as u64;
+                let mut guard = 0u32;
+                loop {
+                    guard += 1;
+                    if guard > 1000 {
+                        break;
+                    }
+                    let group = match overflow.resolve_group(seen as u32)? {
+                        Some(g) => g,
+                        None => break,
+                    };
+                    if group.total_blocks() == 0 {
+                        break;
+                    }
+                    for desc in group.iter() {
+                        if desc.block_count == 0 {
+                            break;
+                        }
+                        ranges.push((desc.start_block, desc.block_count));
+                    }
+                    seen += group.total_blocks();
+                }
+            }
         }
 
         if ranges.is_empty() {
@@ -4840,38 +4899,39 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
     /// leaves a catalog record pointing at blocks the bitmap calls free, so a later
     /// writer could hand the same blocks to a second file. Leaking space is
     /// recoverable; two files sharing blocks is not.
-    fn grow_fork(&mut self, record: &mut FileRecord, extra: usize) -> Result<()> {
-        self.grow_fork_of(&mut record.data_fork, extra, "data fork")
+    fn grow_fork(&mut self, cnid: u32, record: &mut FileRecord, extra: usize) -> Result<()> {
+        self.grow_fork_of(cnid, &mut record.data_fork, extra, "data fork")
     }
 
-    fn grow_resource_fork(&mut self, record: &mut FileRecord, extra: usize) -> Result<()> {
-        self.grow_fork_of(&mut record.resource_fork, extra, "resource fork")
+    fn grow_resource_fork(
+        &mut self,
+        cnid: u32,
+        record: &mut FileRecord,
+        extra: usize,
+    ) -> Result<()> {
+        self.grow_fork_of(cnid, &mut record.resource_fork, extra, "resource fork")
     }
 
     /// Reserve `extra` allocation blocks on `fork` (a mutable view into either
     /// the data or resource fork of `record`), extending the last extent in
     /// place. The bitmap is written before the data blocks, so a crash leaves
     /// either no new blocks or committed blocks with no stale references.
+    ///
+    /// When the fork has used all eight inline extent slots, the new extent
+    /// group is inserted into the volume's Extents B-tree instead of the
+    /// catalog record. Mining reference: Apple `core/FileExtentMapping.c`
+    /// (`AddFileExtent`) allocates inline first and overflows to the Extents
+    /// B-tree when the inline record is full; `core/hfs_extents.c` walks the
+    /// two in sequence via `hfs_ext_iter_next_group`.
     fn grow_fork_of(
         &mut self,
+        cnid: u32,
         fork: &mut crate::format::fork::ForkData,
         extra: usize,
         label: &str,
     ) -> Result<()> {
         use crate::alloc::AllocationMap;
         use crate::format::extents::ExtentDescriptor;
-
-        if fork.extents.next_free().is_none() {
-            return Err(Error::invalid(
-                "write",
-                format!(
-                    "the file's {label} already uses all {} inline extents; a \
-                     ninth extent has to go in the extents B-tree, which is not \
-                     implemented",
-                    fork.extents.raw.len()
-                ),
-            ));
-        }
 
         // The allocation file is read whole, using its own declared length: it is a
         // full allocation block on every volume, not merely the bytes the bitmap
@@ -4915,26 +4975,354 @@ impl<'d, D: BlockDeviceMut + ?Sized> WritableVolume<'d, D> {
             .map_or(1, |e| e.end_block().map_or(1, |end| end as u32 + 1));
         let start = map.reserve(hint, extra as u32)?;
 
-        let slot = fork
-            .extents
-            .next_free()
-            .expect("checked above that a slot is free");
-        fork.extents.set(
-            slot,
-            ExtentDescriptor {
-                start_block: start,
-                block_count: extra as u32,
-            },
-        )?;
-        fork.total_blocks += extra as u32;
+        let descriptor = ExtentDescriptor {
+            start_block: start,
+            block_count: extra as u32,
+        };
 
         // The bitmap goes to disk before the data blocks and before the record.
         // See the method doc for why that order and not the other.
         self.write_allocation_bitmap(&map, declared - extra as u32)?;
+
+        // Try to place the descriptor in the inline extent record. If all eight
+        // slots are used, it overflows into the Extents B-tree instead.
+        if let Some(slot) = fork.extents.next_free() {
+            fork.extents.set(slot, descriptor)?;
+        } else {
+            // The inline record is full: insert the descriptor into the Extents
+            // B-tree. The key's start_block is the number of allocation blocks
+            // already described inline (the sum of the existing extent counts).
+            let start_block = fork.extents.iter().map(|e| e.block_count).sum::<u32>();
+            let key = crate::btree::key::ExtentKey {
+                fork_type: match label {
+                    "data fork" => crate::btree::key::ExtentKey::DATA_FORK,
+                    _ => crate::btree::key::ExtentKey::RESOURCE_FORK,
+                },
+                file_id: cnid,
+                start_block,
+            };
+
+            // Build the overflow record: key + 64-byte extent array with our
+            // single descriptor in the first slot and terminators after.
+            let key_bytes = key.to_record();
+            let mut rec_bytes = Vec::with_capacity(key_bytes.len() + 64);
+            rec_bytes.extend_from_slice(&key_bytes);
+            let mut ext_array = [0u8; 64];
+            descriptor.write_to(&mut ext_array[..8])?;
+            rec_bytes.extend_from_slice(&ext_array);
+            self.insert_extent_overflow_record(&rec_bytes)?;
+        }
+
+        fork.total_blocks += extra as u32;
         Ok(())
     }
 
-    /// Write the allocation bitmap, and the volume header's free count.
+    /// Byte offset of `node_num` in the Extents B-tree fork.
+    ///
+    /// A small wrapper around `BTreeFile::node_offset` so callers that have
+    /// dropped the `BTreeFile` can still compute offsets. Re-opens the tree
+    /// briefly; the header is cheap to re-read and is not cached.
+    fn extents_node_offset(&self, node_num: u32) -> Result<u64> {
+        let bt = crate::btree::io::BTreeFile::open(
+            &*self.device,
+            &self.header.extents_file,
+            self.header.block_size,
+            true,
+        )?;
+        bt.node_offset(node_num)
+    }
+
+    /// Insert or replace an extent group in the volume's Extents B-tree.
+    ///
+    /// The Extents B-tree stores (forkType, fileID, startBlock) -> 8 extent
+    /// descriptors for forks whose inline extent record overflows the eight
+    /// slots in the catalog. Inserting here is the Milestone 15 step that lets
+    /// grow_fork_of fall through to the overflow tree instead of refusing at
+    /// the eighth extent.
+    ///
+    /// Mining reference: Apple core/BTree.c BTInsertKey for the descent,
+    /// InsertKeyRecord in core/BTreeNodeOps.c for record insertion.
+    fn insert_extent_overflow_record(&mut self, record: &[u8]) -> Result<()> {
+        use crate::btree::header::{allocate_node, HEADER_RECORD_OFFSET, LEAF_RECORDS_OFFSET};
+        use crate::btree::io::BTreeFile;
+        use crate::btree::key::ExtentKey;
+        use crate::btree::node::{insert_record, NodeKind};
+
+        // Open the Extents B-tree and collect all the data we need before
+        // doing any writes: the tree borrows self.device immutably, and writes
+        // need a mutable borrow.
+        let (bt_info, leaf_info): (crate::btree::header::BTreeHeader, LeafInfo) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.extents_file,
+                self.header.block_size,
+                true,
+            )?;
+            let btree_header = *bt.header();
+
+            let key = match crate::btree::key::split_extent_record(record) {
+                Some((k, _)) => k,
+                None => return Err(Error::invalid("extent overflow", "record is too short")),
+            };
+
+            // Descend to the leaf.
+            let mut leaf_num = btree_header.root_node;
+            let mut budget = btree_header.total_nodes;
+
+            while budget > 0 && leaf_num != 0 {
+                budget -= 1;
+                let bytes = bt.read_node_bytes(leaf_num)?;
+                let node = bt.parse_node(&bytes)?;
+                if node.kind() == NodeKind::Leaf {
+                    break;
+                }
+                if node.kind() != NodeKind::Index {
+                    return Err(Error::invalid("extents overflow", "unexpected node kind"));
+                }
+                let mut child = 0u32;
+                for index in 0..node.num_records() {
+                    let rec = node.record(index)?;
+                    let key_len = usize::from(u16::from_be_bytes([rec[0], rec[1]]));
+                    let key_end = 2 + key_len;
+                    if rec.len() < key_end + 4 {
+                        continue;
+                    }
+                    let key_bytes = &rec[2..key_end];
+                    let child_ptr = u32::from_be_bytes([
+                        rec[key_end],
+                        rec[key_end + 1],
+                        rec[key_end + 2],
+                        rec[key_end + 3],
+                    ]);
+                    if ExtentKey::from_record(key_bytes)
+                        .map(|k| ExtentKey::cmp_key(&k, &key))
+                        .is_ok_and(|o| o == std::cmp::Ordering::Greater)
+                    {
+                        break;
+                    }
+                    child = child_ptr;
+                }
+                leaf_num = child;
+            }
+
+            if leaf_num == 0 {
+                return Err(Error::invalid("extents overflow", "empty tree"));
+            }
+
+            let leaf_offset = bt.node_offset(leaf_num)?;
+            let leaf_bytes = bt.read_node_bytes(leaf_num)?;
+            let leaf = bt.parse_node(&leaf_bytes)?;
+            if leaf.kind() != NodeKind::Leaf {
+                return Err(Error::invalid("extents overflow", "expected leaf"));
+            }
+            let desc = leaf.descriptor();
+
+            let (insert_at, existing): (usize, Option<usize>) = {
+                let mut insert_at = 0usize;
+                let mut existing: Option<usize> = None;
+                for index in 0..leaf.num_records() {
+                    let rec = leaf.record(index)?;
+                    if let Ok(existing_key) = ExtentKey::from_record(rec) {
+                        match ExtentKey::cmp_key(&existing_key, &key) {
+                            std::cmp::Ordering::Less => insert_at = index as usize + 1,
+                            std::cmp::Ordering::Equal => {
+                                existing = Some(index as usize);
+                                break;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                insert_at = index as usize;
+                                break;
+                            }
+                        }
+                    }
+                }
+                (insert_at, existing)
+            };
+
+            let padded_len = record.len() + (record.len() & 1);
+            let free = crate::btree::node::free_space(&leaf_bytes)?;
+            let need = padded_len + crate::btree::node::OFFSET_SIZE;
+
+            (
+                btree_header,
+                LeafInfo {
+                    leaf_num,
+                    leaf_offset,
+                    leaf_bytes,
+                    desc,
+                    insert_at,
+                    existing,
+                    has_room: free >= need,
+                },
+            )
+        };
+
+        let node_size = bt_info.node_size as usize;
+        let header_at = self.extents_node_offset(0)?;
+
+        if leaf_info.has_room {
+            // Leaf has room: insert or replace the record.
+            let mut buf = leaf_info.leaf_bytes;
+            let leaf = crate::btree::node::Node::parse(&buf, node_size)?;
+
+            if let Some(idx) = leaf_info.existing {
+                let idx_u16 = u16::try_from(idx)
+                    .map_err(|_| Error::invalid("extents overflow", "record index too large"))?;
+                let old_rec = leaf.record(idx_u16)?;
+                if old_rec.len() == record.len() {
+                    let offset = leaf.record_offset(idx_u16)?;
+                    buf[offset..offset + record.len()].copy_from_slice(record);
+                } else {
+                    crate::btree::node::remove_record(&mut buf, idx)?;
+                    let at = if leaf_info.insert_at > idx {
+                        leaf_info.insert_at - 1
+                    } else {
+                        leaf_info.insert_at
+                    };
+                    insert_record(&mut buf, at, record)
+                        .map_err(|e| Error::invalid("extents overflow insertion", e.to_string()))?;
+                }
+            } else {
+                insert_record(&mut buf, leaf_info.insert_at, record)
+                    .map_err(|e| Error::invalid("extents overflow insertion", e.to_string()))?;
+            }
+
+            self.journal_write(leaf_info.leaf_offset, &buf)?;
+            if leaf_info.existing.is_none() {
+                let new_count = bt_info.leaf_records + 1;
+                self.journal_write(
+                    header_at + u64::try_from(HEADER_RECORD_OFFSET).unwrap() + LEAF_RECORDS_OFFSET,
+                    &new_count.to_be_bytes(),
+                )?;
+            }
+            return Ok(());
+        }
+
+        // --- Leaf is full: split it. ---
+        let mut header_node = self.device.read_vec(header_at, node_size)?;
+        let hdr = HEADER_RECORD_OFFSET;
+        let mut free_nodes = bt_info.free_nodes;
+
+        let new_num = allocate_node(&mut header_node, bt_info.total_nodes, &mut free_nodes)?;
+
+        // Collect all records, insert the new one, sort by key.
+        let leaf = crate::btree::node::Node::parse(&leaf_info.leaf_bytes, node_size)?;
+        let mut all_records: Vec<Vec<u8>> = Vec::new();
+        for i in 0..usize::from(leaf.num_records()) {
+            let rec = leaf.record(
+                u16::try_from(i)
+                    .map_err(|_| Error::invalid("extents overflow", "record index too large"))?,
+            )?;
+            all_records.push(rec.to_vec());
+        }
+        if let Some(idx) = leaf_info.existing {
+            all_records[idx] = record.to_vec();
+        } else {
+            all_records.insert(leaf_info.insert_at, record.to_vec());
+        }
+        all_records.sort_by(|a, b| {
+            let ka = crate::btree::key::split_extent_record(a).map(|(k, _)| k);
+            let kb = crate::btree::key::split_extent_record(b).map(|(k, _)| k);
+            match (ka, kb) {
+                (Some(ka), Some(kb)) => ExtentKey::cmp_key(&ka, &kb),
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        let split_at = all_records.len() / 2;
+
+        // Build new leaf with the upper half.
+        let mut new_leaf = vec![0u8; node_size];
+        new_leaf[0..4].copy_from_slice(&leaf_info.desc.f_link.to_be_bytes());
+        new_leaf[4..8].copy_from_slice(&leaf_info.leaf_num.to_be_bytes());
+        new_leaf[8] = NodeKind::Leaf.as_i8() as u8;
+        new_leaf[9] = 1;
+        let new_count = (all_records.len() - split_at) as u16;
+        new_leaf[10..12].copy_from_slice(&new_count.to_be_bytes());
+        for rec in &all_records[split_at..] {
+            let count = crate::btree::node::num_records(&new_leaf)? as usize;
+            insert_record(&mut new_leaf, count, rec)?;
+        }
+
+        // Rebuild old leaf with the lower half.
+        let mut old_leaf = vec![0u8; node_size];
+        old_leaf[0..4].copy_from_slice(&new_num.to_be_bytes());
+        old_leaf[4..8].copy_from_slice(&leaf_info.desc.b_link.to_be_bytes());
+        old_leaf[8] = NodeKind::Leaf.as_i8() as u8;
+        old_leaf[9] = 1;
+        let old_count = split_at as u16;
+        old_leaf[10..12].copy_from_slice(&old_count.to_be_bytes());
+        for rec in &all_records[..split_at] {
+            let count = crate::btree::node::num_records(&old_leaf)? as usize;
+            insert_record(&mut old_leaf, count, rec)?;
+        }
+
+        // Write both leaf nodes.
+        self.journal_write(leaf_info.leaf_offset, &old_leaf)?;
+        let new_leaf_offset = self.extents_node_offset(new_num)?;
+        self.journal_write(new_leaf_offset, &new_leaf)?;
+
+        // Update header node: freeNodes.
+        let free_off = hdr + crate::btree::header::FREE_NODES_OFFSET as usize;
+        header_node[free_off..free_off + 4].copy_from_slice(&free_nodes.to_be_bytes());
+
+        if bt_info.tree_depth == 1 {
+            let new_root = allocate_node(&mut header_node, bt_info.total_nodes, &mut free_nodes)?;
+
+            // Separator key = first key of the new (right) leaf.
+            let right_key = crate::btree::key::split_extent_record(
+                crate::btree::node::Node::parse(&new_leaf, node_size)?.record(0)?,
+            )
+            .ok_or(Error::invalid(
+                "extent overflow",
+                "new leaf has no valid first record",
+            ))?
+            .0;
+            let right_key_bytes = right_key.to_record();
+
+            let mut index_node = vec![0u8; node_size];
+            index_node[8] = NodeKind::Index.as_i8() as u8;
+            index_node[9] = 2;
+            index_node[10..12].copy_from_slice(&1u16.to_be_bytes());
+
+            let mut rec = Vec::with_capacity(right_key_bytes.len() + 4);
+            rec.extend_from_slice(&right_key_bytes);
+            rec.extend_from_slice(&leaf_info.leaf_num.to_be_bytes());
+            insert_record(&mut index_node, 0, &rec)?;
+
+            let mut rec1 = Vec::with_capacity(6);
+            rec1.extend_from_slice(&0u16.to_be_bytes());
+            rec1.extend_from_slice(&new_num.to_be_bytes());
+            insert_record(&mut index_node, 1, &rec1)?;
+
+            self.journal_write(self.extents_node_offset(new_root)?, &index_node)?;
+
+            // Update header record fields.
+            let root_off = hdr + crate::btree::header::ROOT_NODE_OFFSET as usize;
+            header_node[root_off..root_off + 4].copy_from_slice(&new_root.to_be_bytes());
+            let depth_off = hdr + crate::btree::header::TREE_DEPTH_OFFSET as usize;
+            header_node[depth_off..depth_off + 2].copy_from_slice(&2u16.to_be_bytes());
+            let total_off = hdr + crate::btree::header::TOTAL_NODES_OFFSET as usize;
+            let new_total = bt_info.total_nodes + 1;
+            header_node[total_off..total_off + 4].copy_from_slice(&new_total.to_be_bytes());
+        } else {
+            return Err(Error::invalid(
+                "extents overflow",
+                "leaf split with tree depth > 1 not implemented",
+            ));
+        }
+
+        let new_leaf_count = bt_info.leaf_records + 1;
+        self.journal_write(
+            header_at + u64::try_from(HEADER_RECORD_OFFSET).unwrap() + LEAF_RECORDS_OFFSET,
+            &new_leaf_count.to_be_bytes(),
+        )?;
+        self.journal_write(header_at, &header_node)?;
+
+        Ok(())
+    }
+
+    /// Write the allocation bitmap, and the volume header's free count.    /// Write the allocation bitmap, and the volume header's free count.
     ///
     /// One whole allocation block at a time, because that is the unit a checker
     /// reads. The header is written *after* the bitmap, never before: a header

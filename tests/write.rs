@@ -2882,3 +2882,55 @@ fn a_journaled_resource_fork_write_advances_the_journal_sequence() {
         "journaled resource fork write advances journal sequence",
     );
 }
+
+#[test]
+fn writing_a_resource_fork_that_overflows_extents() {
+    // A resource fork spanning more allocation blocks than fit in the eight
+    // inline extent slots must spill into the Extents B-tree. With a 4 KiB
+    // block size, nine blocks (9 * 4096 = 36864 bytes) exhaust the inline
+    // density and force a ninth extent group into the overflow tree.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let block_size = 4096u64;
+    let block_count = 9;
+    let total_bytes = (block_count * block_size) as usize;
+    let test_data = vec![0xABu8; total_bytes];
+
+    // Write the resource fork on the journaled volume.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_resource_fork(ATTR_OWNER, &test_data)
+            .expect("write_resource_fork should succeed with overflow");
+        dev.sync().expect("flush");
+    }
+
+    // Read it back through a fresh volume.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = lookup_obj(&vol, ATTR_OWNER);
+    let f = obj.as_file().expect("CNID {ATTR_OWNER} should be a file");
+    assert_eq!(
+        f.record.resource_fork.logical_size,
+        test_data.len() as u64,
+        "the resource fork length must match the data written"
+    );
+    assert_eq!(
+        f.record.resource_fork.total_blocks,
+        u32::try_from(block_count).unwrap(),
+        "the resource fork must have allocated {} blocks",
+        block_count
+    );
+    let back = vol
+        .read_resource(&obj, 0, test_data.len())
+        .expect("read resource fork");
+    assert_eq!(
+        back, test_data,
+        "the resource fork bytes must round-trip through the extents B-tree"
+    );
+    assert_fsck_clean(&path, "writing a resource fork that overflows extents");
+}
