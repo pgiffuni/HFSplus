@@ -52,7 +52,7 @@ input: every field, offset, and count is bounds-checked.
 | 12.1 | decmpfs decompression — LZVN | Complete |
 | 12.2 | decmpfs decompression — LZFSE | Complete |
 | 13 | Writable volume — attribute mutation | Complete: setxattr/removexattr journaled with crash/replay tests, empty B-tree reset, orphan block freeing |
-| 14 | Writable volume — resource fork mutation | Not started |
+| 14 | Writable volume — resource fork mutation | Complete: write_resource_fork with block allocation, journal transaction, and crash/replay tests |
 | 15 | Catalog extent-overflow growth | Not started |
 | 16 | In-tree checker (hfsck) | Done — see roadmap-write-fsck.md |
 | 17 | In-tree formatter (mkfs) | Not started |
