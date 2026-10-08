@@ -53,7 +53,7 @@ input: every field, offset, and count is bounds-checked.
 | 12.2 | decmpfs decompression — LZFSE | Complete |
 | 13 | Writable volume — attribute mutation | Complete: setxattr/removexattr journaled with crash/replay tests, empty B-tree reset, orphan block freeing |
 | 14 | Writable volume — resource fork mutation | Complete: write_resource_fork with block allocation, journal transaction, and crash/replay tests |
-| 15 | Catalog extent-overflow growth | Not started |
+| 15 | Catalog extent-overflow growth | Complete: grow_fork_of spills to Extents B-tree; write_file_contents_inner and write_resource_fork_inner resolve overflow blocks via ExtentMapper; release_resource_fork_blocks frees overflow groups on truncation; leaf splits and depth-1 tree splits supported; test for 9-block resource fork round-trip with fsck verification |
 | 16 | In-tree checker (hfsck) | Done — see roadmap-write-fsck.md |
 | 17 | In-tree formatter (mkfs) | Not started |
 | 18 | FUSE adapter (P0) | Not started |
