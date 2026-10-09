@@ -1408,6 +1408,54 @@ fn a_created_file_says_it_has_a_thread_record() {
     );
 }
 
+/// Create a symlink at `parent/name` pointing to `target_bytes`, flush, and return CNID.
+fn make_symlink(path: &std::path::Path, parent: u32, name: &str, target_bytes: &[u8]) -> u32 {
+    let mut dev = FileDevice::open_writable(path).expect("open writable");
+    let cnid = {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .create_symlink(parent, &units(name), target_bytes)
+            .expect("create symlink")
+    };
+    dev.sync().expect("flush");
+    cnid
+}
+
+#[test]
+fn create_a_symlink_and_read_it_back() {
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let target = b"/hello/world";
+    let _cnid = make_symlink(&path, parent, "link.bin", target);
+
+    {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("link.bin"))
+            .expect("lookup")
+            .expect("link must exist");
+        let f = obj.as_file().expect("a file record");
+        assert!(
+            f.record.is_symlink(),
+            "a symlink must carry S_IFLNK in its mode; got {:#o}",
+            f.record.bsd_info.file_mode
+        );
+        let read_back = vol.read_link(&obj).expect("read_link");
+        assert_eq!(
+            read_back.as_bytes(),
+            target,
+            "the symlink target must round-trip"
+        );
+    }
+    assert_fsck_clean(&path, "create_symlink");
+}
+
 #[test]
 fn a_hard_link_moves_the_data_behind_a_private_node_and_leaves_a_name() {
     // A hard link is not a second name for one CNID, and it is not a second name in
@@ -3075,4 +3123,525 @@ fn writing_a_data_fork_that_overflows_extents() {
         "the data fork bytes must round-trip through the extents B-tree"
     );
     assert_fsck_clean(&path, "writing a data fork that overflows extents");
+}
+
+#[test]
+fn a_journaled_punch_hole_is_durable_after_reopen() {
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+
+    // Original content for later comparison.
+    let original = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists");
+        vol.read_file(&obj, usize::MAX).expect("read file")
+    };
+
+    // Punch a hole from offset 0 to the end of the first allocation block.
+    let block_size = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        u64::from(vol.header().block_size)
+    };
+    let hole_len = block_size * 2; // punch 2 blocks of zeros
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .punch_hole(cnid, 0, hole_len)
+            .expect("punch_hole should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Reopen and verify: file size unchanged, punched region reads as zeros.
+    let dev = FileDevice::open(&path).expect("open for reading after punch");
+    let vol = Volume::open(&dev).expect("mount after punch");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after punch");
+    let f = obj.as_file().expect("should be a file");
+
+    assert_eq!(
+        f.record.data_fork.logical_size,
+        original.len() as u64,
+        "punch_hole must not change the file's logical size"
+    );
+
+    // The punched region (first 2 blocks) should read as zeros.
+    let after = vol.read_file(&obj, usize::MAX).expect("read after punch");
+    assert_eq!(
+        &after[..hole_len as usize],
+        vec![0u8; hole_len as usize],
+        "punched region must read as zeros"
+    );
+
+    // Data past the punched region must be unchanged.
+    assert_eq!(
+        &after[hole_len as usize..],
+        &original[hole_len as usize..],
+        "data past the hole must be unchanged"
+    );
+
+    assert_fsck_clean(&path, "journaled punch_hole after reopen");
+}
+
+// ---------------------------------------------------------------------------
+// Crash/replay tests for catalog-mutating operations (Phase A2).
+//
+// These tests follow the same pattern as the earlier crash/replay tests:
+// perform a mutation on a copy of a journaled volume, then verify the result
+// survives a close/reopen cycle and that fsck accepts the image.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_journaled_create_file_is_durable_after_reopen() {
+    // A file record + thread record + volume-header counters (fileCount,
+    // nextCatalogID) must all survive a reopen on a journaled volume.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, next_before, file_count_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        (
+            vol.root_cnid().0,
+            vol.header().next_catalog_id,
+            vol.header().file_count,
+        )
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .create_file(parent, &units("journal_new.bin"))
+            .expect("create file should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after create");
+    let vol = Volume::open(&dev).expect("mount after create");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("journal_new.bin"))
+        .expect("lookup")
+        .expect("the created file must exist after reopen");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(f.record.data_fork.logical_size, 0, "new file is empty");
+    assert_eq!(f.record.data_fork.total_blocks, 0, "new file has no blocks");
+    assert_eq!(
+        vol.lookup_cnid(Cnid(f.cnid.0))
+            .expect("lookup by CNID")
+            .expect("thread record must survive reopen")
+            .name()
+            .to_vec(),
+        obj.name().to_vec()
+    );
+    assert_eq!(
+        vol.header().next_catalog_id,
+        next_before + 1,
+        "nextCatalogID must advance"
+    );
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before + 1,
+        "fileCount must advance"
+    );
+    assert_fsck_clean(&path, "journaled create_file after reopen");
+}
+
+#[test]
+fn a_journaled_create_folder_is_durable_after_reopen() {
+    // A folder record + thread record + volume-header counters (folderCount,
+    // nextCatalogID) must all survive a reopen on a journaled volume.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, next_before, folder_count_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        (
+            vol.root_cnid().0,
+            vol.header().next_catalog_id,
+            vol.header().folder_count,
+        )
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .create_folder(parent, &units("journal_dir"))
+            .expect("create folder should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after create");
+    let vol = Volume::open(&dev).expect("mount after create");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("journal_dir"))
+        .expect("lookup")
+        .expect("the created folder must exist after reopen");
+    assert!(obj.is_dir(), "the object must be a directory");
+    assert_eq!(
+        vol.lookup_cnid(obj.cnid())
+            .expect("lookup by CNID")
+            .expect("thread record must survive reopen")
+            .name()
+            .to_vec(),
+        obj.name().to_vec()
+    );
+    assert_eq!(
+        vol.header().next_catalog_id,
+        next_before + 1,
+        "nextCatalogID must advance"
+    );
+    assert_eq!(
+        vol.header().folder_count,
+        folder_count_before + 1,
+        "folderCount must advance"
+    );
+    assert_fsck_clean(&path, "journaled create_folder after reopen");
+}
+
+#[test]
+fn a_journaled_rename_is_durable_after_reopen() {
+    // A rename modifies the catalog record, its thread record, and both
+    // parent folders' valence counts. All must survive a reopen.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    // Create a file to rename, then rename it.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_file(parent, &units("rename_me.bin"))
+            .expect("create file");
+        writable
+            .write_file_contents(cnid, b"rename target data")
+            .expect("write contents");
+        writable
+            .rename(
+                parent,
+                &units("rename_me.bin"),
+                parent,
+                &units("renamed.bin"),
+            )
+            .expect("rename should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after rename");
+    let vol = Volume::open(&dev).expect("mount after rename");
+    // Old name must be gone.
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("rename_me.bin"))
+            .expect("lookup old name")
+            .is_none(),
+        "the old name must not resolve after reopen"
+    );
+    // New name must exist.
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("renamed.bin"))
+        .expect("lookup new name")
+        .expect("the new name must resolve after reopen");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        vol.read(&obj, 0, 18).expect("read"),
+        b"rename target data",
+        "the file's data must survive the rename"
+    );
+    assert!(
+        vol.lookup_cnid(f.cnid).expect("lookup by CNID").is_some(),
+        "thread record must survive reopen"
+    );
+    assert_fsck_clean(&path, "journaled rename after reopen");
+}
+
+#[test]
+fn a_journaled_remove_is_durable_after_reopen() {
+    // A remove deletes the record, its thread record, and adjusts the parent's
+    // valence. On a file with contents it also frees allocation blocks and
+    // updates freeBlocks. All must survive a reopen.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let victim_cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_file(parent, &units("to_remove.bin"))
+            .expect("create file");
+        writable
+            .write_file_contents(cnid, b"delete me")
+            .expect("write contents");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    // Remove refuses a file with contents; truncate first.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .truncate_file(victim_cnid, 0)
+            .expect("truncate victim to nothing");
+        writable
+            .remove(parent, &units("to_remove.bin"))
+            .expect("remove should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after remove");
+    let vol = Volume::open(&dev).expect("mount after remove");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("to_remove.bin"))
+            .expect("lookup name")
+            .is_none(),
+        "the removed file must not exist by name after reopen"
+    );
+    assert!(
+        vol.lookup_cnid(Cnid(victim_cnid))
+            .expect("lookup by CNID")
+            .is_none(),
+        "the removed file must not exist by CNID after reopen"
+    );
+    assert_fsck_clean(&path, "journaled remove after reopen");
+}
+
+#[test]
+fn a_journaled_hard_link_is_durable_after_reopen() {
+    // A hard link creates an inode record (the file moved), a link record, and
+    // a link thread record -- plus volume-header counters (fileCount,
+    // nextCatalogID) and possibly the hard-links folder. All must survive.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, target_cnid, next_before, file_count_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let target = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0;
+        (
+            vol.root_cnid().0,
+            target,
+            vol.header().next_catalog_id,
+            vol.header().file_count,
+        )
+    };
+
+    let link_cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_hard_link(parent, &units("fragmented_link.bin"), target_cnid)
+            .expect("create hard link should succeed");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open for reading after link");
+    let vol = Volume::open(&dev).expect("mount after link");
+    let link_obj = vol
+        .lookup(vol.root_cnid(), &units("fragmented_link.bin"))
+        .expect("lookup")
+        .expect("link must survive reopen");
+    let link_f = link_obj.as_file().expect("a file");
+    assert_eq!(
+        link_f.cnid.0, link_cnid,
+        "link CNID must be the one returned by create_hard_link"
+    );
+    // The link and the original must read the same data. The original was
+    // moved into the hard-links folder by create_hard_link, so look it up by CNID.
+    let link_data = vol.read(&link_obj, 0, 4).expect("read link");
+    let original_obj = vol
+        .lookup_cnid(Cnid(target_cnid))
+        .expect("lookup by CNID")
+        .expect("original inode must survive reopen");
+    let original_data = vol.read(&original_obj, 0, 4).expect("read original");
+    assert_eq!(
+        link_data, original_data,
+        "hard link must read the same data as its target"
+    );
+    // nextCatalogID advances by the link record's CNID, and by one more if
+    // create_hard_link had to create the hard-links folder first. Either way
+    // it must advance at least once.
+    assert!(
+        vol.header().next_catalog_id > next_before,
+        "nextCatalogID must advance for the hard link: before={}, after={}",
+        next_before,
+        vol.header().next_catalog_id
+    );
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before + 1,
+        "fileCount must advance for the link record"
+    );
+    assert_fsck_clean(&path, "journaled hard link after reopen");
+}
+
+#[test]
+fn a_journaled_symlink_is_durable_after_reopen() {
+    // A symlink creates a file record (with S_IFLNK mode) + thread record,
+    // writes target data to the data fork (allocating blocks), and updates
+    // volume-header counters. All must survive a reopen.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .create_symlink(parent, &units("journal_link"), b"/some/target/path")
+            .expect("create symlink should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after symlink");
+    let vol = Volume::open(&dev).expect("mount after symlink");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("journal_link"))
+        .expect("lookup")
+        .expect("symlink must exist after reopen");
+    let f = obj.as_file().expect("a file (symlinks are files on HFS+)");
+    assert!(
+        (f.record.bsd_info.file_mode & 0o170000) == 0o120000,
+        "S_IFLNK must be set: got {:o}",
+        f.record.bsd_info.file_mode
+    );
+    assert!(
+        vol.lookup_cnid(Cnid(f.cnid.0))
+            .expect("lookup by CNID")
+            .is_some(),
+        "thread record must survive reopen"
+    );
+    assert_eq!(
+        vol.read(&obj, 0, f.record.data_fork.logical_size as usize)
+            .expect("read"),
+        b"/some/target/path",
+        "symlink target must survive reopen"
+    );
+    assert_fsck_clean(&path, "journaled create_symlink after reopen");
+}
+
+#[test]
+fn a_journaled_modify_metadata_is_durable_after_reopen() {
+    // modify_file_metadata changes the catalog record's mode, uid, gid, and
+    // timestamps. On a journaled volume these must survive a reopen.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (cnid, mode_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists");
+        let f = obj.as_file().expect("a file");
+        (f.cnid.0, f.record.bsd_info.file_mode)
+    };
+
+    let new_mode = (mode_before & !0o7777) | 0o600;
+    let epoch_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("time moved backwards")
+        .as_secs() as i64
+        + 1;
+    let expected_mtime = hfsplus::timestamp::to_hfs_time(epoch_now, false);
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .modify_file_metadata(
+                cnid,
+                hfsplus::volume::FileMetadataChanges {
+                    mode: Some(new_mode as u32),
+                    uid: Some(1000),
+                    gid: Some(2000),
+                    mtime: Some(epoch_now),
+                    ..Default::default()
+                },
+            )
+            .expect("modify metadata should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after metadata change");
+    let vol = Volume::open(&dev).expect("mount after metadata change");
+    let obj = vol
+        .lookup_cnid(Cnid(cnid))
+        .expect("lookup")
+        .expect("file must exist after reopen");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        f.record.bsd_info.file_mode, new_mode,
+        "mode must survive reopen"
+    );
+    assert_eq!(f.record.bsd_info.owner_id, 1000, "uid must survive reopen");
+    assert_eq!(f.record.bsd_info.group_id, 2000, "gid must survive reopen");
+    assert_eq!(
+        f.record.content_mod_date, expected_mtime,
+        "mtime must survive reopen"
+    );
+    assert_fsck_clean(&path, "journaled modify_file_metadata after reopen");
 }
