@@ -13,6 +13,9 @@ hfsplus = { path = "..", version = "0.1" }
 # fuser is MIT licensed; it is the only third-party dependency in the adapter.
 fuser = "0.18"
 
+[dev-dependencies]
+libc = "0.2"
+
 [features]
 default = []
 # Enables FreeBSD-specific mount paths.

@@ -55,5 +55,5 @@ pub use attr::{
     times_to_fileattr,
 };
 pub use error::errno_of;
-pub use filesystem::HfsPlusFilesystem;
+pub use filesystem::{HfsPlusFilesystem, VolumeHolder};
 pub use handles::{HandleEntry, HandleTable, OpenDir, OpenFile};

@@ -46,7 +46,7 @@ input: every field, offset, and count is bounds-checked.
 | 7E | Mutation invariants | Complete |
 | 8 | Writable volume — basic mutations | Complete |
 | 9 | Journal transaction assembly | Complete |
-| 10 | Journal transaction coverage for all mutations | Done — audited, hard-link folder wrapped |
+| 10 | Journal transaction coverage for all mutations | Done — audited, hard-link folder wrapped, coverage table corrected for grow_fork/freeBlocks/freeCounts |
 | 11 | Logical file layer (compression-aware) | Complete |
 | **12** | **decmpfs decompression — zlib** | **Complete** |
 | 12.1 | decmpfs decompression — LZVN | Complete |
@@ -56,7 +56,9 @@ input: every field, offset, and count is bounds-checked.
 | 15 | Catalog extent-overflow growth | Complete: grow_fork_of spills to Extents B-tree; write_file_contents_inner and write_resource_fork_inner resolve overflow blocks via ExtentMapper; release_resource_fork_blocks frees overflow groups on truncation; leaf splits and depth-1 tree splits supported; test for 9-block resource fork round-trip with fsck verification |
 | 16 | In-tree checker (hfsck) | Done — see roadmap-write-fsck.md |
 | 17 | In-tree formatter (mkfs) | Not started |
-| 18 | FUSE adapter (P0) | Not started |
+| 18 | FUSE adapter (P0) | In progress — `hfsplus-fuse` crate with read/write filesystem |
+| 19 | FUSE adapter (P1) | Complete: xattr, LSEEK, READDIRPLUS, compression-aware READ, compressed-file write rejection |
+| 20 | FUSE adapter (P2) | Complete: BMAP, FALLOCATE (punch_hole zeroes data), COPY_FILE_RANGE |
 
 ---
 
@@ -87,6 +89,16 @@ Ongoing: crash/replay coverage for every mutation family. Each test
 creates a known-good image, performs one operation, simulates
 interruption before home-block completion, then reopens/replays and
 verifies filesystem state. Run `fsck.hfsplus` on a throwaway copy only.
+
+**Completed**: Crash/replay durability tests for all 14 `WritableVolume`
+mutation methods: `write_file_contents`, `write_resource_fork`,
+`truncate_file`, `punch_hole`, `setxattr`, `removexattr`, `create_file`,
+`create_folder`, `rename`, `remove`, `create_hard_link`, `create_symlink`,
+`modify_file_metadata`. Each test performs the mutation on a journaled volume
+copy, then reopens and verifies the result is visible and `fsck.hfsplus`
+accepts the image. The `a_failed_journaled_write_does_not_modify_the_image`
+test additionally verifies that a failed transaction leaves the image
+byte-identical.
 
 ### A3. decmpfs decompression — LZVN / LZFSE
 
@@ -136,9 +148,17 @@ CNID is the FUSE inode number. Do not use host filesystem inode numbers.
 ## Phase E — FUSE P2
 
 - BMAP
-- FALLOCATE
+- FALLOCATE (punch_hole zeroes data in-place; does not release allocation blocks — see limitation in `docs/fuse.md`)
 - COPY_FILE_RANGE
 - Safe FUSE cache / writeback configuration
+
+**Completed**: BMAP, FALLOCATE (punch_hole), COPY_FILE_RANGE. All three operations
+are verified by mounted integration tests (`fallocate_punch_hole`,
+`bmap_returns_physical_block`, `copy_file_range_copies_data`) and crash/replay
+tests (`a_journaled_punch_hole_is_durable_after_reopen`). Punch-hole zeroes the
+affected byte range without releasing allocation blocks; this avoids corrupting
+the inline extent chain (which cannot represent interior holes). Blocks are
+freed on truncation to end-of-file via `truncate_file`.
 
 ---
 

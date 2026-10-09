@@ -1152,6 +1152,54 @@ than a refusal. A catalog more than two levels deep, whose parent index node wou
 itself need splitting, is Milestone 8G; and a leaf split divides by bytes, so a
 tree that would end up three levels deep is refused rather than half-split.
 
+## Symbolic links
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_symlink.c` `hfs_mksymlink` (create); `core/hfs_readwrite.c` `hfs_read_link` (read) |
+| Structures | none — a symlink is a regular file record with `S_IFLNK` mode and the target path in its data fork |
+| Invariants | a symlink is just a file; `S_IFLNK` in `fileMode` and the target bytes in the first data-fork extent are all that distinguish it. The target is stored without a NUL terminator |
+| Rust | `src/volume/mod.rs` `create_symlink` (creates a file via `create_file_inner`, sets `S_IFLNK` mode, writes the target to the data fork); `src/volume/mod.rs` `Volume::read_link` (reads the target back) |
+| Differences | the maximum target length is 4096 bytes (matching Linux `PATH_MAX`); this is larger than Apple's `MAXPATHLEN` (256), but `read_link` already caps at 4096 so the boundary is consistent |
+
+## Compressed-file write rejection
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_vfsops.c` `hfs_vnop_write` checks `ap->a_is_compressed` and returns `EOPNOTSUPP`; `core/hfs_readwrite.c` `hfs_write_recover` |
+| Structures | `K_HFS_HAS_ATTRIBUTES_MASK` on `FileRecord.flags`; the `com.apple.decmpfs` extended attribute holds `DecmpfsHeader` with `CMP_MAGIC` |
+| Invariants | a file is compressed iff its decmpfs header has the magic; writing raw data to such a file would leave the decmpfs metadata stale, so the write must be refused before any blocks change |
+| Rust | `src/volume/mod.rs` `write_file_contents_inner` checks `has_attributes` and opens a temporary read-only `Volume` to call `try_decompress`; `Error::Unsupported` maps to `EOPNOTSUPP` in the FUSE adapter |
+| Differences | the check opens a fresh `Volume` to read the attribute rather than holding a stale `Volume` through the write; on a non-journaled volume this is unnecessary overhead but it is the safe choice |
+
+## FALLOCATE (punch hole)
+
+| | |
+| --- | --- |
+| Apple | `core/FileExtentMapping.c` `TruncateFileC` — zeroes partial-block edges and releases whole blocks past the cut point; `hfs_vnop_fallocate` dispatches `FALLOC_FL_PUNCH_HOLE` |
+| Structures | `FileRecord.data_fork` extent descriptors |
+| Invariants | data within the byte range is zeroed; extent descriptors and `total_blocks` are left unchanged so surviving data retains its logical position |
+| Rust | `src/volume/mod.rs` `punch_hole` / `punch_hole_inner` (transaction-wrapped); uses `zero_range` only |
+| Differences | allocation blocks are NOT released: HFS+ inline extent records are a dense chain with no slot for interior holes, so removing descriptors would shift surviving data; zeroing the data is the correct read-side behaviour, releasing blocks requires overflow B-tree surgery |
+
+## BMAP
+
+| | |
+| --- | --- |
+| Apple | `core/FileExtentMapping.c` `MapFileBlockC` — fork block to device offset |
+| Structures | `ExtentMapper` and `ForkReader` resolving inline + overflow extent descriptors |
+| Invariants | offset must be aligned to the volume allocation block size; a hole yields `Error::OutOfRange` |
+| Rust | `src/volume/mod.rs` `Volume::bmap`; FUSE callback divides the device byte offset by the block size to return a physical block number |
+
+## COPY_FILE_RANGE
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_vfsops.c` / `hfs_vnop_copyfile` — server-side copy via `VnodePath` buffer |
+| Structures | `Volume::read` + `WritableVolume::write_file_contents` |
+| Invariants | source range must be within the source file; destination is read-modify-write so existing data outside the copy range is preserved |
+| Rust | `hfsplus-fuse/src/filesystem.rs` `copy_file_range` — reads via `Volume::read`, writes via `read_modify_write_n` |
+
 One bug was found by a *boundary* rather than by reasoning, and is worth recording
 for that reason: a catalog was accepted at forty files and rejected at forty-one,
 with nothing else different about the tree. An index separator is the first key of

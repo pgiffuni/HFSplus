@@ -217,3 +217,321 @@ fn file_attr_conversion_for_regular_file() {
         }
     }
 }
+
+/// Copy a generated image to a writable temp file.
+///
+/// Uses `bootstrapped-with-file` which has 220 free blocks (901 KB) and a real
+/// file in the root, providing enough space for write operations.
+fn writable_image_copy(test_name: &str) -> std::path::PathBuf {
+    let src = image("bootstrapped-with-file");
+    let dst = std::env::temp_dir().join(format!("hfsplus-writable-unit-{test_name}.img"));
+    std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy image: {e}"));
+    dst
+}
+
+#[test]
+fn writable_open_validates_and_caches_read_volume() {
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("open_validates");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap());
+    assert!(fs.is_ok(), "open_writable failed");
+
+    // The read volume should be cached and accessible.
+    let fs = fs.unwrap();
+    let holder = fs.get_read_volume();
+    assert!(holder.is_ok(), "get_read_volume failed");
+
+    // The volume should report the root folder's name.
+    let holder = holder.unwrap();
+    let name = holder.volume().name();
+    assert!(name.is_ok(), "volume name lookup failed");
+
+    // Clean up.
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn writable_create_file_appears_on_next_read() {
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("create_appears");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap()).unwrap();
+
+    // Record the root's state before creating a file (for comparison below).
+    let _before = fs
+        .lookup_cnid(hfsplus::catalog::ROOT_FOLDER_ID)
+        .unwrap()
+        .unwrap();
+
+    // Create a file.
+    let parent_cnid = hfsplus::catalog::ROOT_FOLDER_ID;
+    let name: Vec<u16> = "test_create_file".encode_utf16().collect();
+    let result = fs.with_writable(|wvol| wvol.create_file(parent_cnid.0, &name));
+    assert!(result.is_ok(), "create_file failed: {:?}", result.err());
+
+    // The new file should be findable in the parent.
+    let new_cnid_result = fs.get_read_volume();
+    assert!(new_cnid_result.is_ok());
+
+    // Invalidate and re-read to see the new file.
+    fs.invalidate_volume();
+
+    // The new file should be findable in the parent.
+    let holder = fs.get_read_volume().unwrap();
+    assert!(
+        holder
+            .volume()
+            .lookup(parent_cnid, &name)
+            .unwrap()
+            .is_some(),
+        "new file not found after create"
+    );
+
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn writable_write_to_file_round_trips() {
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("write_round_trip");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap()).unwrap();
+
+    // Find an existing file in the root.
+    let holder = fs.get_read_volume().unwrap();
+    let entries = holder
+        .volume()
+        .read_dir(holder.volume().root_cnid())
+        .unwrap();
+    let target = entries.iter().find(|e| !e.is_dir() && !e.is_symlink());
+    let Some(object) = target else {
+        eprintln!("skipping: no regular file in root");
+        let _ = std::fs::remove_file(&copy);
+        return;
+    };
+    let cnid = object.cnid().0;
+    let original = holder.volume().read(object, 0, usize::MAX).unwrap();
+
+    // Write new content at offset 0. The file preserves its original length
+    // beyond the written range (FUSE write semantics).
+    let new_data = b"HELLO";
+    let result = fs.read_modify_write(cnid, 0, new_data);
+    assert!(result.is_ok(), "write failed: {:?}", result.err());
+
+    // Read back through a fresh volume.
+    fs.invalidate_volume();
+    let holder = fs.get_read_volume().unwrap();
+    let object = holder
+        .volume()
+        .lookup_cnid(hfsplus::catalog::Cnid(cnid))
+        .unwrap()
+        .unwrap();
+    let written = holder.volume().read(&object, 0, usize::MAX).unwrap();
+
+    // The first 5 bytes should be our new data.
+    assert_eq!(&written[..5], new_data, "written prefix doesn't match");
+    // The rest should be the tail of the original (bytes after offset 5).
+    assert_eq!(
+        &written[5..],
+        &original[5..],
+        "file tail changed unexpectedly"
+    );
+
+    // Restore original content.
+    let _ = fs.read_modify_write(cnid, 0, &original);
+
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn writable_truncate_file_grows() {
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("truncate_grow");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap()).unwrap();
+
+    // Find an existing file in the root.
+    let holder = fs.get_read_volume().unwrap();
+    let entries = holder
+        .volume()
+        .read_dir(holder.volume().root_cnid())
+        .unwrap();
+    let target = entries.iter().find(|e| !e.is_dir() && !e.is_symlink());
+    let Some(object) = target else {
+        eprintln!("skipping: no regular file in root");
+        let _ = std::fs::remove_file(&copy);
+        return;
+    };
+    let cnid = object.cnid().0;
+    let original = holder.volume().read(object, 0, usize::MAX).unwrap();
+    let original_len = original.len();
+
+    // Grow the file to a larger size.
+    let new_len = (original_len + 500) as u64;
+    let result = fs.with_writable(|wvol| wvol.truncate_file(cnid, new_len));
+    assert!(result.is_ok(), "truncate_file failed: {:?}", result.err());
+
+    // Read back through a fresh volume.
+    fs.invalidate_volume();
+    let holder = fs.get_read_volume().unwrap();
+    let object = holder
+        .volume()
+        .lookup_cnid(hfsplus::catalog::Cnid(cnid))
+        .unwrap()
+        .unwrap();
+    let written = holder.volume().read(&object, 0, usize::MAX).unwrap();
+
+    assert_eq!(
+        written.len(),
+        new_len as usize,
+        "file should be grown to new_len"
+    );
+    assert_eq!(
+        &written[..original_len],
+        &original[..],
+        "original content preserved after grow"
+    );
+    assert_eq!(
+        &written[original_len..],
+        &[0u8; 500][..],
+        "extended region should be zero-filled"
+    );
+
+    // Restore original content.
+    fs.with_writable(|wvol| wvol.truncate_file(cnid, original_len as u64))
+        .ok();
+    let _ = fs.read_modify_write(cnid, 0, &original);
+
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn writable_modify_file_metadata() {
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("modify_meta");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap()).unwrap();
+
+    // Find an existing file in the root.
+    let holder = fs.get_read_volume().unwrap();
+    let entries = holder
+        .volume()
+        .read_dir(holder.volume().root_cnid())
+        .unwrap();
+    let target = entries.iter().find(|e| !e.is_dir() && !e.is_symlink());
+    let Some(object) = target else {
+        eprintln!("skipping: no regular file in root");
+        let _ = std::fs::remove_file(&copy);
+        return;
+    };
+    let cnid = object.cnid().0;
+    let original_mode = object.mode();
+
+    // Change the file mode to 0o600.
+    fs.with_writable(|wvol| {
+        wvol.modify_file_metadata(
+            cnid,
+            hfsplus::volume::FileMetadataChanges {
+                mode: Some(0o100600), // S_IFREG | 0600
+                uid: None,
+                gid: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+            },
+        )
+    })
+    .unwrap();
+
+    // Read back and verify.
+    fs.invalidate_volume();
+    let holder = fs.get_read_volume().unwrap();
+    let object = holder
+        .volume()
+        .lookup_cnid(hfsplus::catalog::Cnid(cnid))
+        .unwrap()
+        .unwrap();
+    let new_mode = object.mode();
+    assert_eq!(new_mode & 0o777, 0o600, "mode should be 600 after setattr");
+
+    // Restore original mode.
+    fs.with_writable(|wvol| {
+        wvol.modify_file_metadata(
+            cnid,
+            hfsplus::volume::FileMetadataChanges {
+                mode: Some(original_mode as u32),
+                uid: None,
+                gid: None,
+                atime: None,
+                mtime: None,
+                ctime: None,
+            },
+        )
+    })
+    .ok();
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn writable_hard_link_round_trips() {
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("remove_file");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap()).unwrap();
+
+    // Create then remove a file.
+    let parent_cnid = hfsplus::catalog::ROOT_FOLDER_ID;
+    let name: Vec<u16> = "to_be_removed".encode_utf16().collect();
+
+    let created = fs.with_writable(|wvol| wvol.create_file(parent_cnid.0, &name));
+    assert!(created.is_ok());
+
+    // Verify the file exists.
+    let holder = fs.get_read_volume().unwrap();
+    assert!(holder
+        .volume()
+        .lookup(parent_cnid, &name)
+        .unwrap()
+        .is_some());
+    drop(holder);
+
+    // Remove it.
+    let removed = fs.with_writable(|wvol| wvol.remove(parent_cnid.0, &name));
+    assert!(removed.is_ok());
+
+    // Verify it's gone.
+    fs.invalidate_volume();
+    let holder = fs.get_read_volume().unwrap();
+    assert!(holder
+        .volume()
+        .lookup(parent_cnid, &name)
+        .unwrap()
+        .is_none());
+
+    let _ = std::fs::remove_file(&copy);
+}

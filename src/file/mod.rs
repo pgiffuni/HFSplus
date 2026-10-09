@@ -212,8 +212,10 @@ impl<'a, D: BlockDevice + ?Sized> ForkReader<'a, D> {
                 return Ok(Some(offset));
             }
             if offset < range_end {
-                // Inside this extent; hole starts at the end of it.
-                return Ok(Some(range_end));
+                // Inside this extent; the hole starts at the end of the allocated
+                // region, clamped to the logical file size so a file whose extent
+                // extends past its declared size reports EOF as the hole.
+                return Ok(Some(range_end.min(self.fork.logical_size)));
             }
         }
 

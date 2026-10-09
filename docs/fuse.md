@@ -37,27 +37,52 @@ attributes B-tree key on.
 
 ## File handles
 
-- `OpenFile { cnid, is_dir }` — allocated on `OPEN`, tracks a regular file.
-- `OpenDir { cnid, cursor }` — allocated on `OPENDIR`, tracks a directory
-  cursor for resumable `READDIR`.
+- `OpenFile { cnid, is_dir }` — allocated on `OPEN`/`CREATE`, tracks a regular file.
+- `OpenDir { cnid, cursor }` — allocated on `OPENDIR`, tracks a directory cursor
+  for resumable `READDIR`.
 - Handles are stored in a `HandleTable` (internally `Mutex<HashMap<u64, _>>`),
   indexed by a monotonically increasing 64-bit token.
 
 ## Thread safety
 
-`fuser::Filesystem` requires `Send + Sync + 'static`. The `hfsplus::Volume`
-holds its lazy-initialized B-trees in `std::sync::OnceLock`, making it `Sync`
-when the backing device is `Sync`. The FUSE adapter wraps the volume in
-`Arc<Volume<'static, FileDevice>>` and accesses it through `&self`, so read
-operations are lock-free at the FUSE layer. The handle table is internally
-synchronized with a `Mutex`.
+`fuser::Filesystem` requires `Send + Sync + 'static`. The read volume is held in
+an `Arc` behind an `RwLock`, enabling lazy initialization and cache
+invalidation after writes. Read operations clone the `Arc` and proceed without
+holding the lock. The handle table is internally synchronized with a `Mutex`.
 
-The lifetime extension from the device to `'static` is done with a documented
-`transmute` in the adapter: both the `FileDevice` and the `Volume` are owned
-together in the same struct, so the borrow is always valid. This is the same
-pattern used by FUSE implementations that tie a volume to its block device.
+### Read path
 
-## Supported operations (read-only)
+Read operations (`LOOKUP`, `GETATTR`, `READ`, `READDIR`, etc.) acquire a read
+lock, lazily initialize the cached `Volume` if unset, clone the `Arc`, and
+proceed. The lock is released immediately after the clone.
+
+### Write path
+
+Write operations (`CREATE`, `UNLINK`, `WRITE`, etc.) open a fresh
+`FileDevice` read-write and a `WritableVolume` from it. Each public
+`WritableVolume` method is self-contained within a journal transaction
+(`begin_transaction` / `end_transaction`), so the write is committed before the
+device is closed. After the write, the cached read volume is invalidated
+(set to `None`) so the next read re-opens from disk.
+
+The `WRITE` callback uses a read-modify-write pattern: it opens the device
+read-write, reads the existing content through a `Volume`, drops that volume,
+then opens a `WritableVolume` to write the merged data. Both borrows are
+sequential (not overlapping), so this is sound without `unsafe`.
+
+### Lifetime extension
+
+The `Volume` borrows its `FileDevice` (`&'a D`). Both are co-located in
+`VolumeHolder`, and the lifetime is extended to `'static` via `transmute` in the
+adapter. This is sound because:
+- The `FileDevice` is declared before `Volume` in the struct, so Rust drops the
+  volume before the device (reverse declaration order).
+- The `Volume` is only ever accessed through a shared reference (via `Arc`).
+- This operates on the block-device wrapper, not raw image bytes.
+
+## Supported operations
+
+### Read-only operations
 
 | FUSE operation | Library call            |
 | --- | --- |
@@ -74,12 +99,45 @@ pattern used by FUSE implementations that tie a volume to its block device.
 | `RELEASEDIR` | `HandleTable::remove` |
 | `READLINK` | `Volume::read_link` |
 | `STATFS` | `Volume::statfs` |
-| `DESTROY` | — (no-op) |
+| `DESTROY` | — (drops the cached volume) |
+
+### Writable operations
+
+| FUSE operation | Library call            |
+| --- | --- |
+| `CREATE` | `WritableVolume::create_file` |
+| `MKDIR`  | `WritableVolume::create_folder` |
+| `UNLINK` | `WritableVolume::remove` |
+| `RMDIR`  | `WritableVolume::remove` |
+| `RENAME` | `WritableVolume::rename` |
+| `WRITE`  | read-modify-write via `Volume::read` + `WritableVolume::write_file_contents` |
+| `SETATTR` (size) | `WritableVolume::truncate_file` (supports growth and shrink) |
+| `SETATTR` (mode/uid/gid) | `WritableVolume::modify_file_metadata` |
+| `SETATTR` (atime/mtime) | `WritableVolume::modify_file_metadata` |
+| `LINK` | `WritableVolume::create_hard_link` (reads via `Volume::resolved_fork`) |
+| `SETXATTR` | `WritableVolume::setxattr` |
+| `GETXATTR` | `Volume::getxattr` |
+| `LISTXATTR` | `Volume::listxattr` |
+| `REMOVEXATTR` | `WritableVolume::removexattr` |
+| `FSYNC` | — (each write commits a journal transaction) |
+| `FSYNCDIR` | — (each directory mutation commits a journal transaction) |
+| `FLUSH` | — (transactions are atomic per write) |
+| `SYMLINK` | `WritableVolume::create_symlink` |
+| `LSEEK` | `Volume::seek_data` / `Volume::seek_hole` (SEEK_DATA, SEEK_HOLE) |
+| `READDIRPLUS` | `Volume::read_dir_plus` (entries with full attributes) |
+| `BMAP` | `Volume::bmap` (logical block → physical device block) |
+| `FALLOCATE` | `WritableVolume::punch_hole` (FALLOC_FL_PUNCH_HOLE: zeroes data) / `truncate_file` (default: grow/shrink) |
+| `COPY_FILE_RANGE` | `Volume::read` + `read_modify_write` (server-side copy) |
 
 ## Mount options
 
-The initial implementation mounts read-only (`-o ro`) with auto-unmount.
-Write operations are not yet supported.
+The adapter supports two modes:
+
+- **Read-only** (default): `hfsplus-fuse <image> <mountpoint>`
+- **Writable** (`-w`/`--writable`): `hfsplus-fuse <image> <mountpoint> -w`
+
+Read-only mounts use `-o ro`; writable mounts use `-o rw`. Both use
+`FSName("hfsplus")` for identification.
 
 ## FreeBSD compatibility
 
@@ -87,24 +145,16 @@ The adapter uses `fuser`, which provides a single API across Linux and
 FreeBSD. The platform-specific differences (e.g. `fusermount` vs `fusermount3`
 for unmounting) are handled in the test harness, not in the adapter.
 
-## Operation compatibility matrix
-
-| Operation      | Linux | FreeBSD |
-| --- | --- | --- |
-| mount          | yes | yes |
-| lookup         | yes | yes |
-| read           | yes | yes |
-| readdir        | yes | yes |
-| xattr           | planned | planned |
-| lseek           | planned | planned |
-| bmap            | planned | planned |
-
 ## Known limitations
 
-- Write operations (`WRITE`, `CREATE`, `MKDIR`, `UNLINK`, `RENAME`, etc.) are
-  not yet implemented. The mount is always read-only.
 - `ACCESS` always succeeds; full permission checking awaits writable semantics.
 - `READDIR` fetches all entries in a single batch; large directories are not
   paginated yet.
-- Hard links and resource forks are visible (via the catalog) but not through
-  POSIX link operations.
+- `WRITE` uses a full read-modify-write cycle; sparse writes and large-file
+  partial writes are correct but not optimal.
+- `FALLOCATE` punch-hole zeroes the affected data but does not release
+  allocation blocks. HFS+ inline extent records are a dense chain starting at
+  logical block 0 with no slot for interior holes; removing descriptors would
+  shift surviving data, so blocks remain allocated and the data is zeroed
+  instead. SEEK_DATA/SEEK_HOLE are block-granular: a hole within a block is
+  not visible until the next block boundary.
