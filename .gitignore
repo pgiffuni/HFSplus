@@ -13,3 +13,6 @@ tests/images/macos/*
 # mktorn.py imports makejournal.py to reuse its journal layout and checksum.
 __pycache__/
 *.pyc
+
+# Kilo agent configuration and state — local to each developer's environment.
+.kilo/
