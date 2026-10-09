@@ -389,7 +389,8 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
             return Ok(decompressed[start as usize..end as usize].to_vec());
         }
 
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+        let (fork, fid) = self.resolved_fork(f)?;
+        self.fork_reader(&fork, ExtentKey::DATA_FORK, fid)
             .read(offset, len)
     }
 
@@ -413,7 +414,8 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         }
 
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+        let (fork, fid) = self.resolved_fork(f)?;
+        self.fork_reader(&fork, ExtentKey::DATA_FORK, fid)
             .read_all(limit)
     }
 
@@ -447,19 +449,16 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
                 // For types 1–7, the compressed data lives in the resource fork.
                 // Read the entire resource fork.
                 let f = file.as_file()?;
-                if f.record.resource_fork.logical_size == 0 {
+                let (rfork, rf_id) = self.resolved_resource_fork(f)?;
+                if rfork.logical_size == 0 {
                     return Err(Error::invalid(
                         "compressed file",
                         "resource fork is empty but compression type is not uncompressed",
                     ));
                 }
-                let rf_size = f.record.resource_fork.logical_size as usize;
-                self.fork_reader(
-                    &f.record.resource_fork,
-                    ExtentKey::RESOURCE_FORK,
-                    file_id(f),
-                )
-                .read_all(rf_size.max(1))?
+                let rf_size = rfork.logical_size as usize;
+                self.fork_reader(&rfork, ExtentKey::RESOURCE_FORK, rf_id)
+                    .read_all(rf_size.max(1))?
             }
         };
 
@@ -483,7 +482,8 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         D: Sync,
     {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+        let (fork, fid) = self.resolved_fork(f)?;
+        self.fork_reader(&fork, ExtentKey::DATA_FORK, fid)
             .seek_data(offset)
     }
 
@@ -498,7 +498,8 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         D: Sync,
     {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+        let (fork, fid) = self.resolved_fork(f)?;
+        self.fork_reader(&fork, ExtentKey::DATA_FORK, fid)
             .seek_hole(offset)
     }
 
@@ -517,7 +518,8 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         D: Sync,
     {
         let f = file.as_file()?;
-        self.fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
+        let (fork, fid) = self.resolved_fork(f)?;
+        self.fork_reader(&fork, ExtentKey::DATA_FORK, fid)
             .bmap(offset)
     }
 
@@ -530,15 +532,12 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
         D: Sync,
     {
         let f = file.as_file()?;
-        if f.record.resource_fork.logical_size == 0 {
+        let (rfork, rf_id) = self.resolved_resource_fork(f)?;
+        if rfork.logical_size == 0 {
             return Ok(Vec::new());
         }
-        self.fork_reader(
-            &f.record.resource_fork,
-            ExtentKey::RESOURCE_FORK,
-            file_id(f),
-        )
-        .read(offset, len)
+        self.fork_reader(&rfork, ExtentKey::RESOURCE_FORK, rf_id)
+            .read(offset, len)
     }
 
     /// The attributes B-tree for this volume, opened lazily.
@@ -641,10 +640,9 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 
         let bytes = self
             .fork_reader(&f.record.data_fork, ExtentKey::DATA_FORK, file_id(f))
-            .read_all(MAX_TARGET)?;
-        // `write_journal_header` shows the target is stored without a terminator,
-        // but a writer that appends one is not a fault, so trailing NULs are
-        // trimmed rather than refused.
+            .read_all(MAX_TARGET)?; // `write_journal_header` shows the target is stored without a terminator,
+                                    // but a writer that appends one is not a fault, so trailing NULs are
+                                    // trimmed rather than refused.
         let s = String::from_utf8_lossy(&bytes);
         Ok(s.trim_end_matches('\0').to_string())
     }
@@ -802,6 +800,26 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     }
 }
 
+/// Fields that [`WritableVolume::modify_file_metadata`] can change.
+///
+/// Each field is `None` when the caller has nothing to set, so the method
+/// only touches what was requested.
+#[derive(Debug, Default)]
+pub struct FileMetadataChanges {
+    /// New `bsd_info.file_mode`, truncated to 16 bits on write.
+    pub mode: Option<u32>,
+    /// New owner UID (`bsd_info.owner_id`).
+    pub uid: Option<u32>,
+    /// New group GID (`bsd_info.group_id`).
+    pub gid: Option<u32>,
+    /// Access time in Unix seconds.
+    pub atime: Option<i64>,
+    /// Content modification time in Unix seconds.
+    pub mtime: Option<i64>,
+    /// Attribute modification time in Unix seconds.
+    pub ctime: Option<i64>,
+}
+
 /// A volume opened for mutation.
 ///
 /// This type exists to make the trust boundary explicit rather than to expose
@@ -868,17 +886,20 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 ///
 /// | Method | Home blocks | Bitmap | Volume hdr | Transaction |
 /// |---|---|---|---|---|
-/// | `write_file_contents` | catalog fork record, data fork blocks | no | no | open → commit/abort |
-/// | `write_resource_fork` | catalog fork record, resource fork blocks | freed blocks on replace | `freeBlocks` | open → commit/abort |
+/// | `write_file_contents` | catalog fork record, data fork blocks | allocated blocks on grow (via `write_allocation_bitmap`) | `freeBlocks` on grow (via `write_allocation_bitmap`) | open → commit/abort |
+/// | `write_resource_fork` | catalog fork record, resource fork blocks | allocated + freed blocks (via `write_allocation_bitmap`) | `freeBlocks` (via `write_allocation_bitmap`) | open → commit/abort |
 /// | `setxattr` | attributes B-tree leaf | no | no | open → commit/abort |
 /// | `removexattr` | attributes B-tree leaf, allocation bitmap (orphaned fork blocks on empty tree) | orphaned blocks | `freeBlocks` | open → commit/abort |
-/// | `create_file` | catalog leaf (file record + thread), parent folder record, volume header (next CNID) | no | `nextCatalogID` | open → commit/abort |
+/// | `create_file` | catalog leaf (file record + thread), parent folder record, volume header (file count, next CNID) | no | `fileCount`, `nextCatalogID` | open → commit/abort |
 /// | `create_folder` | catalog leaf (folder record + thread), parent folder record, volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open → commit/abort |
 /// | `remove` | catalog leaf (deletion), parent folder record (valence), allocation bitmap (freed blocks) | freed blocks | `freeBlocks` | open → commit/abort |
 /// | `rename` | catalog leaf (delete + insert), source and destination parent records (valence) | no | no | open → commit/abort |
-/// | `create_hard_link` | catalog leaf (inode + link records), parent folder record (valence), volume header (next CNID) | no | `nextCatalogID` | open → commit/abort |
+/// | `create_hard_link` | catalog leaf (inode + link records), parent folder record (valence), volume header (file count, next CNID) | no | `fileCount`, `nextCatalogID` | open → commit/abort |
 /// | `ensure_file_hardlinks_folder` | catalog leaf (folder + thread records), volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open (or reuse) → commit/abort |
-/// | `truncate_file` | catalog leaf (fork record), allocation bitmap (freed blocks) | freed blocks | `freeBlocks` | open → commit/abort |
+/// | `truncate_file` | catalog leaf (fork record), allocation bitmap (freed/allocated blocks) | freed blocks on shrink, allocated on grow | `freeBlocks` (via `write_allocation_bitmap`) | open → commit/abort |
+/// | `punch_hole` | catalog leaf (fork record) | no | no | open → commit/abort |
+/// | `create_symlink` | catalog leaf (file record + thread), parent folder record (valence), data fork blocks | allocated blocks on grow (via `write_file_contents_inner` → `grow_fork`) | `fileCount`, `nextCatalogID`, `freeBlocks` on grow (via `create_file_inner` + `grow_fork`) | open → commit/abort |
+/// | `modify_file_metadata` | catalog leaf (record fields: mode, uid, gid, timestamps) | no | no | open → commit/abort |
 ///
 /// All writes pass through [`journal_write`](Self::journal_write), which is the
 /// only path to the device. Internal helpers (`replace_catalog_record`,
@@ -1278,6 +1299,28 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
 
         let mut record = self.read_file_record(cnid)?;
 
+        // A compressed file's data fork holds compressed bytes, not raw
+        // content. Writing raw bytes here would corrupt the file's mapping
+        // without updating the decmpfs metadata. Refuse with EOPNOTSUPP, as
+        // Apple does: `hfs_vnop_write` checks `ap->a_is_compressed` and
+        // returns `EOPNOTSUPP` for the write path.
+        // Mining reference: `core/hfs_vfsops.c` `hfs_vnop_write` and
+        // `core/hfs_readwrite.c` `hfs_write_recover`.
+        if record.has_attributes() {
+            // Open a read-only Volume to check for the decmpfs attribute
+            // without holding a conflicting borrow.
+            let obj = Object::from_record(
+                Vec::new(),
+                crate::catalog::record::CatalogRecord::File(Box::new(record)),
+                self.header.has_expanded_times(),
+            )
+            .expect("a file record becomes an object");
+            let ro = Volume::open(&*self.device)?;
+            if ro.try_decompress(&obj)?.is_some() {
+                return Err(Error::unsupported("write to compressed file"));
+            }
+        }
+
         let owned = record.data_fork.total_blocks as usize;
         let capacity = owned * block_size as usize;
         if data.len() > capacity {
@@ -1646,6 +1689,72 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         self.header.file_count = file_count;
         self.header.next_catalog_id = cnid + 1;
         self.write_header_u32(32, file_count)?;
+        Ok(cnid)
+    }
+
+    /// Create a symbolic link at `parent/name` whose target is `target`.
+    ///
+    /// On HFS Plus, a symlink is a regular file whose mode includes
+    /// `S_IFLNK` and whose data fork holds the target path as raw bytes.
+    /// This method creates the file record and writes the target in one
+    /// journal transaction, so a crash cannot leave a mode-mismatched empty
+    /// file behind.
+    ///
+    /// Mining reference: Apple `core/hfs_symlink.c` `hfs_mksymlink` creates a
+    /// file record with `S_IFLNK` and writes the target through
+    /// `hfs_write`: the symlink is a file, not a special catalog record type.
+    pub fn create_symlink(&mut self, parent: u32, name: &[u16], target: &[u8]) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.create_symlink_inner(parent, name, target);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn create_symlink_inner(&mut self, parent: u32, name: &[u16], target: &[u8]) -> Result<u32> {
+        use crate::catalog::record::S_IFLNK;
+
+        if name.is_empty() {
+            return Err(Error::invalid(
+                "symlink",
+                "a link cannot have an empty name",
+            ));
+        }
+        if target.len() > 4096 {
+            return Err(Error::invalid(
+                "symlink",
+                format!(
+                    "target path is {} bytes; HFS+ symlinks are limited to 4096",
+                    target.len()
+                ),
+            ));
+        }
+
+        // Create the file with S_IFLNK mode, then write the target to its
+        // data fork. Reusing create_file gives us the catalog/bookkeeping for
+        // free; we only need to fix up the mode and write the target.
+        let cnid = self.create_file_inner(parent, name)?;
+
+        // Build a partial FileMetadataChanges-like mutation but inline, because
+        // we are already in the create_file transaction context.
+        let expanded = self.header.has_expanded_times();
+        let now = crate::timestamp::now_hfs(expanded).map_err(|e| Error::Io {
+            message: e.to_string(),
+        })?;
+
+        let mut record = self.read_file_record(cnid)?;
+        record.bsd_info.file_mode = S_IFLNK | 0o777;
+        record.content_mod_date = now;
+        record.attribute_mod_date = now;
+        self.replace_catalog_record(cnid, &record)?;
+
+        // Write the target path into the data fork. This allocates blocks and
+        // writes through the journal.
+        self.write_file_contents_inner(cnid, target)?;
+
         Ok(cnid)
     }
 
@@ -2440,9 +2549,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         to_name: &[u16],
     ) -> Result<u32> {
         use crate::catalog::key::CatalogKey;
-        use crate::catalog::record::{
-            CatalogRecord, FolderRecord, THREAD_RECORD_FIXED_SIZE, THREAD_RECORD_NAME_LEN_OFFSET,
-        };
+        use crate::catalog::record::{CatalogRecord, THREAD_RECORD_NAME_LEN_OFFSET};
 
         if from_name.is_empty() || to_name.is_empty() {
             return Err(Error::invalid("rename", "a name cannot be empty"));
@@ -2654,7 +2761,6 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 return Err(e);
             }
         }
-        let _ = (FolderRecord::EMPTY, THREAD_RECORD_FIXED_SIZE);
         Ok(cnid)
     }
 
@@ -4307,41 +4413,185 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
     fn truncate_file_inner(&mut self, cnid: u32, new_len: u64) -> Result<()> {
         let block_size = self.header.block_size;
         let mut record = self.read_file_record(cnid)?;
-        let keep = (new_len as usize + block_size as usize - 1) / block_size as usize;
 
-        // A request that both keeps every block *and* does not shorten the file
-        // changes nothing at all, so it is refused rather than answered by
-        // rewriting the record with the same numbers and moving the modification
-        // time -- which would look like a successful truncate of nothing.
-        //
-        // Keeping the blocks while shortening the length is *not* refused: that is
-        // how a file gives up the tail of its last partial block without releasing
-        // it, and Apple allows it -- `TruncateFileC` shortens by
-        // `extentNextBlock - nextBlock` blocks and writes the new length
-        // regardless of whether that count was zero.
-        if keep >= record.data_fork.total_blocks as usize
-            && new_len >= record.data_fork.logical_size
-        {
-            return Err(Error::invalid(
-                "truncate",
-                format!(
-                    "{new_len} bytes keeps all {} of the file's block(s) and does \
-                     not shorten it; that is not a truncation",
-                    record.data_fork.total_blocks
-                ),
-            ));
-        }
-        if keep == 0 {
-            // Every block goes, and every descriptor is zeroed, so the record's
-            // length is unchanged and there is nothing left to describe.
-            self.release_blocks(&mut record, 0, cnid)?;
-            record.data_fork.logical_size = 0;
-        } else {
-            self.release_blocks(&mut record, keep, cnid)?;
+        // Growing the file: allocate new blocks and zero the extension.
+        // POSIX ftruncate allows growing; the extended region is zero-filled.
+        if new_len > record.data_fork.logical_size {
+            let current_blocks = record.data_fork.total_blocks as usize;
+            let needed = (new_len as usize + block_size as usize - 1) / block_size as usize;
+            let extra = needed.saturating_sub(current_blocks);
+            if extra > 0 {
+                self.grow_fork(cnid, &mut record, extra)?;
+            }
+            // Zero the new bytes from the old logical boundary to new_len,
+            // rounding up to the block boundary for the last partial block.
+            // Newly allocated blocks must be zero-initialized so a read of the
+            // gap returns zeroes, matching POSIX sparse-file semantics.
+            let old_len = record.data_fork.logical_size;
+            self.zero_range(cnid, &record, old_len, new_len)?;
             record.data_fork.logical_size = new_len;
+        } else {
+            // Shrinking the file: release blocks past the new length.
+            let keep = (new_len as usize + block_size as usize - 1) / block_size as usize;
+
+            // A request that both keeps every block *and* does not shorten the
+            // file changes nothing at all, so it is refused rather than answered
+            // by rewriting the record with the same numbers and moving the
+            // modification time -- which would look like a successful truncate of
+            // nothing.
+            //
+            // Keeping the blocks while shortening the length is *not* refused: that
+            // is how a file gives up the tail of its last partial block without
+            // releasing it, and Apple allows it -- `TruncateFileC` shortens by
+            // `extentNextBlock - nextBlock` blocks and writes the new length
+            // regardless of whether that count was zero.
+            if keep >= record.data_fork.total_blocks as usize
+                && new_len >= record.data_fork.logical_size
+            {
+                return Err(Error::invalid(
+                    "truncate",
+                    format!(
+                        "{new_len} bytes keeps all {} of the file's block(s) and does \
+                         not shorten it; that is not a truncation",
+                        record.data_fork.total_blocks
+                    ),
+                ));
+            }
+            if keep == 0 {
+                // Every block goes, and every descriptor is zeroed, so the record's
+                // length is unchanged and there is nothing left to describe.
+                self.release_blocks(&mut record, 0, cnid)?;
+                record.data_fork.logical_size = 0;
+            } else {
+                self.release_blocks(&mut record, keep, cnid)?;
+                record.data_fork.logical_size = new_len;
+            }
         }
         self.touch_record(&mut record)?;
         self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Punch a hole in a file: zero the byte range `[offset, offset+length)`
+    /// in the file's data fork, leaving the logical size unchanged (matching
+    /// `FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`).
+    ///
+    /// Reads of the punched region return zero and all other data is preserved.
+    /// Allocation blocks are NOT released: HFS+ inline extent records are a dense
+    /// ordered chain starting at logical block 0 with no slot for interior holes,
+    /// so removing an early extent's descriptor would shift every subsequent
+    /// extent's logical block upward, relocating data rather than punching a hole.
+    /// Zeroing the data is the correct read-side behaviour; releasing blocks
+    /// would require overflow B-tree surgery to record the hole's logical offset.
+    ///
+    /// Mining reference: Apple `core/FileExtentMapping.c` `TruncateFileC` zeros
+    /// partial-block edges and releases whole blocks past the cut point. This
+    /// implementation performs only the zeroing: truncation to end-of-file is
+    /// handled by [`truncate_file`](Self::truncate_file), which shortens the
+    /// extent chain from the end and is the case Apple's release logic covers.
+    pub fn punch_hole(&mut self, cnid: u32, offset: u64, length: u64) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.punch_hole_inner(cnid, offset, length);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn punch_hole_inner(&mut self, cnid: u32, offset: u64, length: u64) -> Result<()> {
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| Error::overflow("punch_hole: offset + length overflow"))?;
+
+        let mut record = self.read_file_record(cnid)?;
+
+        // Zero the data in the byte range [offset, end). `zero_range` resolves
+        // the fork's extent chain (inline + overflow) and writes zeroes to every
+        // device block that overlaps the range, zeroing only the byte sub-ranges
+        // that fall within [offset, end). Extent descriptors and `total_blocks`
+        // are left untouched so that surviving data retains its logical position.
+        self.zero_range(cnid, &record, offset, end)?;
+
+        self.touch_record(&mut record)?;
+        self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Apply `setattr`-style mutations to a file record and persist it.
+    ///
+    /// Any field that is `None` is left unchanged.
+    pub fn modify_file_metadata(&mut self, cnid: u32, changes: FileMetadataChanges) -> Result<()> {
+        self.begin_transaction()?;
+        let result = self.modify_file_metadata_inner(cnid, &changes);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn modify_file_metadata_inner(
+        &mut self,
+        cnid: u32,
+        changes: &FileMetadataChanges,
+    ) -> Result<()> {
+        use crate::timestamp;
+
+        let expanded = self.header.has_expanded_times();
+        let mut record = self.read_file_record(cnid)?;
+
+        if let Some(m) = changes.mode {
+            record.bsd_info.file_mode = m as u16;
+        }
+        if let Some(u) = changes.uid {
+            record.bsd_info.owner_id = u;
+        }
+        if let Some(g) = changes.gid {
+            record.bsd_info.group_id = g;
+        }
+        if let Some(t) = changes.atime {
+            record.access_date = timestamp::to_hfs_time(t, expanded);
+        }
+        if let Some(t) = changes.mtime {
+            record.content_mod_date = timestamp::to_hfs_time(t, expanded);
+        }
+        if let Some(t) = changes.ctime {
+            record.attribute_mod_date = timestamp::to_hfs_time(t, expanded);
+        }
+
+        self.replace_catalog_record(cnid, &record)
+    }
+
+    /// Zero the logical byte range `[start, end)` of `record`'s data fork by
+    /// writing zero bytes to the backing allocation blocks.
+    ///
+    /// Used by [`truncate_file_inner`] when growing a file: newly allocated
+    /// blocks must be zero-initialised so reads of the extended region return
+    /// zero, matching POSIX sparse-file semantics. The record's
+    /// `logical_size` should be left at its old value while this runs, because
+    /// [`fork_blocks`] walks extents, which are sized by total allocation blocks
+    /// rather than logical size.
+    fn zero_range(&mut self, cnid: u32, record: &FileRecord, start: u64, end: u64) -> Result<()> {
+        let block_size = u64::from(self.header.block_size);
+        let blocks = self.fork_blocks(&record.data_fork, cnid, ExtentKey::DATA_FORK)?;
+
+        for (i, block) in blocks.iter().enumerate() {
+            let block_start = i as u64 * block_size;
+            let block_end = block_start + block_size;
+
+            if block_end <= start || block_start >= end {
+                continue;
+            }
+
+            let within_start = block_start.max(start) - block_start;
+            let within_end = block_end.min(end) - block_start;
+            let zeros = vec![0u8; (within_end - within_start) as usize];
+            let at = u64::from(*block) * block_size + within_start;
+            self.journal_write(at, &zeros)?;
+        }
+
+        Ok(())
     }
 
     /// Release every block of `record`'s data fork past `keep` blocks.
@@ -5737,6 +5987,54 @@ enum CatalogHit {
 /// `kResourceForkType = 0xFF`.
 fn file_id(f: &FileAttrs) -> u32 {
     f.record.file_id.0
+}
+
+impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
+    /// Resolve a file to the fork data and file ID used for extent mapping,
+    /// following hard-link indirection if the file is a hard link.
+    ///
+    /// A hard link's record carries an empty data fork; the actual fork data
+    /// lives in the indirect node whose CNID is stored in the link's `bsd_info.special`
+    /// field (TN1150: `hl_linkReference`). This method looks up the indirect
+    /// node and returns its fork data and CNID, so that callers like [`read`]
+    /// and [`bmap`] transparently access the link's data.
+    ///
+    /// For a non-hard-link file, returns a reference to the file's own fork
+    /// and its own CNID.
+    ///
+    /// [`read`]: Volume::read
+    /// [`bmap`]: Volume::bmap
+    fn resolved_fork(&self, f: &FileAttrs) -> Result<(crate::format::fork::ForkData, u32)> {
+        if !f.is_hard_link {
+            return Ok((f.record.data_fork, file_id(f)));
+        }
+
+        let inode_cnid = Cnid(f.bsd_info.special);
+        let inode = self.lookup_cnid(inode_cnid)?.ok_or(Error::NotFound {
+            what: "hard link target inode",
+        })?;
+        let inode_file = inode.as_file()?;
+        Ok((inode_file.record.data_fork, file_id(inode_file)))
+    }
+
+    /// Like [`resolved_fork`](Self::resolved_fork), but for the resource fork.
+    /// Hard links carry their resource fork on the indirect node, not the link
+    /// record.
+    fn resolved_resource_fork(
+        &self,
+        f: &FileAttrs,
+    ) -> Result<(crate::format::fork::ForkData, u32)> {
+        if !f.is_hard_link {
+            return Ok((f.record.resource_fork, file_id(f)));
+        }
+
+        let inode_cnid = Cnid(f.bsd_info.special);
+        let inode = self.lookup_cnid(inode_cnid)?.ok_or(Error::NotFound {
+            what: "hard link target inode",
+        })?;
+        let inode_file = inode.as_file()?;
+        Ok((inode_file.record.resource_fork, file_id(inode_file)))
+    }
 }
 
 fn kind_label(kind: FileSystemKind) -> &'static str {
