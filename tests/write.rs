@@ -18,7 +18,9 @@
 mod common;
 
 use hfsplus::blockdev::{BlockDeviceMut, FileDevice};
+use hfsplus::btree::io::BTreeFile;
 use hfsplus::catalog::cnid::Cnid;
+use hfsplus::file::TreeOverflow;
 use hfsplus::volume::{Object, Volume, WritableVolume};
 
 /// UTF-16 code units of `s`, for a catalog lookup.
@@ -4135,4 +4137,105 @@ fn a_journaled_hard_link_removal_is_durable_after_reopen() {
     let report = hfsplus::check::check(&vol, None).expect("check");
     assert!(report.is_clean(), "{:?}", report.describe());
     assert_fsck_clean(&path, "journaled hard link removal after reopen");
+}
+
+#[test]
+fn truncating_a_file_with_overflow_extents_deletes_the_records() {
+    // A file that spills past eight inline extents must carry its extra groups
+    // in the Extents B-tree. When the fork is truncated to zero, every
+    // allocation block is returned and every overflow record for that fork
+    // must be deleted from the tree — stale records would describe blocks that
+    // are no longer reserved for this file.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+
+    // 9 blocks × 4 KiB = 36 KiB forces one overflow group (8 inline + 1 overflow).
+    let block_size = 4096u64;
+    let block_count = 9;
+    let total_bytes = (block_count * block_size) as usize;
+    let test_data = vec![0xCDu8; total_bytes];
+
+    // Write enough data to create an overflow group.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .write_file_contents(cnid, &test_data)
+            .expect("write with overflow");
+        dev.sync().expect("flush");
+    }
+
+    // Confirm the overflow record exists before truncation.
+    {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let bt = BTreeFile::open(
+            &dev,
+            &vol.header().extents_file,
+            vol.header().block_size,
+            true,
+        )
+        .expect("open extents tree");
+        let tree = TreeOverflow::new(bt);
+        let group = tree
+            .find_group(hfsplus::btree::key::ExtentKey::DATA_FORK, cnid, 8)
+            .expect("find overflow group");
+        assert!(
+            group.is_some(),
+            "the overflow group should exist after writing 9 blocks"
+        );
+    }
+
+    let blocks_before = allocated_blocks(&path);
+
+    // Truncate to zero — this should delete the overflow record.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable.truncate_file(cnid, 0).expect("truncate to zero");
+        dev.sync().expect("flush");
+    }
+
+    // All blocks should be freed.
+    assert_eq!(
+        allocated_blocks(&path),
+        blocks_before - block_count,
+        "all 9 blocks must come back after truncation"
+    );
+
+    // The overflow record must be gone.
+    {
+        let dev = FileDevice::open(&path).expect("open for reading after truncate");
+        let vol = Volume::open(&dev).expect("mount after truncate");
+        let bt = BTreeFile::open(
+            &dev,
+            &vol.header().extents_file,
+            vol.header().block_size,
+            true,
+        )
+        .expect("open extents tree");
+        let tree = TreeOverflow::new(bt);
+        let group = tree
+            .find_group(hfsplus::btree::key::ExtentKey::DATA_FORK, cnid, 8)
+            .expect("find overflow group after truncate");
+        assert!(
+            group.is_none(),
+            "the overflow record must be deleted after truncation"
+        );
+    }
+
+    assert_fsck_clean(&path, "truncating a file with overflow extents");
 }

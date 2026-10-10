@@ -462,8 +462,9 @@ compression metadata (7B.2) are done and appear above.
 | **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | Milestone 10 |
 | **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
 | **Unlinking** through a link | `cat_delete` refusing a record with siblings | done (Milestone 10C) |
-| Extents overflow | `core/hfs_extents.c` `extents_search` for lookup, `hfs_ext_iter_next_group` for traversal; overflow records | Milestone 15 |
+| Extents overflow | `core/hfs_extents.c` `extents_search` for lookup, `hfs_ext_iter_next_group` for traversal; overflow records | done (Milestone 15: insert; Milestone 8F: delete) |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
+| Deleting a leaf record | `core/BTree.c` `BTDeleteRecord` — the remove path: `RemoveRecord`, `DeleteNode` | done (Milestone 8F) |
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
 | Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | Milestone 10D |
 | Opened-but-deleted files in the metadata directory | `HFS_DELETE_PREFIX "temp"`; TN1150's Hard Links section | Milestone 10D |
@@ -1155,6 +1156,8 @@ rather than approximated:
   clumps long before that.
 - **A fork cannot overflow into the extents tree.** Nine extents and the answer is
   a refusal naming 8D. That is also what stops a catalog growing indefinitely.
+  (Overflow records *can* be deleted on truncation — Milestone 8F – but the tree
+  cannot grow new nodes to hold further insertions.)
 - **Nothing can be written to a journaled volume.** `WritableVolume::open` refuses
   one, because a write that is not journalled leaves a journal that does not
   describe the volume.

@@ -4907,6 +4907,11 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
     /// be loaded from the device -- which needs a shared borrow -- and mutating it
     /// happens in memory. Releasing one range at a time would reload it per
     /// extent for no benefit: the writes are coalesced when the bitmap goes out.
+    ///
+    /// Overflow record deletion is performed after the allocation bitmap is
+    /// updated, still within the same transaction. The records are removed from
+    /// the Extents B-tree leaf, `leafRecords` is decremented, and the root index
+    /// is rebuilt if the leaf's first record changed.
     fn release_blocks(&mut self, record: &mut FileRecord, keep: usize, cnid: u32) -> Result<()> {
         use crate::format::extents::{ExtentDescriptor, EMPTY_DESCRIPTOR};
 
@@ -4925,6 +4930,12 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             .collect();
 
         let inline_total: u32 = record.data_fork.total_blocks;
+        let had_overflow = record.data_fork.needs_overflow();
+        // The number of blocks described by inline extents *before* any
+        // truncation. Overflow records are keyed by this count, not by `keep`,
+        // because the key records where the inline extents end and the overflow
+        // begins.
+        let original_inline_blocks = record.data_fork.inline_blocks();
 
         for (slot, start_block, block_count) in descriptors {
             // How many of this descriptor's blocks lie before the new end.
@@ -4960,16 +4971,11 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
 
         record.data_fork.total_blocks = keep as u32;
 
-        // Release overflow groups past the cut point.
-        // After the inline descriptors are trimmed, `keep` blocks remain inline.
-        // Overflow groups whose key (cumulative block count) is >= `keep` are
-        // entirely beyond the new end and must be released. Their records are
-        // not deleted from the Extents B-tree — that would require a B-tree
-        // delete (node merge/redistribute) path that is not yet implemented;
-        // the stale records are harmless because they describe blocks that have
-        // been returned to the free pool and will not be reallocated until the
-        // inline extents are also cleared (full truncation case below).
-        if keep < inline_total as usize && record.data_fork.needs_overflow() {
+        // Overflow group keys (start blocks) whose records must be deleted from
+        // the Extents B-tree once their blocks are freed.
+        let mut overflow_to_delete: Vec<u32> = Vec::new();
+
+        if keep < inline_total as usize && had_overflow {
             let fork_data = &self.header.extents_file;
             if fork_data.logical_size > 0 {
                 let tree = crate::btree::io::BTreeFile::open(
@@ -4981,7 +4987,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 let resolver = crate::file::TreeOverflow::new(tree);
                 let overflow =
                     crate::file::ForkOverflow::for_fork(&resolver, ExtentKey::DATA_FORK, cnid);
-                let mut seen = keep as u64;
+                let mut seen = original_inline_blocks;
                 let mut guard = 0u32;
                 loop {
                     guard += 1;
@@ -5006,8 +5012,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                         ranges.push((desc.start_block, desc.block_count));
                         freed += desc.block_count;
                     }
-                    // TODO: delete the overflow record for this group from the
-                    // Extents B-tree once B-tree delete is implemented.
+                    overflow_to_delete.push(key);
                     seen += group.total_blocks();
                 }
             }
@@ -5020,6 +5025,10 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         let mut map = self.load_allocation_map()?;
         for (start, count) in ranges {
             map.release(start, count)?;
+        }
+
+        for start_block in overflow_to_delete {
+            self.remove_extent_overflow_record(ExtentKey::for_data_fork(cnid, start_block))?;
         }
         let free_blocks = self
             .header
@@ -5960,6 +5969,217 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         )?;
         self.journal_write(header_at, &header_node)?;
 
+        Ok(())
+    }
+
+    /// Remove one overflow extent record from the Extents B-tree.
+    ///
+    /// The inverse of [`Self::insert_extent_overflow_record`] for a known key.
+    /// Removes the leaf record, decrements `leafRecords`, and updates the
+    /// index separator if the key was the leaf's first record.
+    fn remove_extent_overflow_record(&mut self, key: crate::btree::key::ExtentKey) -> Result<()> {
+        use crate::btree::header::{HEADER_RECORD_OFFSET, LEAF_RECORDS_OFFSET};
+        use crate::btree::io::BTreeFile;
+        use crate::btree::key::ExtentKey;
+        use crate::btree::node::{num_records, remove_record, NodeKind};
+
+        // Open the Extents B-tree and collect all the data we need before
+        // doing any writes: the tree borrows self.device immutably, and writes
+        // need a mutable borrow.
+        let (bt_info, leaf_num, found): (crate::btree::header::BTreeHeader, u32, Option<usize>) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.extents_file,
+                self.header.block_size,
+                true,
+            )?;
+            let btree_header = *bt.header();
+
+            // Descend to the leaf.
+            let mut node_num = btree_header.root_node;
+            let mut budget = btree_header.total_nodes;
+
+            while budget > 0 && node_num != 0 {
+                budget -= 1;
+                let bytes = bt.read_node_bytes(node_num)?;
+                let node = bt.parse_node(&bytes)?;
+                if node.kind() == NodeKind::Leaf {
+                    break;
+                }
+                if node.kind() != NodeKind::Index {
+                    return Err(Error::invalid("extents overflow", "unexpected node kind"));
+                }
+                let mut child = 0u32;
+                for index in 0..node.num_records() {
+                    let rec = node.record(index)?;
+                    let key_len = usize::from(u16::from_be_bytes([rec[0], rec[1]]));
+                    let key_end = 2 + key_len;
+                    if rec.len() < key_end + 4 {
+                        continue;
+                    }
+                    let rec_key_bytes = &rec[2..key_end];
+                    let child_ptr = u32::from_be_bytes([
+                        rec[key_end],
+                        rec[key_end + 1],
+                        rec[key_end + 2],
+                        rec[key_end + 3],
+                    ]);
+                    if ExtentKey::from_record(rec_key_bytes)
+                        .map(|k| ExtentKey::cmp_key(&k, &key))
+                        .is_ok_and(|o| o == std::cmp::Ordering::Greater)
+                    {
+                        break;
+                    }
+                    child = child_ptr;
+                }
+                node_num = child;
+            }
+
+            if node_num == 0 {
+                return Ok(());
+            }
+
+            let leaf_bytes = bt.read_node_bytes(node_num)?;
+            let leaf = bt.parse_node(&leaf_bytes)?;
+            if leaf.kind() != NodeKind::Leaf {
+                return Err(Error::invalid("extents overflow", "expected leaf"));
+            }
+
+            let found = {
+                let mut found: Option<usize> = None;
+                for index in 0..leaf.num_records() {
+                    let rec = leaf.record(index)?;
+                    if let Ok(existing_key) = ExtentKey::from_record(rec) {
+                        match ExtentKey::cmp_key(&existing_key, &key) {
+                            std::cmp::Ordering::Equal => {
+                                found = Some(index as usize);
+                                break;
+                            }
+                            std::cmp::Ordering::Greater => break,
+                            std::cmp::Ordering::Less => {}
+                        }
+                    }
+                }
+                found
+            };
+
+            (btree_header, node_num, found)
+        };
+
+        let Some(index) = found else {
+            return Ok(());
+        };
+
+        // Re-locate the leaf for the edit (the search borrow above must be
+        // released before writing).
+        let leaf_offset = self.extents_node_offset(leaf_num)?;
+        let header_at = self.extents_node_offset(0)?;
+
+        let buf = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.extents_file,
+                self.header.block_size,
+                true,
+            )?;
+            let mut buf = bt.read_node_bytes(leaf_num)?;
+            remove_record(&mut buf, index)?;
+            buf
+        };
+        let _ = num_records(&buf)?;
+        self.journal_write(leaf_offset, &buf)?;
+
+        let leaf_records = self.extents_leaf_records()?.checked_sub(1).ok_or_else(|| {
+            Error::invalid("BTHeaderRec.leafRecords", "a remove took it below zero")
+        })?;
+        self.journal_write(
+            header_at + u64::try_from(HEADER_RECORD_OFFSET).unwrap() + LEAF_RECORDS_OFFSET,
+            &leaf_records.to_be_bytes(),
+        )?;
+
+        // A removal can change the leaf's *first* record, which is what the index
+        // separator for it is.
+        self.refresh_extents_index(bt_info.node_size as usize)
+    }
+
+    /// `leafRecords` from the Extents B-tree header.
+    fn extents_leaf_records(&self) -> Result<u32> {
+        use crate::btree::io::BTreeFile;
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.extents_file,
+            self.header.block_size,
+            true,
+        )?;
+        Ok(bt.header().leaf_records)
+    }
+
+    /// Rebuild the Extents B-tree root index node from the leaf chain.
+    ///
+    /// Only needed when `tree_depth >= 2` (the root is an index node). For
+    /// depth 1, the root is also the leaf and no index exists to refresh.
+    /// Mirrors the catalog's [`Self::refresh_index`] but operates on the
+    /// Extents B-tree.
+    fn refresh_extents_index(&mut self, node_size: usize) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node;
+
+        let (hdr, root_node) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.extents_file,
+                self.header.block_size,
+                true,
+            )?;
+            let hdr = *bt.header();
+            (hdr, hdr.root_node)
+        };
+
+        if hdr.tree_depth < 2 {
+            return Ok(());
+        }
+
+        // Walk the leaf chain collecting the first record of each leaf.
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        let mut cursor = hdr.first_leaf_node;
+        let mut seen = 0u32;
+        while cursor != 0 && seen < hdr.total_nodes {
+            seen += 1;
+            let leaf_bytes = self
+                .device
+                .read_vec(self.extents_node_offset(cursor)?, node_size)?;
+
+            // Verify it is a leaf (kind byte at offset 8 is 0xFF for leaves).
+            if leaf_bytes[8] != 0xFF {
+                return Err(Error::invalid(
+                    "extents overflow leaf chain",
+                    format!("node {cursor} is not a leaf"),
+                ));
+            }
+            let count = node::num_records(&leaf_bytes)?;
+            if count == 0 {
+                return Err(Error::invalid(
+                    "extents overflow leaf chain",
+                    format!("node {cursor} is an empty leaf"),
+                ));
+            }
+            let first = Self::record_at(&leaf_bytes, 0)?;
+            records.push(Self::index_record(&first, cursor)?);
+
+            cursor =
+                u32::from_be_bytes([leaf_bytes[0], leaf_bytes[1], leaf_bytes[2], leaf_bytes[3]]);
+        }
+
+        // Rebuild the root index node in place.
+        let root = Self::build_node(
+            node_size,
+            0x00,
+            (hdr.tree_depth - 1) as u8,
+            root_node,
+            0,
+            &records,
+        )?;
+        self.journal_write(self.extents_node_offset(root_node)?, &root)?;
         Ok(())
     }
 
