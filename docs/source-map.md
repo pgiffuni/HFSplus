@@ -457,11 +457,11 @@ compression metadata (7B.2) are done and appear above.
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
 | Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
 | **The private hardlinks folder** | `core/hfs_link.c` `hfs_private_names`, `HFSPLUSMETADATAFOLDER` in `core/hfs_format.h` | Milestone 10, first |
-| **Threading** a second link's chain | `cat_lookup_lastlink`; `hl_prevLinkID`/`hl_nextLinkID` | Milestone 10B |
-| **Removing** through a link | `cat_delete` refusing a record with siblings; `decvalency` | Milestone 10C |
+| **Threading** a second link's chain | `cat_lookup_lastlink`; `hl_prevLinkID`/`hl_nextLinkID` | done (Milestone 10B) |
+| **Removing** through a link | `cat_delete` refusing a record with siblings; `decvalency` | done (Milestone 10C) |
 | **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | Milestone 10 |
 | **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
-| **Unlinking** through a link | `cat_delete` refusing a record with siblings | Milestone 10 |
+| **Unlinking** through a link | `cat_delete` refusing a record with siblings | done (Milestone 10C) |
 | Extents overflow | `core/hfs_extents.c` `extents_search` for lookup, `hfs_ext_iter_next_group` for traversal; overflow records | Milestone 15 |
 | Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
 | Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
@@ -803,8 +803,11 @@ when creating an additional link, and decrement the value when removing a link..
 When removing a link, an implementation should not allow the linkCount to
 underflow; if it is already zero, do not change it."
 
-That last clause is a rule this crate does not implement and should: the guard in
-`remove` and in any future unlink must not decrement below zero.
+That last clause is a rule this crate **does** implement: the guard in
+`remove_inner` checks `link_count() == 0` before decrementing, so a removal of a
+stale or pre-Tiger link never underflows. A second link is still refused at
+creation time on the grounds that threading the chain is unimplemented, so the
+guard is a safety net rather than a live path.
 
 **`special` is exactly what the union says.** "**iNodeNum** -- For hard link files,
 this field contains the link reference number. **linkCount** -- For indirect node
@@ -1042,9 +1045,11 @@ The next attempt should establish the order **by reading `cat_rename`'s four ste
 as a list and writing them down before any code**, since every bug so far has been
 in the sequencing rather than in the model.
 
-So `create_hard_link` is **not** written. The folder it needs is, and the link-count
-fix that came out of the attempt is, but a writer whose records `fsck` quietly
-rewrites is not something to ship.
+So `create_hard_link` was **not yet written** at the time of that attempt -- the
+folder it needs was, and the link-count fix that came out of the attempt was, but
+a writer whose records `fsck` quietly rewrites was not something to ship. The
+sequencing was later resolved by reading `cat_rename`'s steps as an ordered list,
+and `create_hard_link` is now implemented and committed (see Milestone 10 above).
 
 The next step is the unresolved row, and the way in is the diff: `fsck` is deleting
 the chain flag, so it does not think that record is a link. That points at the
@@ -1112,11 +1117,18 @@ Two more things the mining turned up while writing this up:
 
 ## What Milestone 8 has and has not reached
 
-**Milestone 10 is complete** for file hard links. `create_hard_link` moves a file's
-record into the metadata directory as `iNode<cnid>` and leaves a link record where
-the name was, with the fields Apple's sources specify. It is verified against those
-sources rather than against `fsck.hfsplus`, deliberately -- see the hard-link
-section below for why, and for what that does and does not claim.
+**Milestone 10 is complete** for file hard links: creation (`create_hard_link`)
+moves a file's record into the metadata directory as `iNode<cnid>` and leaves a
+link record where the name was, with the fields Apple's sources specify;
+**threading a second link** (Milestone 10B) walks `hl_nextLinkID` from the
+inode's `firstLinkID` to find the tail and appends the new link to the chain,
+updating both the tail's `nextLinkID` and the new link's `prevLinkID`; removal
+(`remove_inner`) decrements the inode's link count, splices the link out of the
+chain by rewriting its neighbours' `prev`/`next` pointers (and the inode's
+`firstLinkID` when the head is removed), and when the count reaches zero frees
+the inode's blocks and deletes both its catalog and thread records. Both phases
+are verified against Apple's sources, not against `fsck.hfsplus`, deliberately --
+see the hard-link section below for why.
 
 **Milestone 9 is complete.** Done and `fsck`-verified: overwrite, grow and truncate
 a file's contents within its eight inline extents; create a file, create a folder,
