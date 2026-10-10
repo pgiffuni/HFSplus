@@ -1564,65 +1564,399 @@ fn a_hard_link_moves_the_data_behind_a_private_node_and_leaves_a_name() {
 }
 
 #[test]
-fn a_second_hard_link_is_refused_because_threading_is_not_implemented() {
-    // `hfs_makelink`'s own guard is `cp->c_linkcount == 2`, so a second link is the
-    // threading case: walking `hl_prevLinkID`/`hl_nextLinkID`. A `linkCount` that
-    // climbs with nothing behind it is the volume shape this milestone exists to
-    // avoid.
+fn multiple_hard_links_chain_through_the_indirect_node() {
+    // A second link to the same file must be appended to the chain, not refused.
+    // The inode's linkCount climbs to 2, the tail's nextLinkID points at the new
+    // link, and the new link's prevLinkID points back. Removing one link must
+    // splice it out of the chain; removing the last must free the inode.
     let path = copy_fixture(IMAGE).expect("fixture");
     let parent = {
         let dev = FileDevice::open(&path).expect("open");
         let vol = Volume::open(&dev).expect("mount");
         vol.root_cnid().0
     };
-    let (target, link) = {
+    let target = {
         let mut dev = FileDevice::open_writable(&path).expect("open writable");
-        let ids = {
+        let cnid = {
             let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
             let target = writable
                 .create_file(parent, &units("orig.bin"))
                 .expect("create");
-            let link = writable
-                .create_hard_link(parent, &units("alias.bin"), target)
-                .expect("link");
-            (target, link)
+            writable
+                .write_file_contents(target, &[0xABu8; 400])
+                .expect("contents");
+            target
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let (link1, link2) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let link1 = writable
+                .create_hard_link(parent, &units("first.bin"), target)
+                .expect("first link");
+            let link2 = writable
+                .create_hard_link(parent, &units("second.bin"), target)
+                .expect("second link -- must chain");
+            (link1, link2)
         };
         dev.sync().expect("flush");
         ids
     };
+    assert_ne!(link1, link2, "each link has its own CNID");
 
+    // Read through the read API to verify the chain resolves.
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup by CNID")
+        .expect("inode must survive");
+    let inode_f = inode.as_file().expect("a file");
+    assert_eq!(inode_f.record.link_count(), 2, "inode reports two links");
+
+    // Walk the chain from the inode's firstLinkID (reserved1 on the indirect
+    // node; the hasLinkChain flag lives on links, not on the inode).
+    let inode_f = inode.as_file().expect("a file");
+    assert_eq!(inode_f.record.link_count(), 2, "inode reports two links");
+    let head = Cnid(inode_f.record.reserved1);
+    assert_ne!(
+        head.0, target,
+        "firstLinkID is the head link, not the inode"
+    );
+
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1")
+        .expect("link1 must exist");
+    let link1_f = link1_obj.as_file().expect("a file");
+    assert_eq!(
+        link1_f.record.link_reference().expect("link1 ref").0,
+        target,
+        "link1 references the inode"
+    );
+
+    let link2_obj = vol
+        .lookup_cnid(Cnid(link2))
+        .expect("lookup link2")
+        .expect("link2 must exist");
+    let link2_f = link2_obj.as_file().expect("a file");
+    assert_eq!(
+        link2_f.record.link_reference().expect("link2 ref").0,
+        target,
+        "link2 references the inode"
+    );
+
+    // Verify chain connectivity: one link is the head, the other is the tail.
+    let (head_cnid, tail_cnid, middle_cnid) = if link1 == head.0 {
+        (link1, link2, 0)
+    } else if link2 == head.0 {
+        (link2, link1, 0)
+    } else {
+        // head is one of the links; the other is middle if neither next is 0
+        // after head, but with two links that can't happen.
+        panic!("head link CNID {head:?} is neither of the link CNIDs");
+    };
+    let head_rec = vol.lookup_cnid(Cnid(head_cnid)).unwrap().unwrap();
+    let tail_rec = vol.lookup_cnid(Cnid(tail_cnid)).unwrap().unwrap();
+    let head_f = head_rec.as_file().unwrap();
+    let tail_f = tail_rec.as_file().unwrap();
+    assert_eq!(
+        head_f.record.bsd_info.group_id, tail_cnid,
+        "head's nextLinkID must point at the tail"
+    );
+    assert_eq!(
+        tail_f.record.bsd_info.owner_id, head_cnid,
+        "tail's prevLinkID must point at the head"
+    );
+    assert_eq!(
+        tail_f.record.bsd_info.group_id, 0,
+        "tail's nextLinkID must be 0"
+    );
+    let _ = middle_cnid; // no middle link with only two
+
+    // Both links read the same data as the inode.
+    let data = vol.read(&link1_obj, 0, 8).expect("read through link1");
+    let inode_data = vol.read(&inode, 0, 8).expect("read inode");
+    assert_eq!(&data, &inode_data, "link1 reads inode data");
+    let data = vol.read(&link2_obj, 0, 8).expect("read through link2");
+    assert_eq!(&data, &inode_data, "link2 reads inode data");
+
+    let file_count_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().file_count
+    };
+
+    // Remove link2 (the tail). The chain must be re-threaded: head's next → 0.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to remove");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("second.bin"))
+            .expect("remove the tail link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    let dev = FileDevice::open(&path).expect("open after tail removal");
+    let vol = Volume::open(&dev).expect("mount after tail removal");
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode after tail removal")
+        .expect("inode must survive tail removal");
+    let inode_f = inode.as_file().expect("a file");
+    assert_eq!(
+        inode_f.record.link_count(),
+        1,
+        "count dropped to 1 after tail removal"
+    );
+
+    let head = Cnid(inode_f.record.reserved1);
+    assert_eq!(
+        head.0, link1,
+        "the remaining link must be the head when the tail was removed"
+    );
+    // Reading through the remaining link must still work.
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1 after tail removal")
+        .expect("link1 must exist after tail removal");
+    let data = vol
+        .read(&link1_obj, 0, 4)
+        .expect("read through link1 after tail removal");
+    assert_eq!(
+        &data, &[0xABu8; 4],
+        "link1 reads the right data after tail removal"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check after tail removal");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    drop(vol);
+    drop(dev);
+
+    // Now remove the last link. The inode should be freed.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to remove last");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("first.bin"))
+            .expect("remove the head link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    let dev = FileDevice::open(&path).expect("open after last removal");
+    let vol = Volume::open(&dev).expect("mount after last removal");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("first.bin"))
+            .expect("lookup")
+            .is_none(),
+        "link1 must be gone"
+    );
+    assert!(
+        vol.lookup_cnid(Cnid(target))
+            .expect("lookup inode")
+            .is_none(),
+        "inode must be freed when its last link is removed"
+    );
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before - 3,
+        "fileCount: freed two links and one inode"
+    );
+    let report = hfsplus::check::check(&vol, None).expect("check after last removal");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "chain of hard links");
+}
+
+#[test]
+fn a_link_is_not_a_target() {
+    // `create_hard_link` must refuse a link as a target: the chain bit marks the
+    // record as a link, not an indirect node, so linking to it would create a
+    // second-level indirection nothing supports.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let link = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_file(parent, &units("orig.bin"))
+                .expect("create");
+            writable
+                .create_hard_link(parent, &units("alias.bin"), target)
+                .expect("link")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
     let mut dev = FileDevice::open_writable(&path).expect("open writable");
     {
         let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
         let err = writable
-            .create_hard_link(parent, &units("third.bin"), target)
-            .expect_err("a second link cannot be threaded yet");
-        assert!(
-            format!("{err}").contains("thread"),
-            "the refusal must say what is missing; got: {err}"
-        );
-        let err = writable
-            .create_hard_link(parent, &units("fourth.bin"), link)
+            .create_hard_link(parent, &units("third.bin"), link)
             .expect_err("a link is not a target");
         assert!(
             format!("{err}").contains("indirect node"),
             "the refusal must point at the indirect node; got: {err}"
         );
-        dev.sync().expect("flush");
     }
+    dev.sync().expect("flush");
 
     let dev = FileDevice::open(&path).expect("open");
     let vol = Volume::open(&dev).expect("mount");
-    for n in ["third.bin", "fourth.bin"] {
-        assert!(
-            vol.lookup(vol.root_cnid(), &units(n))
-                .expect("lookup")
-                .is_none(),
-            "{n} must not exist after a refused link"
-        );
-    }
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("third.bin"))
+            .expect("lookup")
+            .is_none(),
+        "the refused link must not exist"
+    );
     let report = hfsplus::check::check(&vol, None).expect("check");
     assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "refused link-to-link");
+}
+
+#[test]
+fn a_journaled_hard_link_chain_survives_reopen() {
+    // On a journaled volume, two links + chain pointers + linkCount must all
+    // survive a transaction commit and reopen. Using `fragmented.bin` (CNID 18,
+    // eight scattered extents) exercises block-indirection through the chain.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let target = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0
+    };
+    let file_count_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().file_count
+    };
+
+    let (link1, link2) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let link1 = writable
+                .create_hard_link(parent, &units("jchain1.bin"), target)
+                .expect("first link");
+            let link2 = writable
+                .create_hard_link(parent, &units("jchain2.bin"), target)
+                .expect("second link -- must chain");
+            (link1, link2)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+    assert_ne!(link1, link2, "each link has its own CNID");
+
+    // Remove the tail. Chain must be re-threaded and inode linkCount must drop to 1.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable to remove tail");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("jchain2.bin"))
+            .expect("remove tail link");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open after tail removal");
+    let vol = Volume::open(&dev).expect("mount after tail removal");
+
+    // Head link must still resolve and read the inode's data.
+    let head = vol
+        .lookup(vol.root_cnid(), &units("jchain1.bin"))
+        .expect("lookup jchain1")
+        .expect("jchain1 must exist");
+    let head_f = head.as_file().expect("a file");
+    assert_eq!(
+        head_f.record.link_reference().expect("ref").0,
+        target,
+        "remaining link references the inode"
+    );
+
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive tail removal");
+    let inode_f = inode.as_file().expect("a file");
+    assert_eq!(
+        inode_f.record.link_count(),
+        1,
+        "linkCount drops to 1 after removing the tail"
+    );
+
+    // Reading through the remaining link must yield the inode's data.
+    let data = vol.read(&head, 0, 4).expect("read through remaining link");
+    assert!(!data.is_empty(), "link reads inode data");
+
+    // fileCount: started at N, created two links (+2), removed one link (-1) → N+1.
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before + 1,
+        "fileCount accounts for two links created, one link removed"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check after tail removal");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "journaled chain after tail removal");
+    drop(vol);
+    drop(dev);
+
+    // Remove the head link. This frees the inode (count 1 → 0).
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable to remove head");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("jchain1.bin"))
+            .expect("remove head link");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open after head removal");
+    let vol = Volume::open(&dev).expect("mount after head removal");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("jchain1.bin"))
+            .expect("lookup")
+            .is_none(),
+        "head link must be gone"
+    );
+    assert!(
+        vol.lookup_cnid(Cnid(target))
+            .expect("lookup inode")
+            .is_none(),
+        "inode must be freed when its last link is removed"
+    );
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before - 1,
+        "fileCount: two links added, both links and inode freed = net -1"
+    );
+    let report = hfsplus::check::check(&vol, None).expect("check after head removal");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "journaled chain after head removal");
 }
 
 #[test]
@@ -3644,4 +3978,161 @@ fn a_journaled_modify_metadata_is_durable_after_reopen() {
         "mtime must survive reopen"
     );
     assert_fsck_clean(&path, "journaled modify_file_metadata after reopen");
+}
+
+#[test]
+fn removing_a_hard_link_frees_the_indirect_node_when_count_reaches_zero() {
+    // Removing the last hard link to an indirect node must do more than delete the
+    // link's own record and thread: it must decrement the inode's linkCount, and
+    // when that reaches zero it must free the inode's data and resource-fork blocks,
+    // delete the inode's record and thread, and update fileCount. One stale record
+    // leaves `cat_count` or `ext_count` wrong and the checker complains.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let (target, link) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_file(parent, &units("orig.bin"))
+                .expect("create");
+            writable
+                .write_file_contents(target, &[4u8; 700])
+                .expect("contents");
+            let link = writable
+                .create_hard_link(parent, &units("alias.bin"), target)
+                .expect("link");
+            (target, link)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+
+    let file_count_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().file_count
+    };
+
+    let removed = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .remove(parent, &units("alias.bin"))
+                .expect("remove the hard link")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+    assert_eq!(removed, link, "remove must return the link's CNID");
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+
+    // The link name must be gone.
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("alias.bin"))
+            .expect("lookup")
+            .is_none(),
+        "the link must no longer resolve by name"
+    );
+
+    // The inode record must be gone (linkCount dropped to zero and the
+    // indirect node was freed).
+    assert!(
+        vol.lookup_cnid(Cnid(target))
+            .expect("lookup by CNID")
+            .is_none(),
+        "the indirect node must be gone when its last link is removed"
+    );
+
+    // fileCount must drop by 2: the link record *and* the inode record.
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before - 2,
+        "fileCount must account for both the link and the inode"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "a removed hard link");
+}
+
+#[test]
+fn a_journaled_hard_link_removal_is_durable_after_reopen() {
+    // The inode's record, its thread, its freed blocks and the updated fileCount
+    // must all survive a transaction commit. `fragmented.bin` (CNID 18) has eight
+    // scattered extents, so freeing the inode's blocks exercises the overflow
+    // extents path too.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, target_cnid, file_count_before) = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        let target = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists")
+            .as_file()
+            .expect("a file")
+            .cnid
+            .0;
+        (vol.root_cnid().0, target, vol.header().file_count)
+    };
+
+    let link_cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let link = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_hard_link(parent, &units("fragmented_link.bin"), target_cnid)
+                .expect("create hard link")
+        };
+        dev.sync().expect("flush");
+        link
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable to remove");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let removed = writable
+            .remove(parent, &units("fragmented_link.bin"))
+            .expect("remove the hard link");
+        assert_eq!(removed, link_cnid, "remove returns the link's CNID");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after removal");
+    let vol = Volume::open(&dev).expect("mount after removal");
+
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("fragmented_link.bin"))
+            .expect("lookup")
+            .is_none(),
+        "the link must be gone after reopen"
+    );
+    assert!(
+        vol.lookup_cnid(Cnid(target_cnid))
+            .expect("lookup by CNID")
+            .is_none(),
+        "the indirect node must be gone after reopen"
+    );
+    // fileCount: link created (+1) and then removed (-2: link + inode).
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before + 1 - 2,
+        "fileCount must survive reopen: created one link, freed one link + one inode"
+    );
+
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "journaled hard link removal after reopen");
 }
