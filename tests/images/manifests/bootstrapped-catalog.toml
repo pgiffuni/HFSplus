@@ -14,7 +14,7 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/bootstrapped-catalog.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "7bf954c0718a0e3082cc30d628d749995b6e072fe5bfbe958a3dddcf49be7f4b"
+sha256_informational = "dd4cbbc9ccb3a2d13501e00142736a8088b5db5812b81e338495e09748071c20"
 
 [volume]
 block_size = 4096
@@ -59,7 +59,7 @@ journal = false
 unicode = true
 hard_links = false
 directory_hard_links = false
- resource_forks = false
+resource_forks = false
 xattrs = false
 finder_info = false
 compression = false
@@ -73,7 +73,7 @@ expected_error = ""
 note = "HFS+/HFSX read-only support is the milestone under test"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "OK"
-checker_output_contains = "appears to be OK"
+checker_output_contains = "consistent"

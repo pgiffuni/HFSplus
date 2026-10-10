@@ -14,7 +14,7 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/journaled-hfsplus.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "28eecc34a90fe89faa63ce8a110a3f5c6f6ef9f140b66a44288f1227bd3a5c6a"
+sha256_informational = "b7e3269ac45de3a2744caa0f6fe919070471fa037001366528bb8d9a4c352653"
 
 [volume]
 block_size = 4096
@@ -73,7 +73,7 @@ expected_error = ""
 note = "HFS+/HFSX read-only support is the milestone under test"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "OK"
-checker_output_contains = "appears to be OK"
+checker_output_contains = "consistent"

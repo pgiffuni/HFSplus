@@ -453,9 +453,10 @@ fn an_in_filesystem_journal_is_not_reported_as_external() {
 fn the_independent_checker_accepts_the_external_journal_image() {
     // This is not an exotic state -- it is what a Time Machine volume looks like
     // -- so the checker should accept a volume whose journal it cannot replay
-    // rather than call it damaged.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
+    // rather than call it damaged. The in-tree hfsck is read-only, so no copy
+    // is needed.
+    let Some(hfsck) = common::hfsck_available() else {
+        eprintln!("skipping: hfsck binary not built");
         return;
     };
     let path = common::repo_root().join("tests/images/replayed/journal-external.img");
@@ -463,25 +464,22 @@ fn the_independent_checker_accepts_the_external_journal_image() {
         eprintln!("skipping: {} not built", path.display());
         return;
     }
-    let mut probe = std::env::temp_dir();
-    probe.push(format!("hfsplus-external-{}.img", std::process::id()));
-    std::fs::copy(&path, &probe).expect("copy for fsck");
+    let before = std::fs::read(&path).expect("read original");
 
-    let out = common::run_fsck(&fsck, &probe);
+    let out = common::run_hfsck(&hfsck, &path).expect("spawn hfsck");
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let after = std::fs::read(&probe).expect("read the probe back");
-    let _ = std::fs::remove_file(&probe);
 
     assert!(
-        text.contains("appears to be OK"),
-        "expected a sound volume:\n{text}"
+        out.status.success(),
+        "expected a sound volume (external journal):\n{text}"
     );
+    let after = std::fs::read(&path).expect("read the image back");
     assert_eq!(
-        digest(&std::fs::read(&path).expect("read the original")),
+        digest(&before),
         digest(&after),
         "the checker modified the image:\n{text}"
     );
@@ -731,9 +729,16 @@ fn a_journal_header_pointing_at_its_own_header_is_refused() {
 /// reader's job rather than the checker's.
 #[test]
 fn the_milestone_criteria_hold_for_every_journaled_image() {
+    // The in-tree hfsck (read-only) and the external fsck.hfsplus (read-write)
+    // both verify image consistency. hfsck is preferred: it needs no copy and
+    // cannot repair what it examines. The external checker is still used when
+    // available, because it independently accepts/rejects and documents repair
+    // behavior.
+    let hfsck = common::hfsck_available();
     let fsck = common::fsck_available();
-    if fsck.is_none() {
-        eprintln!("skipping the fsck column: fsck.hfsplus not installed");
+    if hfsck.is_none() && fsck.is_none() {
+        eprintln!("skipping: neither hfsck binary nor fsck.hfsplus installed");
+        return;
     }
 
     let mut names: Vec<String> = Vec::new();
@@ -799,6 +804,25 @@ fn the_milestone_criteria_hold_for_every_journaled_image() {
             before, after,
             "{entry}: reading the image modified the source"
         );
+
+        if let Some(hfsck) = &hfsck {
+            // hfsck replays the journal, so images with deliberately corrupted
+            // journals (journal-bad-*) are expected to fail the check. Only
+            // run hfsck on images where the journal itself is sound.
+            let entry_stem = entry.split('/').next_back().unwrap_or(entry);
+            if !entry_stem.starts_with("journal-bad-") {
+                let out = common::run_hfsck(hfsck, &path).expect("spawn hfsck");
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    out.status.success(),
+                    "{entry}: hfsck rejected a sound image:\n{text}"
+                );
+            }
+        }
 
         if let Some(fsck) = &fsck {
             let mut probe = std::env::temp_dir();

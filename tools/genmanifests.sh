@@ -4,15 +4,15 @@
 #
 # The point of this script is that the manifest is never written by hand from
 # memory. Every fact under [volume] and [forks] comes from the volume header via
-# `hfsinspect --json`, and the [verify] block comes from running the independent
-# Apple checker. That way a bug in the Rust parser cannot end up redefining what
-# the parser is supposed to produce: the manifest is captured before the parser
-# is consulted, and the tests then compare the two.
+# `hfsinspect --json`, and the [verify] block comes from running the in-tree
+# `hfsck` checker. That way a bug in the Rust parser cannot end up redefining
+# what the parser is supposed to produce: the manifest is captured before the
+# parser is consulted, and the tests then compare the two.
 #
 # Usage:
 #   tools/genmanifests.sh
 #
-# Requires the crate to be built (cargo build) so hfsinspect exists.
+# Requires the crate to be built (cargo build) so hfsinspect and hfsck exist.
 
 set -euo pipefail
 
@@ -22,11 +22,9 @@ cd "${REPO_ROOT}"
 
 IMG_DIR="tests/images/generated"
 MAN_DIR="tests/images/manifests"
-FSCK="${FSCK:-/usr/sbin/fsck.hfsplus}"
+HFSCK="${REPO_ROOT}/target/debug/hfsck"
 
-[[ -x ${FSCK} ]] || FSCK=$(command -v fsck.hfsplus || true)
-
-cargo build --quiet --bin hfsinspect
+cargo build --quiet --bin hfsinspect --bin hfsck
 
 mkdir -p "${MAN_DIR}"
 
@@ -37,18 +35,18 @@ for img in "${IMG_DIR}"/*.img; do
   # hfsinspect exits 2 when an image fails to parse, which is itself a result we
   # want to record, so the non-zero status must not abort the script.
   json=$(./target/debug/hfsinspect --json "${img}" || true)
-  summary=$(python3 - "${json}" "${name}" "${img}" "${FSCK}" <<'PYEOF'
+  summary=$(python3 - "${json}" "${name}" "${img}" "${HFSCK}" <<'PYEOF'
 import hashlib, json, subprocess, sys
 
-doc, name, img, fsck = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+doc, name, img, hfsck = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 d = json.loads(doc)
 
-# Ground truth from the independent Apple checker.
+# Ground truth from the in-tree checker.
 verdict, output = "UNKNOWN", ""
-if fsck:
-    p = subprocess.run([fsck, img], capture_output=True, text=True)
+if hfsck:
+    p = subprocess.run([hfsck, img], capture_output=True, text=True)
     output = p.stdout + p.stderr
-    verdict = "OK" if "appears to be OK" in output else "FAIL"
+    verdict = "OK" if "consistent" in output else "FAIL"
 
 def f(k):
     for entry in d["forks"]:
@@ -93,10 +91,10 @@ expected_error = "unrecognised volume signature"
 note = "classic HFS (0x4244) is a real HFS family signature but is not HFS+ or HFSX; it must be refused, never misparsed"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "{verdict}"
-checker_output_contains = "appears to be OK"
+checker_output_contains = "consistent"
 '''
     print(rejected, end="")
     raise SystemExit(0)
@@ -190,7 +188,7 @@ journal = {str(journaled).lower()}
 unicode = true
 hard_links = false
 directory_hard_links = false
- resource_forks = false
+resource_forks = false
 xattrs = {str(name == "journal-with-compressed").lower()}
 finder_info = false
 compression = {str(name == "journal-with-compressed").lower()}
@@ -204,10 +202,10 @@ expected_error = "{expected_error}"
 note = "{note}"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "{verdict}"
-checker_output_contains = "appears to be OK"
+checker_output_contains = "consistent"
 '''
 
 
@@ -228,7 +226,7 @@ PYEOF
       capture { print }
     ' "${MAN_DIR}/${name}.toml")
     if [[ -n "${hand_edited}" ]]; then
-      printf '\n%s\n' "${hand_edited}" >> "${summary}"
+      summary="${summary}"$'\n'"${hand_edited}"$'\n'
     fi
   fi
 

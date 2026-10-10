@@ -14,7 +14,7 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/journal-with-attributes.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "59622ea9dc908d858f1f2fc95dc2a1bb28c8ae4bfb0a703f00564e74b529a8cf"
+sha256_informational = "f667ea845d19f1d8b9cd28aac03a0811c5e7cd0ad4ddfd6023762b3dba81416b"
 
 [volume]
 block_size = 4096
@@ -59,7 +59,7 @@ journal = true
 unicode = true
 hard_links = false
 directory_hard_links = false
- resource_forks = false
+resource_forks = false
 xattrs = false
 finder_info = false
 compression = false
@@ -73,7 +73,7 @@ expected_error = ""
 note = "HFS+/HFSX read-only support is the milestone under test"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "OK"
-checker_output_contains = "appears to be OK"
+checker_output_contains = "consistent"

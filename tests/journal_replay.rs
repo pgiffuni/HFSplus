@@ -266,12 +266,12 @@ fn replay_never_modifies_the_image() {
 
 #[test]
 fn the_independent_checker_accepts_a_replayed_image() {
-    // fsck.hfsplus reads the image directly, so it sees the filesystem as it is
-    // on disk. Because the transaction rewrites a block the filesystem does not
-    // reference, the filesystem must still be sound. Run on a COPY: fsck repairs
-    // as well as reports, and pointing it at a fixture would rewrite it.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
+    // The in-tree hfsck reads the image as it is on disk. Because the
+    // transaction rewrites a block the filesystem does not reference, the
+    // filesystem must remain sound even before replay. hfsck is read-only and
+    // needs no copy.
+    let Some(hfsck) = common::hfsck_available() else {
+        eprintln!("skipping: hfsck binary not built");
         return;
     };
     for (name, _, _) in replayed() {
@@ -279,21 +279,16 @@ fn the_independent_checker_accepts_a_replayed_image() {
         if !path.exists() {
             continue;
         }
-        let mut probe = std::env::temp_dir();
-        probe.push(format!("hfsplus-journal-{name}-{}.img", std::process::id()));
-        std::fs::copy(&path, &probe).expect("copy for fsck");
-
-        let out = common::run_fsck(&fsck, &probe);
+        let out = common::run_hfsck(&hfsck, &path).expect("spawn hfsck");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         );
-        let _ = std::fs::remove_file(&probe);
 
         assert!(
-            text.contains("appears to be OK"),
-            "{name}: fsck.hfsplus rejected a replayed image:\n{text}"
+            out.status.success(),
+            "{name}: hfsck rejected a replayed image:\n{text}"
         );
     }
 }

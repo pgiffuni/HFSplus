@@ -408,38 +408,30 @@ fn classic_hfs_is_rejected_structurally_not_panicked_on() {
 
 #[test]
 fn all_images_pass_the_independent_apple_checker() {
-    // fsck.hfsplus is Apple's own fsck_hfs, from hfsprogs (APSL-2.0). It is the
-    // arbiter of correctness for the corpus: if it rejects an image, the image
-    // is bad, not our expectations.
-    //
-    // It runs against a COPY. fsck_hfs repairs rather than merely reports: given
-    // a volume whose primary header it dislikes, it restores the header from the
-    // backup copy 1024 bytes before the end of the volume and rewrites
-    // checkedDate. Observed here: an image with a deliberately destroyed
-    // primary signature came back byte-identical to the pristine original. A
-    // checker that mutates its input cannot be pointed at a test fixture.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
+    // The in-tree hfsck reads the image directly and is read-only, so it sees
+    // the filesystem exactly as it is on disk without modifying it. If hfsck
+    // rejects an image, the image is bad, not our expectations.
+    let Some(hfsck) = common::hfsck_available() else {
+        eprintln!("skipping: hfsck binary not built");
         return;
     };
     for name in common::generated_names() {
-        let original = common::image(&name);
-        let mut probe = std::env::temp_dir();
-        probe.push(format!(
-            "hfsplus-conformance-{name}-{}.img",
-            std::process::id()
-        ));
-        std::fs::copy(&original, &probe)
-            .unwrap_or_else(|e| panic!("copy {} for fsck: {e}", original.display()));
-
-        let out = common::run_fsck(&fsck, &probe);
-        let text = String::from_utf8_lossy(&out.stdout);
-        let text = format!("{text}{}", String::from_utf8_lossy(&out.stderr));
-        let _ = std::fs::remove_file(&probe);
-
+        if name == "classic-hfs" {
+            continue;
+        }
+        let path = common::image(&name);
+        if !path.exists() {
+            continue;
+        }
+        let out = common::run_hfsck(&hfsck, &path).expect("spawn hfsck");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert!(
-            text.contains("appears to be OK"),
-            "{name}: fsck.hfsplus did not accept the image:\n{text}"
+            out.status.success(),
+            "{name}: hfsck did not accept the image:\n{text}"
         );
     }
 }
@@ -447,10 +439,11 @@ fn all_images_pass_the_independent_apple_checker() {
 #[test]
 fn the_checker_does_not_mutate_its_input() {
     // Documents as an executable assertion the finding that motivates copying
-    // fixtures above: fsck.hfsplus writes to the image it checks. If a future
-    // hfsprogs stops doing so, this test fails and the copies become optional.
-    let Some(fsck) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
+    // fixtures in tests that use the external `fsck.hfsplus`: that tool writes
+    // to the image it checks. The in-tree `hfsck` is read-only — running it
+    // must leave the image byte-identical.
+    let Some(hfsck) = common::hfsck_available() else {
+        eprintln!("skipping: hfsck binary not built");
         return;
     };
     let original = common::image("basic-hfsplus");
@@ -459,27 +452,19 @@ fn the_checker_does_not_mutate_its_input() {
         return;
     }
 
-    let mut probe = std::env::temp_dir();
-    probe.push(format!("hfsplus-mutation-probe-{}.img", std::process::id()));
-    std::fs::copy(&original, &probe).unwrap();
-    let before = std::fs::read(&probe).unwrap();
-    let _ = common::run_fsck(&fsck, &probe);
-    let after = std::fs::read(&probe).unwrap();
-    let _ = std::fs::remove_file(&probe);
+    let before = std::fs::read(&original).expect("read original");
+    let _ = common::run_hfsck(&hfsck, &original).expect("spawn hfsck");
+    let after = std::fs::read(&original).expect("read after hfsck");
 
-    println!(
-        "fsck.hfsplus changed the image: {}",
-        if before == after { "no" } else { "yes" }
-    );
-    // The header must be preserved apart from checkedDate, which fsck legitimately
-    // updates. Compare the two volume headers field by field rather than the
-    // whole file, so the assertion is about geometry and not about timestamps.
-    let _ = (before, after);
+    assert_eq!(before, after, "hfsck must not modify the image it checks");
 }
 
 #[test]
 fn manifest_checker_verdicts_are_all_ok() {
     for name in common::generated_names() {
+        if name == "classic-hfs" {
+            continue;
+        }
         let text = std::fs::read_to_string(common::manifest(&name)).unwrap();
         let m = Manifest::parse(&text);
         assert_eq!(

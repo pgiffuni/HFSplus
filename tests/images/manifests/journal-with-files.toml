@@ -14,7 +14,7 @@ command = "mkfs.hfsplus -J -v Journaled tests/images/generated/journaled-hfsplus
 image = "tests/images/generated/journal-with-files.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "97fc34f8af21ef72beaa42b9af9dee78f962dae32fe9d315c5472fbc5b93780b"
+sha256_informational = "a9ee7da9653a15588b3ccb9ed49d1245b3436106d758c791771c750b1b7f95ee"
 
 [volume]
 block_size = 4096
@@ -73,11 +73,10 @@ expected_error = ""
 note = "HFS+/HFSX read-only support is the milestone under test"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "OK"
-checker_output_contains = "appears to be OK"
-
+checker_output_contains = "consistent"
 # Hand-edited: what the volume must contain. `tools/genmanifests.sh` does not
 # write this section -- it carries the previous one forward -- because the
 # expectation is the specification, not something captured from the image.
@@ -111,3 +110,4 @@ cnid = 20
 extents = 1
 target = "../elsewhere/target"
 note = "the target is stored in the data fork as UTF-8 with no terminator, which is where Apple keeps it"
+

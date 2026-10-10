@@ -14,7 +14,7 @@ command = "see tools/genimages.sh"
 image = "tests/images/generated/hfsx-case-sensitive.img"
 # Images embed creation timestamps, so this digest changes on regeneration.
 # It is recorded for provenance, not used as a byte-exact test fixture.
-sha256_informational = "e978a2adbc034aa8d97d3646b24cb0bacd6f8945e58b35ed046efc4bc744485b"
+sha256_informational = "5a889cf39aa7f0f522c04c69c74c96490143d8d835a55d153ede477f33008159"
 
 [volume]
 block_size = 4096
@@ -59,7 +59,7 @@ journal = false
 unicode = true
 hard_links = false
 directory_hard_links = false
- resource_forks = false
+resource_forks = false
 xattrs = false
 finder_info = false
 compression = false
@@ -73,7 +73,7 @@ expected_error = ""
 note = "HFS+/HFSX read-only support is the milestone under test"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
+checker = "hfsck"
+checker_version = "in-tree"
 verdict = "OK"
-checker_output_contains = "appears to be OK"
+checker_output_contains = "consistent"

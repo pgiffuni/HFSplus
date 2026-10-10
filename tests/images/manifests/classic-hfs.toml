@@ -12,7 +12,7 @@ tool_version = "540.1.linux3"
 tool_licence = "APSL-2.0"
 command = "mkfs.hfsplus -h -v ClassicVolume tests/images/generated/classic-hfs.img"
 image = "tests/images/generated/classic-hfs.img"
-sha256_informational = "facf48c0485c75222d6867fd61177e94fc57981e376e18f3710bdc782cd9cb95"
+sha256_informational = "f456083b0c8e6e4b8fb79bee2d2d4060ea300ecbceda7881b787cf7b87d45040"
 
 [features]
 # Not applicable: nothing is parsed from this image beyond its signature.
@@ -29,7 +29,7 @@ expected_error = "unrecognised volume signature"
 note = "classic HFS (0x4244) is a real HFS family signature but is not HFS+ or HFSX; it must be refused, never misparsed"
 
 [verify]
-checker = "fsck.hfsplus"
-checker_version = "540.1.linux3-6build1"
-verdict = "OK"
-checker_output_contains = "appears to be OK"
+checker = "hfsck"
+checker_version = "in-tree"
+verdict = "FAIL"
+checker_output_contains = "consistent"

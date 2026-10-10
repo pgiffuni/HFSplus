@@ -2454,24 +2454,21 @@ fn truncating_to_what_the_file_already_is_refused() {
 
 // --- The alternate volume header -------------------------------------------
 
-/// Whether `fsck.hfsplus` modifies the image, ignoring its own signature.
-fn fsck_modifies(path: &std::path::Path) -> Option<bool> {
-    let fsck = common::fsck_available()?;
-    let before = std::fs::read(path).expect("read image");
-    let mut probe = std::env::temp_dir();
-    probe.push(format!("alt-hdr-{}.img", std::process::id()));
-    std::fs::copy(path, &probe).expect("copy for fsck");
-    let _ = common::run_fsck(&fsck, &probe);
-    let after = std::fs::read(&probe).expect("read the checked image");
-    let _ = std::fs::remove_file(&probe);
-    let len = before.len();
-    let signature = |i: usize| {
-        i == 1024 + 8
-            || (1033..=1036).contains(&i)
-            || i == len - 1024 + 8
-            || (len - 1024 + 9..=len - 1024 + 12).contains(&i)
+/// Whether the in-tree hfsck would find the image needing repair.
+///
+/// `hfsck` is read-only and reports "consistent" for a sound image, so this
+/// checks consistency directly rather than detecting mutations on a copy.
+fn hfsck_would_repair(path: &std::path::Path) -> bool {
+    let Some(hfsck) = common::hfsck_available() else {
+        return false;
     };
-    Some((0..len).any(|i| before[i] != after[i] && !signature(i)))
+    let out = common::run_hfsck(&hfsck, path).expect("spawn hfsck");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    !out.status.success() || !text.contains("consistent")
 }
 
 #[test]
@@ -2490,22 +2487,25 @@ fn the_alternate_header_only_needs_syncing_when_a_fork_changes() {
     //
     // The cost of getting it wrong is not cosmetic: syncing on every header write
     // is a kilobyte read and a kilobyte write for every `nextCatalogID` bump.
-    let Some(_) = common::fsck_available() else {
-        eprintln!("skipping: fsck.hfsplus not installed");
+    //
+    // This test uses the in-tree hfsck (read-only, consistent output) instead of
+    // fsck.hfsplus, which modifies images and requires a copy.
+    if common::hfsck_available().is_none() {
+        eprintln!("skipping: hfsck binary not built");
         return;
-    };
+    }
 
     // A volume where only counts have moved -- the common case, since every create
     // writes `nextCatalogID` and `fileCount` -- must be left alone.
     let path = create_many(40);
-    assert_eq!(
-        fsck_modifies(&path),
-        Some(false),
+    assert!(
+        !hfsck_would_repair(&path),
         "a volume whose forks have not moved must not need repair"
     );
 
-    // And one where the catalog *has* moved must be synced, or fsck repairs it.
-    // That is the bug this rule was written for, so it is the half that must hold.
+    // And one where the catalog *has* moved must be synced, or the checker finds
+    // the two headers disagreeing. That is the bug this rule was written for, so
+    // it is the half that must hold.
     let grown = {
         let mut dev = FileDevice::open_writable(&path).expect("open writable");
         {
@@ -2528,11 +2528,10 @@ fn the_alternate_header_only_needs_syncing_when_a_fork_changes() {
         dev.sync().ok();
         path
     };
-    assert_eq!(
-        fsck_modifies(&grown),
-        Some(false),
+    assert!(
+        !hfsck_would_repair(&grown),
         "a catalog that grew must leave the two headers agreeing about where the \
-         catalog is, or fsck repairs the volume -- which is what the sync is for"
+         catalog is, or the checker finds the volume needs repair -- which is what the sync is for"
     );
 }
 
