@@ -601,6 +601,7 @@ impl FileRecord {
         dst.fill(0);
         dst[0..2].copy_from_slice(&self.record_type.to_be_bytes());
         dst[2..4].copy_from_slice(&self.flags.to_be_bytes());
+        dst[4..8].copy_from_slice(&self.reserved1.to_be_bytes());
         dst[8..12].copy_from_slice(&self.file_id.0.to_be_bytes());
         dst[12..16].copy_from_slice(&self.create_date.to_be_bytes());
         dst[16..20].copy_from_slice(&self.content_mod_date.to_be_bytes());
