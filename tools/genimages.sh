@@ -2,10 +2,11 @@
 #
 # Build the generated slice of the HFS+ test corpus.
 #
-# Every image is produced by `mkfs.hfsplus` (hfsprogs 540.1, APSL-2.0, Apple).
-# It is an external process, not a dependency of the crate: this project's
-# licence obligations are unaffected, and the corpus stays reproducible on any
-# machine with hfsprogs installed.
+# Every image is produced by the in-tree `hnewfs` (built from
+# `src/format/writer.rs`). It is the project's own formatter, so this script has
+# no external dependency beyond a working Rust toolchain. `mkfs.hfsplus` is
+# retained only as a fallback and only when `hnewfs` cannot produce the image
+# (classic HFS, for which there is no in-tree formatter).
 #
 # Determinism
 # -----------
@@ -34,23 +35,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 OUT_DIR="${REPO_ROOT}/${OUT_DIR#"${REPO_ROOT}"/}"
 
-MKDIR=$(command -v mkfs.hfsplus || true)
-if [[ -z "${MKDIR}" ]]; then
+# The in-tree formatter. Built from src/format/writer.rs via src/bin/hnewfs.rs.
+cargo build --quiet --bin hnewfs --bin hfsck
+HNEWFS="${REPO_ROOT}/target/debug/hnewfs"
+HFSCK="${REPO_ROOT}/target/debug/hfsck"
+
+# Fallback to mkfs.hfsplus only when hnewfs cannot produce the image.
+MKFS=$(command -v mkfs.hfsplus || true)
+if [[ -z "${MKFS}" ]]; then
   for candidate in /usr/sbin/mkfs.hfsplus /sbin/mkfs.hfsplus; do
-    [[ -x ${candidate} ]] && MKDIR=${candidate} && break
+    [[ -x ${candidate} ]] && MKFS=${candidate} && break
   done
 fi
-if [[ -z "${MKDIR}" ]]; then
-  echo "error: mkfs.hfsplus not found (install hfsprogs)" >&2
-  exit 1
-fi
-
-cargo build --quiet --bin hfsck
-HFSCK="${REPO_ROOT}/target/debug/hfsck"
 
 mkdir -p "${OUT_DIR}"
 
-# make_image <name> <size-MiB> <mkfs-args...>
+# make_image <name> <size-MiB> <hnewfs-args...>
 make_image() {
   local name="$1"; shift
   local size_mb="$1"; shift
@@ -65,13 +65,32 @@ make_image() {
   # Create sparse: an HFS+ volume is mostly free space, so allocating the
   # blocks up front wastes both time and disk.
   truncate -s "${bytes}" "${img}"
-  "${MKDIR}" "$@" "${img}" >/dev/null
+  "${HNEWFS}" "$@" "${img}" >/dev/null
+  echo "  + ${name}.img ($(( $(stat -c %s "${img}") / 1024 / 1024 )) MiB)  hnewfs $*"
+}
+
+# make_image_mkfs <name> <size-MiB> <mkfs-args...>
+# Use the external mkfs.hfsplus — only for images hnewfs cannot build.
+make_image_mkfs() {
+  local name="$1"; shift
+  local size_mb="$1"; shift
+  local img="${OUT_DIR}/${name}.img"
+  local bytes=$(( size_mb * 1024 * 1024 ))
+
+  if [[ -f ${img} && ${FORCE} -eq 0 ]]; then
+    echo "  = ${name}.img (exists, skipped; use --force to rebuild)"
+    return 0
+  fi
+
+  truncate -s "${bytes}" "${img}"
+  "${MKFS}" "$@" "${img}" >/dev/null
   echo "  + ${name}.img ($(( $(stat -c %s "${img}") / 1024 / 1024 )) MiB)  mkfs.hfsplus $*"
 }
 
-echo "mkfs.hfsplus : ${MKDIR}"
-echo "hfsck         : ${HFSCK}"
-echo "output       : ${OUT_DIR}"
+echo "hnewfs         : ${HNEWFS}"
+echo "hfsck          : ${HFSCK}"
+echo "mkfs.hfsplus   : ${MKFS:-not found}"
+echo "output         : ${OUT_DIR}"
 echo
 
 echo "BASIC"
@@ -100,9 +119,13 @@ make_image journaled-hfsplus    1 -v "Journaled" -J
 make_image journaled-hfsplus-1k  1 -v "Journaled1K" -J -b 1024
 
 echo "LEGACY"
-# -h creates a classic HFS volume wrapped for Mac OS 9 bootability. This crate
-# must recognise the signature and refuse it cleanly, not misparse it.
-make_image classic-hfs          1 -h -v "ClassicVolume"
+# -h creates a classic HFS volume wrapped for Mac OS 9 bootability. hnewfs does
+# not support classic HFS, so this falls back to mkfs.hfsplus if available.
+if [[ -n "${MKFS:-}" ]]; then
+  make_image_mkfs classic-hfs          1 -h -v "ClassicVolume"
+else
+  echo "  -- classic-hfs.img (skipped: mkfs.hfsplus not found)"
+fi
 
 echo
 echo "JOURNAL REPLAY"

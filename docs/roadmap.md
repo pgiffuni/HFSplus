@@ -55,7 +55,7 @@ input: every field, offset, and count is bounds-checked.
 | 14 | Writable volume — resource fork mutation | Complete: write_resource_fork with block allocation, journal transaction, and crash/replay tests |
 | 15 | Catalog extent-overflow growth | Complete: grow_fork_of spills to Extents B-tree; write_file_contents_inner and write_resource_fork_inner resolve overflow blocks via ExtentMapper; release_resource_fork_blocks frees overflow groups on truncation; leaf splits and depth-1 tree splits supported; test for 9-block resource fork round-trip with fsck verification |
 | 16 | In-tree checker (hfsck) | Done — see roadmap-write-fsck.md |
-| 17 | In-tree formatter (mkfs) | Not started |
+| 17 | In-tree formatter (hnewfs) | Done — `src/format/writer.rs` creates HFS+/HFSX volumes with and without journal; `src/bin/hnewfs.rs` CLI; verified by `hfsck` |
 | 18 | FUSE adapter (P0) | In progress — `hfsplus-fuse` crate with read/write filesystem |
 | 19 | FUSE adapter (P1) | Complete: xattr, LSEEK, READDIRPLUS, compression-aware READ, compressed-file write rejection |
 | 20 | FUSE adapter (P2) | Complete: BMAP, FALLOCATE (punch_hole zeroes data), COPY_FILE_RANGE |

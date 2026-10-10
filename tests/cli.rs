@@ -38,6 +38,16 @@ fn hfsinspect(args: &[&str]) -> Output {
     run(env!("CARGO_BIN_EXE_hfsinspect"), args)
 }
 
+/// Run `hnewfs` with `args`.
+fn hnewfs(args: &[&str]) -> Output {
+    run(env!("CARGO_BIN_EXE_hnewfs"), args)
+}
+
+/// Run `hfsck` with `args`.
+fn hfsck(args: &[&str]) -> Output {
+    run(env!("CARGO_BIN_EXE_hfsck"), args)
+}
+
 fn run(bin: &str, args: &[&str]) -> Output {
     Command::new(bin)
         .args(args)
@@ -727,4 +737,151 @@ fn digest(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x100_0000_01b3);
     }
     h
+}
+
+// --- hnewfs ---------------------------------------------------------------
+
+/// Create a sparse image file of `size_mb` megabytes and return its path.
+/// `hnewfs` determines the device size from the file length.
+fn fresh_image(size_mb: u64) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut path = std::env::temp_dir();
+    path.push(format!("hnewfs-test-{}-{}.img", std::process::id(), n));
+    let file = std::fs::File::create(&path).unwrap();
+    file.set_len(size_mb * 1024 * 1024).unwrap();
+    drop(file);
+    path.to_string_lossy().to_string()
+}
+
+#[test]
+fn hnewfs_help_succeeds() {
+    let out = hnewfs(&["-h"]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let text = stderr(&out);
+    assert!(
+        text.contains("Construct an HFS+ file system"),
+        "got:\n{text}"
+    );
+}
+
+#[test]
+fn hnewfs_without_arguments_is_a_usage_error() {
+    let out = hnewfs(&[]);
+    assert_ne!(code(&out), 0, "should error without a device");
+    assert!(
+        stderr(&out).contains("usage"),
+        "should print usage: {}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn hnewfs_creates_a_basic_volume() {
+    let img = fresh_image(1);
+    let out = hnewfs(&["-v", "TestVolume", &img]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    // hfsck must find the result consistent.
+    let check = hfsck(&[&img]);
+    assert_eq!(code(&check), 0, "{}", stdout(&check));
+    assert!(
+        stdout(&check).contains("consistent"),
+        "got:\n{}",
+        stdout(&check)
+    );
+
+    // The signature must be HFS+ (0x482B).
+    let data = std::fs::read(&img).unwrap();
+    let sig = [data[1024], data[1025]];
+    assert_eq!(sig, [0x48, 0x2b], "expected HFS+ signature, got {sig:02x?}");
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn hnewfs_creates_a_case_sensitive_volume() {
+    let img = fresh_image(1);
+    let out = hnewfs(&["-v", "CaseSensitive", "-s", &img]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let check = hfsck(&[&img]);
+    assert_eq!(code(&check), 0, "{}", stdout(&check));
+
+    // The signature must be HFSX (0x4858).
+    let data = std::fs::read(&img).unwrap();
+    let sig = [data[1024], data[1025]];
+    assert_eq!(sig, [0x48, 0x58], "expected HFSX signature, got {sig:02x?}");
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn hnewfs_creates_a_journaled_volume() {
+    let img = fresh_image(2);
+    let out = hnewfs(&["-v", "Journaled", "-J", &img]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let check = hfsck(&[&img]);
+    assert_eq!(code(&check), 0, "{}", stdout(&check));
+
+    let ls = hfsls(&["-j", &img]);
+    assert_eq!(code(&ls), 0, "{}", stderr(&ls));
+    let ls_out = stdout(&ls);
+    assert!(
+        ls_out.contains("journaled:       true"),
+        "a -J volume must report a journal:\n{ls_out}"
+    );
+    assert!(
+        ls_out.contains("uninitialised:   true"),
+        "a fresh journal has no transactions yet:\n{ls_out}"
+    );
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn hnewfs_respects_a_custom_block_size() {
+    let img = fresh_image(2);
+    let out = hnewfs(&["-v", "LargeBlocks", "-b", "8192", &img]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+
+    let check = hfsck(&[&img]);
+    assert_eq!(code(&check), 0, "{}", stdout(&check));
+
+    // The volume header's blockSize field is at offset 1024 + 40 (u32 BE).
+    let data = std::fs::read(&img).unwrap();
+    let block_size = u32::from_be_bytes([data[1064], data[1065], data[1066], data[1067]]);
+    assert_eq!(
+        block_size, 8192,
+        "expected 8192-byte blocks, got {block_size}"
+    );
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn hnewfs_rejects_an_oversized_volume_name() {
+    let name = "x".repeat(300);
+    let img = fresh_image(1);
+    let out = hnewfs(&["-v", &name, &img]);
+    let _ = std::fs::remove_file(&img);
+    assert_ne!(code(&out), 0, "should reject oversized name");
+}
+
+#[test]
+fn hnewfs_rejects_an_invalid_block_size() {
+    let img = fresh_image(1);
+    let out = hnewfs(&["-v", "Test", "-b", "100", &img]);
+    let _ = std::fs::remove_file(&img);
+    assert_ne!(code(&out), 0, "should reject non-power-of-two block size");
+}
+
+#[test]
+fn hnewfs_rejects_a_non_power_of_two_block_size() {
+    let img = fresh_image(1);
+    let out = hnewfs(&["-v", "Test", "-b", "500", &img]);
+    let _ = std::fs::remove_file(&img);
+    assert_ne!(code(&out), 0, "should reject non-power-of-two block size");
 }
