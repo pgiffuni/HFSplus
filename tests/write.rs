@@ -1827,6 +1827,57 @@ fn a_link_is_not_a_target() {
 }
 
 #[test]
+fn a_directory_link_is_not_a_target() {
+    // `create_hard_link` must refuse to link through a directory hard link:
+    // the target must be the indirect node (the original directory), not one
+    // of its link records.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+    let link = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder");
+            writable
+                .create_hard_link(parent, &units("alias_dir"), target)
+                .expect("dir link")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+    let mut dev = FileDevice::open_writable(&path).expect("open writable");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let err = writable
+            .create_hard_link(parent, &units("third_dir"), link)
+            .expect_err("a directory link is not a target");
+        assert!(
+            format!("{err}").contains("indirect node"),
+            "the refusal must point at the indirect node; got: {err}"
+        );
+    }
+    dev.sync().expect("flush");
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("third_dir"))
+            .expect("lookup")
+            .is_none(),
+        "the refused link must not exist"
+    );
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "refused dir link-to-link");
+}
+
+#[test]
 fn a_journaled_hard_link_chain_survives_reopen() {
     // On a journaled volume, two links + chain pointers + linkCount must all
     // survive a transaction commit and reopen. Using `fragmented.bin` (CNID 18,
@@ -4140,6 +4191,292 @@ fn a_journaled_hard_link_removal_is_durable_after_reopen() {
 }
 
 #[test]
+fn a_journaled_directory_hard_link_is_durable_after_reopen() {
+    // A directory hard link leaves the original directory in place as the
+    // indirect node (chain flag set, hl_firstLinkID pointing at the head) and
+    // adds a link record + thread. All catalog changes and the volume-header
+    // folderCount/nextCatalogID advance must survive a transaction commit
+    // and reopen.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, folder_count_before, next_before) = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        (
+            vol.root_cnid().0,
+            vol.header().folder_count,
+            vol.header().next_catalog_id,
+        )
+    };
+
+    // Create a directory to link to.
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let link_cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_hard_link(parent, &units("alias_dir"), target)
+                .expect("create dir hard link should succeed")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open for reading after link");
+    let vol = Volume::open(&dev).expect("mount after link");
+    let link_obj = vol
+        .lookup(vol.root_cnid(), &units("alias_dir"))
+        .expect("lookup")
+        .expect("link must survive reopen");
+    let link_dir = match &link_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for the link"),
+    };
+    assert_eq!(
+        link_dir.bsd_info.special, target,
+        "link references the original directory"
+    );
+    // The inode must survive with link count 1.
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive reopen");
+    let inode_dir = match &inode {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for the inode"),
+    };
+    assert_eq!(inode_dir.bsd_info.special, 1, "inode reports one link");
+    assert!(link_dir.cnid.0 != target, "link has its own CNID");
+    assert!(
+        link_dir.cnid.0 == link_cnid,
+        "link CNID matches returned value"
+    );
+    assert!(
+        vol.header().next_catalog_id > next_before,
+        "nextCatalogID must advance for the dir hard link"
+    );
+    assert_eq!(
+        vol.header().folder_count,
+        folder_count_before + 2,
+        "folderCount advances for the new directory and the link"
+    );
+    assert_fsck_clean(&path, "journaled directory hard link after reopen");
+}
+
+#[test]
+fn a_journaled_directory_hard_link_chain_survives_reopen() {
+    // Two links to one directory create a chain: inode (firstLinkID=head) →
+    // link1 → link2. All must survive reopen, with the inode counting 2 links.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, folder_count_before) = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        (vol.root_cnid().0, vol.header().folder_count)
+    };
+
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let (link1, link2) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let l1 = writable
+                .create_hard_link(parent, &units("first_dir"), target)
+                .expect("first dir link");
+            let l2 = writable
+                .create_hard_link(parent, &units("second_dir"), target)
+                .expect("second dir link");
+            (l1, l2)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+
+    let dev = FileDevice::open(&path).expect("open for reading after chain");
+    let vol = Volume::open(&dev).expect("mount after chain");
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive reopen");
+    let inode_dir = match &inode {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for the inode"),
+    };
+    assert_eq!(inode_dir.bsd_info.special, 2, "inode reports two links");
+
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1")
+        .expect("link1 must exist");
+    let link1_dir = match &link1_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link1"),
+    };
+    assert_eq!(link1_dir.bsd_info.special, target, "link1 references inode");
+    assert_eq!(link1_dir.bsd_info.group_id, link2, "link1.next → link2");
+    assert_eq!(link1_dir.bsd_info.owner_id, 0, "link1 is head");
+
+    let link2_obj = vol
+        .lookup_cnid(Cnid(link2))
+        .expect("lookup link2")
+        .expect("link2 must exist");
+    let link2_dir = match &link2_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link2"),
+    };
+    assert_eq!(link2_dir.bsd_info.special, target, "link2 references inode");
+    assert_eq!(link2_dir.bsd_info.group_id, 0, "link2 is tail");
+    assert_eq!(link2_dir.bsd_info.owner_id, link1, "link2.prev → link1");
+
+    assert_eq!(
+        vol.header().folder_count,
+        folder_count_before + 3,
+        "folderCount: original dir + two links"
+    );
+    assert_fsck_clean(&path, "journaled directory hard link chain");
+}
+
+#[test]
+fn a_journaled_directory_hard_link_removal_is_durable_after_reopen() {
+    // Remove a directory hard link, then reopen: the link name is gone, the
+    // inode survives with a decremented count, and folderCount is consistent.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (parent, folder_count_before) = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        (vol.root_cnid().0, vol.header().folder_count)
+    };
+
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let link = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_hard_link(parent, &units("alias_dir"), target)
+                .expect("dir link")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable to remove");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let removed = writable
+            .remove(parent, &units("alias_dir"))
+            .expect("remove the dir hard link");
+        assert_eq!(removed, link, "remove returns the link's CNID");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after removal");
+    let vol = Volume::open(&dev).expect("mount after removal");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("alias_dir"))
+            .expect("lookup")
+            .is_none(),
+        "the link must be gone after reopen"
+    );
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive removal");
+    let inode_dir = match &inode {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for the inode"),
+    };
+    assert_eq!(
+        inode_dir.bsd_info.special, 0,
+        "inode link count back to zero"
+    );
+    assert_eq!(
+        vol.header().folder_count,
+        folder_count_before + 1,
+        "folderCount: original dir + one removed link = original dir"
+    );
+    assert_fsck_clean(&path, "journaled directory hard link removal after reopen");
+}
+
+#[test]
+fn a_failed_journaled_directory_hard_link_does_not_modify_the_image() {
+    // Creating a hard link to a non-existent target must fail before any
+    // catalog or volume-header change: the journal transaction is abandoned
+    // and the image must be byte-identical to before the attempt.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let before = std::fs::read(&path).expect("read image before");
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let err = writable
+            .create_hard_link(parent, &units("bad_link"), 99999)
+            .expect_err("target CNID 99999 must not exist");
+        assert!(
+            matches!(err, hfsplus::Error::NotFound { .. }),
+            "target not found, got {err:?}"
+        );
+        dev.sync().expect("flush");
+    }
+
+    let after = std::fs::read(&path).expect("read image after failed link");
+    assert_eq!(
+        before, after,
+        "a failed directory hard link on a journaled volume must not modify the image"
+    );
+}
+
+#[test]
 fn truncating_a_file_with_overflow_extents_deletes_the_records() {
     // A file that spills past eight inline extents must carry its extra groups
     // in the Extents B-tree. When the fork is truncated to zero, every
@@ -4238,4 +4575,687 @@ fn truncating_a_file_with_overflow_extents_deletes_the_records() {
     }
 
     assert_fsck_clean(&path, "truncating a file with overflow extents");
+}
+
+#[test]
+fn an_indirect_node_is_not_removable_while_links_exist() {
+    // The original directory (the indirect node) carries the chain flag and a
+    // non-zero firstLinkID. It must not be rmdir-able by name while any hard
+    // link still points at it — doing so would orphan the chain and leave `bsd_info.special`
+    // (the live link count) misread as a link reference.
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let t = writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder");
+            writable
+                .create_file(t, &units("note.txt"))
+                .expect("create child");
+            t
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable to link");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .create_hard_link(parent, &units("alias_dir"), target)
+            .expect("dir hard link");
+        dev.sync().expect("flush");
+    }
+
+    // Attempt to rmdir the original directory — it has an active hard link chain.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to rmdir");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let err = writable
+            .remove(parent, &units("docs"))
+            .expect_err("must not rmdir an indirect node with active links");
+        assert!(
+            format!("{err}").contains("not empty"),
+            "expected a non-empty-directory error, got: {err}"
+        );
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    // The original directory and the link must both survive.
+    let dev = FileDevice::open(&path).expect("open after failed rmdir");
+    let vol = Volume::open(&dev).expect("mount");
+    assert!(
+        vol.lookup_cnid(Cnid(target))
+            .expect("lookup inode")
+            .is_some(),
+        "original directory must survive the refused rmdir"
+    );
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("alias_dir"))
+            .expect("lookup")
+            .is_some(),
+        "the link must survive the refused rmdir"
+    );
+    let report = hfsplus::check::check(&vol, None).expect("check");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    assert_fsck_clean(&path, "refused rmdir of indirect node");
+}
+
+#[test]
+fn creating_a_directory_hard_link_and_removing_it() {
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    // Create a directory with one child so we know the original stays in place.
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder");
+            let child = writable
+                .create_file(target, &units("note.txt"))
+                .expect("create child");
+            writable
+                .write_file_contents(child, &[0xFFu8; 300])
+                .expect("write child contents");
+            target
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let folder_count_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().folder_count
+    };
+
+    // Create the first hard link to the directory.
+    let link = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable to link");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            writable
+                .create_hard_link(parent, &units("alias_dir"), target)
+                .expect("dir hard link")
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+    assert_ne!(link, target, "the link has its own CNID");
+
+    let dev = FileDevice::open(&path).expect("open after link");
+    let vol = Volume::open(&dev).expect("mount after link");
+
+    // The original directory must still exist with its child intact.
+    let inode_obj = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive");
+    match inode_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, 1, "inode reports one hard link");
+            // firstLinkID in folder_count must point at the link.
+            // (checked below via folder_count_before)
+        }
+        _ => panic!("expected a directory"),
+    }
+    // The original child must still be there.
+    let child_obj = vol
+        .lookup(Cnid(target), &units("note.txt"))
+        .expect("lookup child")
+        .expect("child must survive");
+    assert_eq!(child_obj.data_size(), 300, "child data is intact");
+
+    // The link itself must resolve and report the same inode.
+    let link_obj = vol
+        .lookup_cnid(Cnid(link))
+        .expect("lookup link")
+        .expect("link must exist");
+    match link_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(
+                d.bsd_info.special, target,
+                "link references the original directory"
+            );
+        }
+        _ => panic!("expected a directory for the link"),
+    }
+
+    // A directory hard link record is a pointer: its `bsd_info.special` holds
+    // the inode's CNID. Children live in the inode, so resolving the link
+    // through its reference yields the original directory's contents.
+    let link_obj = vol
+        .lookup(vol.root_cnid(), &units("alias_dir"))
+        .expect("lookup alias_dir")
+        .expect("alias_dir must exist");
+    let link_dir = match &link_obj {
+        Object::Directory(d) => d,
+        _ => panic!("alias_dir should be a directory"),
+    };
+    let inode_cnid = link_dir.bsd_info.special;
+    assert_eq!(inode_cnid, target, "link references the original directory");
+    let child_through_inode = vol
+        .lookup(Cnid(inode_cnid), &units("note.txt"))
+        .expect("lookup child through resolved inode")
+        .expect("child must be visible through the hard-link inode");
+    assert_eq!(
+        child_through_inode.data_size(),
+        300,
+        "child data is the same size through the link"
+    );
+    assert_eq!(
+        vol.read(&child_through_inode, 0, 4)
+            .expect("read through link"),
+        &[0xFFu8; 4],
+        "child data matches through the directory hard link"
+    );
+
+    assert_eq!(
+        vol.header().folder_count,
+        folder_count_before + 1,
+        "folderCount accounts for the link"
+    );
+    let report = hfsplus::check::check(&vol, None).expect("check after link");
+    assert!(report.is_clean(), "{:?}", report.describe());
+    drop(vol);
+    drop(dev);
+
+    // Remove the link. The directory and its child must survive.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to unlink");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("alias_dir"))
+            .expect("remove the dir hard link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    let dev = FileDevice::open(&path).expect("open after unlink");
+    let vol = Volume::open(&dev).expect("mount after unlink");
+    // The original directory and its child must be intact.
+    let inode_obj = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode after unlink")
+        .expect("inode must survive unlink");
+    match inode_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, 0, "inode link count back to zero");
+        }
+        _ => panic!("expected a directory for the inode"),
+    }
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("alias_dir"))
+            .expect("lookup")
+            .is_none(),
+        "the link name must be gone"
+    );
+    drop(vol);
+    assert_fsck_clean(&path, "a directory hard link removed");
+}
+
+#[test]
+fn multiple_directory_hard_links_chain_through_the_indirect_node() {
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let folder_count_before = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.header().folder_count
+    };
+
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder");
+            let child = writable
+                .create_file(target, &units("note.txt"))
+                .expect("create child");
+            writable
+                .write_file_contents(child, &[0xCDu8; 50])
+                .expect("write child contents");
+            target
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let (link1, link2) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let link1 = writable
+                .create_hard_link(parent, &units("first_dir"), target)
+                .expect("first dir link");
+            let link2 = writable
+                .create_hard_link(parent, &units("second_dir"), target)
+                .expect("second dir link -- must chain");
+            (link1, link2)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+    assert_ne!(link1, link2, "each link has its own CNID");
+
+    let dev = FileDevice::open(&path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive");
+    match inode {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, 2, "inode reports two links");
+        }
+        _ => panic!("expected a directory"),
+    }
+
+    // link1 is the head; its next must be link2, and link2 (the tail) has next=0.
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1")
+        .expect("link1 exists");
+    match link1_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, target, "link1 references inode");
+            assert_eq!(d.bsd_info.group_id, link2, "head's nextLinkID is link2");
+            assert_eq!(d.bsd_info.owner_id, 0, "head's prevLinkID is 0");
+        }
+        _ => panic!("expected a directory for link1"),
+    }
+
+    let link2_obj = vol
+        .lookup_cnid(Cnid(link2))
+        .expect("lookup link2")
+        .expect("link2 exists");
+    match link2_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, target, "link2 references inode");
+            assert_eq!(d.bsd_info.group_id, 0, "tail's nextLinkID is 0");
+            assert_eq!(d.bsd_info.owner_id, link1, "tail's prevLinkID is link1");
+        }
+        _ => panic!("expected a directory for link2"),
+    }
+    drop(vol);
+    drop(dev);
+
+    // Remove the tail (link2). The chain must be re-threaded: link1's next -> 0.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to remove tail");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("second_dir"))
+            .expect("remove tail link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    let dev = FileDevice::open(&path).expect("open after tail removal");
+    let vol = Volume::open(&dev).expect("mount after tail removal");
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1 after tail removal")
+        .expect("link1 must exist after tail removal");
+    match link1_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.group_id, 0, "link1 is now the tail");
+        }
+        _ => panic!("expected a directory for link1"),
+    }
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode after tail removal")
+        .expect("inode must survive");
+    match inode {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, 1, "count is 1 after tail removal");
+        }
+        _ => panic!("expected a directory for the inode"),
+    }
+    drop(vol);
+    drop(dev);
+
+    // Remove the last link. The original directory is downgraded back to a
+    // regular directory (chain flag cleared, counts zeroed) but its catalog
+    // record and thread survive, because the original name "docs" still lives
+    // in the parent.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to remove last");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("first_dir"))
+            .expect("remove the last dir hard link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    let dev = FileDevice::open(&path).expect("open after last removal");
+    let vol = Volume::open(&dev).expect("mount after last removal");
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("first_dir"))
+            .expect("lookup")
+            .is_none(),
+        "link1 name must be gone"
+    );
+    // The inode survives: its original entry "docs" is still in the parent.
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must survive — original name \"docs\" still present");
+    match inode {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.special, 0, "inode link count back to zero");
+        }
+        _ => panic!("expected a directory for the inode"),
+    }
+    assert_eq!(
+        vol.header().folder_count,
+        folder_count_before + 1,
+        "folderCount reflects the surviving inode directory"
+    );
+    assert_fsck_clean(&path, "directory hard links chain and free");
+}
+
+#[test]
+fn head_directory_hard_link_is_spliced_out_of_the_chain() {
+    // Create a 3-link chain (link1 -> link2 -> link3), then remove the head
+    // (link1). The inode's firstLinkID must advance to link2, and link2's
+    // prevLinkID must become 0 (it is the new head).
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder");
+            let child = writable
+                .create_file(target, &units("note.txt"))
+                .expect("create child");
+            writable
+                .write_file_contents(child, &[0xABu8; 300])
+                .expect("write child contents");
+            target
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let (link1, link2, link3) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let l1 = writable
+                .create_hard_link(parent, &units("first_dir"), target)
+                .expect("first dir link");
+            let l2 = writable
+                .create_hard_link(parent, &units("second_dir"), target)
+                .expect("second dir link");
+            let l3 = writable
+                .create_hard_link(parent, &units("third_dir"), target)
+                .expect("third dir link");
+            (l1, l2, l3)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+
+    // Verify the chain before removal: inode's firstLinkID -> link1.
+    let dev = FileDevice::open(&path).expect("open after links");
+    let vol = Volume::open(&dev).expect("mount after links");
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1")
+        .expect("link1 must exist");
+    let link1_dir = match &link1_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link1"),
+    };
+    assert_eq!(link1_dir.bsd_info.owner_id, 0, "link1 is head (prev = 0)");
+    drop(vol);
+    drop(dev);
+
+    // Remove the head (link1). Inode's firstLinkID -> link2, link2.prev -> 0.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to remove head");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("first_dir"))
+            .expect("remove the head link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    // Verify post-removal chain state.
+    let dev = FileDevice::open(&path).expect("open after head removal");
+    let vol = Volume::open(&dev).expect("mount after head removal");
+
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("first_dir"))
+            .expect("lookup")
+            .is_none(),
+        "head link name must be gone"
+    );
+
+    // Inode's firstLinkID must now point to link2.
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode after head removal")
+        .expect("inode must survive");
+    let inode_dir = match &inode {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory"),
+    };
+    assert_eq!(inode_dir.bsd_info.special, 2, "count dropped to 2");
+    // Inode's firstLinkID now points to link2: verified indirectly by
+    // link2 being the new head (prev = 0).
+
+    // link2 must now be the head: prevLinkID == 0.
+    let link2_obj = vol
+        .lookup_cnid(Cnid(link2))
+        .expect("lookup link2")
+        .expect("link2 must exist");
+    match link2_obj {
+        Object::Directory(ref d) => {
+            assert_eq!(d.bsd_info.owner_id, 0, "link2 is now the head (prev = 0)");
+            assert_eq!(d.bsd_info.group_id, link3, "link2.next still -> link3");
+        }
+        _ => panic!("expected a directory for link2"),
+    }
+    drop(vol);
+    drop(dev);
+
+    assert_fsck_clean(&path, "directory hard link head spliced from chain");
+}
+
+#[test]
+fn middle_directory_hard_link_is_spliced_out_of_the_chain() {
+    let path = copy_fixture(IMAGE).expect("fixture");
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let target = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let cnid = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let target = writable
+                .create_folder(parent, &units("docs"))
+                .expect("create folder");
+            writable
+                .create_file(target, &units("note.txt"))
+                .expect("create child");
+            target
+        };
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    // Create three links so we have head → middle → tail.
+    let (link1, link2, link3) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let ids = {
+            let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+            let l1 = writable
+                .create_hard_link(parent, &units("first_dir"), target)
+                .expect("first dir link");
+            let l2 = writable
+                .create_hard_link(parent, &units("second_dir"), target)
+                .expect("second dir link");
+            let l3 = writable
+                .create_hard_link(parent, &units("third_dir"), target)
+                .expect("third dir link");
+            (l1, l2, l3)
+        };
+        dev.sync().expect("flush");
+        ids
+    };
+    assert_ne!(
+        (link1, link2, link3),
+        (target, 0, 0),
+        "links have distinct CNIDs"
+    );
+
+    // After creation: head is link1 (folder_count), chain is link1 → link2 → link3.
+    let dev = FileDevice::open(&path).expect("open after links");
+    let vol = Volume::open(&dev).expect("mount after links");
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode")
+        .expect("inode must exist");
+    let inode_dir = match &inode {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory"),
+    };
+    assert_eq!(inode_dir.bsd_info.special, 3, "inode reports three links");
+
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1")
+        .expect("link1 exists");
+    let link1_dir = match &link1_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link1"),
+    };
+    assert_eq!(link1_dir.bsd_info.group_id, link2, "link1.next → link2");
+    assert_eq!(link1_dir.bsd_info.owner_id, 0, "link1 is head (prev = 0)");
+
+    let link2_obj = vol
+        .lookup_cnid(Cnid(link2))
+        .expect("lookup link2")
+        .expect("link2 exists");
+    let link2_dir = match &link2_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link2"),
+    };
+    assert_eq!(link2_dir.bsd_info.group_id, link3, "link2.next → link3");
+    assert_eq!(link2_dir.bsd_info.owner_id, link1, "link2.prev → link1");
+
+    let link3_obj = vol
+        .lookup_cnid(Cnid(link3))
+        .expect("lookup link3")
+        .expect("link3 exists");
+    let link3_dir = match &link3_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link3"),
+    };
+    assert_eq!(link3_dir.bsd_info.group_id, 0, "link3 is tail (next = 0)");
+    assert_eq!(link3_dir.bsd_info.owner_id, link2, "link3.prev → link2");
+    drop(vol);
+    drop(dev);
+
+    // Remove the middle link (link2). Chain should become link1 → link3.
+    let mut dev = FileDevice::open_writable(&path).expect("open writable to remove middle");
+    {
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .remove(parent, &units("second_dir"))
+            .expect("remove the middle link");
+    }
+    dev.sync().expect("flush");
+    drop(dev);
+
+    let dev = FileDevice::open(&path).expect("open after middle removal");
+    let vol = Volume::open(&dev).expect("mount after middle removal");
+    let inode = vol
+        .lookup_cnid(Cnid(target))
+        .expect("lookup inode after middle removal")
+        .expect("inode must survive");
+    let inode_dir = match &inode {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory"),
+    };
+    assert_eq!(
+        inode_dir.bsd_info.special, 2,
+        "count dropped to 2 after middle removal"
+    );
+
+    // link1.next must now point at link3 (skipping the removed link2).
+    let link1_obj = vol
+        .lookup_cnid(Cnid(link1))
+        .expect("lookup link1 after middle removal")
+        .expect("link1 must exist");
+    let link1_dir = match &link1_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link1"),
+    };
+    assert_eq!(
+        link1_dir.bsd_info.group_id, link3,
+        "link1.next → link3 after splice"
+    );
+
+    // link3.prev must now point at link1 (skipping the removed link2).
+    let link3_obj = vol
+        .lookup_cnid(Cnid(link3))
+        .expect("lookup link3 after middle removal")
+        .expect("link3 must exist");
+    let link3_dir = match &link3_obj {
+        Object::Directory(d) => d,
+        _ => panic!("expected a directory for link3"),
+    };
+    assert_eq!(
+        link3_dir.bsd_info.owner_id, link1,
+        "link3.prev → link1 after splice"
+    );
+
+    // "second_dir" must be gone.
+    assert!(
+        vol.lookup(vol.root_cnid(), &units("second_dir"))
+            .expect("lookup")
+            .is_none(),
+        "middle link name must be gone"
+    );
+    assert_fsck_clean(&path, "middle directory hard link spliced from chain");
 }

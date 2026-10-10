@@ -443,7 +443,7 @@ impl FolderRecord {
         dst[48..64].copy_from_slice(&self.user_info);
         dst[64..80].copy_from_slice(&self.finder_info);
         dst[80..84].copy_from_slice(&self.text_encoding.to_be_bytes());
-        // dst[84..88] is reserved3, zeroed by the fill above.
+        dst[84..88].copy_from_slice(&self.folder_count.to_be_bytes());
         Ok(())
     }
 
@@ -453,6 +453,62 @@ impl FolderRecord {
         // Writing into a correctly sized array cannot fail.
         let _ = self.write_to(&mut out);
         out
+    }
+
+    /// Whether this folder has a hard link chain.
+    ///
+    /// `kHFSHasLinkChainMask` (`K_HFS_HAS_LINK_CHAIN_MASK`) in the record
+    /// flags. On `FileRecord` this is set on link records and clear on the
+    /// indirect node (the inode relocated to the private folder), so
+    /// `is_hard_link()` is false on a file's inode. `FolderRecord` differs:
+    /// the flag is also set on the indirect node (the original directory that
+    /// owns the chain), because `directory hard link removal walks the chain
+    /// by finding the inode via its CNID, so the flag distinguishes an
+    /// indirect node from a regular directory.
+    pub fn is_hard_link(&self) -> bool {
+        self.flags & K_HFS_HAS_LINK_CHAIN_MASK != 0
+    }
+
+    /// The link reference of a directory hard link.
+    ///
+    /// On a link record, `bsd_info.special` holds the CNID of the original
+    /// directory (the indirect node), the same union member as on file links.
+    /// On a non-link folder, returns `None`.
+    ///
+    /// On the indirect node itself, `bsd_info.special` is the link *count*,
+    /// not a reference, so this returns `None` — distinguished by
+    /// `folder_count` being non-zero (the firstLinkID). Link records have
+    /// `folder_count == 0`.
+    pub fn link_reference(&self) -> Option<Cnid> {
+        if self.is_hard_link() && self.folder_count == 0 {
+            Some(Cnid(self.bsd_info.special))
+        } else {
+            None
+        }
+    }
+
+    /// The link count on the indirect node (the original directory).
+    ///
+    /// For directory hard links, the original directory acts as the indirect
+    /// node: `bsd_info.special` stores `hl_linkCount` while the chain flag
+    /// is *set* on that record (see [`Self::is_hard_link`]).
+    pub fn link_count(&self) -> u32 {
+        self.bsd_info.special
+    }
+
+    /// The first link CNID in the chain, stored in `reserved1`
+    /// (`hl_firstLinkID`).
+    ///
+    /// For directory hard links, `reserved1` on the original folder is
+    /// `hl_firstLinkID` (folder counts use `K_HFS_HAS_FOLDER_COUNT_MASK`,
+    /// which only HFSX sets), "valid only if HasLinkChain flag is set" --
+    /// here, on the original directory that owns the chain.
+    pub fn first_link_id(&self) -> Option<Cnid> {
+        if self.is_hard_link() && self.folder_count != 0 {
+            Some(Cnid(self.folder_count))
+        } else {
+            None
+        }
     }
 }
 

@@ -894,8 +894,10 @@ pub struct FileMetadataChanges {
 /// | `create_folder` | catalog leaf (folder record + thread), parent folder record, volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open → commit/abort |
 /// | `remove` | catalog leaf (deletion), parent folder record (valence), allocation bitmap (freed blocks) | freed blocks | `freeBlocks` | open → commit/abort |
 /// | `remove` (hard link) | catalog leaf (link deletion + inode record/thread deletion when count→0), parent folder record (valence), allocation bitmap (inode blocks freed when count→0), volume header (file count for inode) | freed blocks when count→0 | `freeBlocks` + `fileCount` when count→0 | open → commit/abort |
+/// | `remove` (directory hard link) | catalog leaf (link record+thread deletion, inode downgraded in place when count→0), parent folder record (valence), volume header (folder count) | no | `folderCount` | open → commit/abort |
 /// | `rename` | catalog leaf (delete + insert), source and destination parent records (valence) | no | no | open → commit/abort |
-/// | `create_hard_link` | catalog leaf (inode + link records), parent folder record (valence), volume header (file count, next CNID) | no | `fileCount`, `nextCatalogID` | open → commit/abort |
+/// | `create_hard_link` (file) | catalog leaf (private-folder inode + link records), private folder record (valence), volume header (file count, next CNID) | no | `fileCount`, `nextCatalogID` | open → commit/abort |
+/// | `create_hard_link` (directory) | catalog leaf (link record + thread, original stays in place), parent folder record (valence), volume header (folder count, next CNID) | no | `folderCount`, `nextCatalogID` | open → commit/abort |
 /// | `ensure_file_hardlinks_folder` | catalog leaf (folder + thread records), volume header (next CNID, folder count) | no | `nextCatalogID`, `folders` | open (or reuse) → commit/abort |
 /// | `truncate_file` | catalog leaf (fork record), allocation bitmap (freed/allocated blocks) | freed blocks on shrink, allocated on grow | `freeBlocks` (via `write_allocation_bitmap`) | open → commit/abort |
 /// | `punch_hole` | catalog leaf (fork record) | no | no | open → commit/abort |
@@ -1824,7 +1826,33 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 f.is_hard_link().then_some(f.bsd_info.group_id),
             ),
             crate::catalog::record::CatalogRecord::Folder(fo) => {
-                (fo.folder_id.0, true, fo.valence > 0, None, None, None)
+                // A directory hard-link has the chain flag set on *both* the
+                // indirect node and its link records. The inode is distinguished
+                // by `folder_count` (firstLinkID) being non-zero; link records
+                // leave it zero. Only link records carry prev/next pointers and
+                // a link reference; the inode carries its own link count in
+                // `special` and must not be mistaken for a link.
+                let is_link = fo.is_hard_link() && fo.folder_count == 0;
+                // An indirect node with active links cannot be removed by name
+                // — its `special` is a live link count, and the inode owns data
+                // no link record does. Refuse rather than silently dropping
+                // the chain.
+                let is_active_indnode = !is_link && fo.is_hard_link() && fo.bsd_info.special > 0;
+                (
+                    fo.folder_id.0,
+                    true,
+                    // Hard-link records carry valence 0; do not refuse removing
+                    // the link name even though the directory it resolves to may
+                    // have its own children under its original name.
+                    // The inode (is_link==false) is subject to the normal
+                    // non-empty-directory check, so it cannot be rmdir'd while
+                    // it still has children. An indirect node with active links
+                    // is also refused.
+                    !is_link && (fo.valence > 0 || is_active_indnode),
+                    fo.link_reference().map(|c| c.0),
+                    is_link.then_some(fo.bsd_info.owner_id),
+                    is_link.then_some(fo.bsd_info.group_id),
+                )
             }
             // A thread record cannot be named, so a lookup by name cannot return
             // one; this arm exists only so the match is total.
@@ -1893,6 +1921,11 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         //
         // TN1150: "decrement the value when removing a link ... should not allow the
         // linkCount to underflow; if it is already zero, do not change it."
+        //
+        // For file hard links the inode lives in the private hardlinks folder; for
+        // directory hard links the inode is the original directory itself, in place.
+        let is_dir_link = is_folder && link_ref.is_some();
+        // Old bytes of the inode record and thread, for in-transaction rollback.
         let mut inode_old_bytes: Option<(Vec<u8>, Vec<u8>)> = None;
         // Old bytes of any link records whose chain pointers were rewritten,
         // for in-transaction rollback. The journal has before-images too, but
@@ -1900,148 +1933,312 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         // transaction (matching `create_hard_link_inner`'s `undo` pattern).
         let mut link_old_bytes: Vec<(u32, Vec<u8>)> = Vec::new();
         // Remember which folder (if any) had its valence decremented, so the
-        // rollback closure can restore it.
+        // rollback closure can restore it. Only file hard links touch a private
+        // folder.
         let mut undo_private_valence: Option<u32> = None;
+        // Whether the inode was deleted (new_count == 0) vs modified in-place.
+        // Only relevant for file hard links — directory inodes are always
+        // modified in place.
+        let mut inode_deleted = false;
+
         if let Some(inode_cnid) = link_ref {
-            let private_folder = self.ensure_file_hardlinks_folder()?;
-            let inode_key = {
-                use crate::catalog::key::CatalogKey;
-                let inode_name: Vec<u16> = format!("{}{}", INODE_NAME_PREFIX, inode_cnid)
-                    .encode_utf16()
-                    .collect();
-                CatalogKey::for_child(Cnid(private_folder), &inode_name)
-            };
-            let inode_thread_key =
-                crate::catalog::key::CatalogKey::for_child(Cnid(inode_cnid), &[]);
-
-            let inode_old_bytes_val = (
-                self.catalog_record_bytes(&inode_key)?
-                    .ok_or(Error::NotFound {
-                        what: "hard-link inode record",
-                    })?,
-                self.catalog_record_bytes(&inode_thread_key)?
-                    .ok_or(Error::NotFound {
-                        what: "hard-link inode thread record",
-                    })?,
-            );
-
-            let mut inode = self.read_file_record(inode_cnid)?;
-            let new_count = if inode.link_count() == 0 {
-                0
+            let new_count = if is_dir_link {
+                let inode = self.read_folder_record(inode_cnid)?;
+                if inode.link_count() == 0 {
+                    0
+                } else {
+                    inode.link_count() - 1
+                }
             } else {
-                inode.link_count() - 1
+                let inode = self.read_file_record(inode_cnid)?;
+                if inode.link_count() == 0 {
+                    0
+                } else {
+                    inode.link_count() - 1
+                }
             };
-            inode.bsd_info.special = new_count;
 
-            if new_count == 0 {
-                // Free all data and resource-fork blocks, then remove both
-                // the inode and its thread from the catalog. The inode lived
-                // inside the private hardlinks folder, so that folder's valence
-                // must drop too.
-                self.release_blocks(&mut inode, 0, inode_cnid)?;
-                self.release_resource_fork_blocks(&mut inode, inode_cnid)?;
-                self.remove_catalog_record(&inode_key)?;
-                if let Err(e) = self.remove_catalog_record(&inode_thread_key) {
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
-                    return Err(e);
-                }
-                if let Err(e) = self.change_folder_valence(private_folder, -1) {
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
-                    return Err(e);
-                }
-                if let Err(e) = self.write_header_u32(32, self.header.file_count - 1) {
-                    let _ = self.change_folder_valence(private_folder, 1);
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
-                    return Err(e);
-                }
-                self.header.file_count -= 1;
-                undo_private_valence = Some(private_folder);
-            } else {
-                // Decrement the chain: the removed link may be head, tail, or
-                // a middle link. Splice it out by rewriting its neighbours'
-                // prev/next pointers, and -- if it was the head -- the inode's
-                // firstLinkID.
-                //
-                // prev/next are the link's own neighbours; link_prev == 0 means
-                // this link was the head, link_next == 0 means it was the tail.
-                let prev_cnid = link_prev.unwrap_or(0);
-                let next_cnid = link_next.unwrap_or(0);
+            if is_dir_link {
+                let inode = self.read_folder_record(inode_cnid)?;
+                let mut inode_mut = inode;
+                inode_mut.bsd_info.special = new_count;
 
-                // Update the previous link's nextLinkID to skip this one.
-                if prev_cnid != 0 {
-                    let prev_key = crate::catalog::key::CatalogKey::for_child(Cnid(prev_cnid), &[]);
-                    let prev_old =
-                        self.catalog_record_bytes(&prev_key)?
-                            .ok_or(Error::NotFound {
-                                what: "previous hard link record",
-                            })?;
-                    let mut prev_record = self.read_file_record(prev_cnid)?;
-                    prev_record.bsd_info.group_id = next_cnid;
-                    if let Err(e) = self.replace_catalog_record(prev_cnid, &prev_record) {
-                        let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
-                        let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
-                        let _ = self.insert_catalog_record(&prev_old);
-                        return Err(e);
+                // Save old bytes for rollback: the inode's record and thread.
+                let (inode_parent, inode_name) = self.inode_location(inode_cnid)?;
+                let inode_key = {
+                    use crate::catalog::key::CatalogKey;
+                    CatalogKey::for_child(Cnid(inode_parent), &inode_name)
+                };
+                let inode_thread_key =
+                    crate::catalog::key::CatalogKey::for_child(Cnid(inode_cnid), &[]);
+                let inode_old_bytes_val = (
+                    self.catalog_record_bytes(&inode_key)?
+                        .ok_or(Error::NotFound {
+                            what: "hard-link inode record",
+                        })?,
+                    self.catalog_record_bytes(&inode_thread_key)?
+                        .ok_or(Error::NotFound {
+                            what: "hard-link inode thread record",
+                        })?,
+                );
+
+                if new_count == 0 {
+                    inode_mut.flags &= !crate::catalog::record::K_HFS_HAS_LINK_CHAIN_MASK;
+                    inode_mut.bsd_info.special = 0;
+                    inode_mut.folder_count = 0;
+                    let now = crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(
+                        |e| Error::Io {
+                            message: e.to_string(),
+                        },
+                    )?;
+                    inode_mut.content_mod_date = now;
+                    inode_mut.attribute_mod_date = now;
+                    self.replace_catalog_body(inode_cnid, &inode_mut.to_bytes())?;
+                    inode_old_bytes = Some(inode_old_bytes_val);
+                } else {
+                    // Splice the removed link out of the chain. The removed
+                    // link may be head, tail, or a middle link.
+                    let prev_cnid = link_prev.unwrap_or(0);
+                    let next_cnid = link_next.unwrap_or(0);
+
+                    if prev_cnid != 0 {
+                        let prev_key =
+                            crate::catalog::key::CatalogKey::for_child(Cnid(prev_cnid), &[]);
+                        let prev_old =
+                            self.catalog_record_bytes(&prev_key)?
+                                .ok_or(Error::NotFound {
+                                    what: "previous hard link record",
+                                })?;
+                        let mut prev_record = self.read_folder_record(prev_cnid)?;
+                        prev_record.bsd_info.group_id = next_cnid;
+                        if let Err(e) =
+                            self.replace_catalog_body(prev_cnid, &prev_record.to_bytes())
+                        {
+                            // Inode not yet modified; restore prev only.
+                            if let Some(body) = Self::record_body_slice(&prev_old) {
+                                let _ = self.replace_catalog_body(prev_cnid, body);
+                            }
+                            return Err(e);
+                        }
+                        link_old_bytes.push((prev_cnid, prev_old));
+                    } else if next_cnid != 0 {
+                        // Head removed: the inode's firstLinkID -> new head.
+                        inode_mut.folder_count = next_cnid;
                     }
-                    link_old_bytes.push((prev_cnid, prev_old));
-                } else if next_cnid != 0 {
-                    // Head is being removed: the inode's firstLinkID must point
-                    // at the new head.
-                    inode.reserved1 = next_cnid;
-                }
 
-                // Update the next link's prevLinkID to skip this one.
-                if next_cnid != 0 {
-                    let next_key = crate::catalog::key::CatalogKey::for_child(Cnid(next_cnid), &[]);
-                    let next_old =
-                        self.catalog_record_bytes(&next_key)?
-                            .ok_or(Error::NotFound {
-                                what: "next hard link record",
-                            })?;
-                    let mut next_record = self.read_file_record(next_cnid)?;
-                    next_record.bsd_info.owner_id = prev_cnid;
-                    if let Err(e) = self.replace_catalog_record(next_cnid, &next_record) {
-                        let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
-                        let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
-                        for (_, bytes) in link_old_bytes.drain(..) {
-                            let _ = self.insert_catalog_record(&bytes);
+                    if next_cnid != 0 {
+                        let next_key =
+                            crate::catalog::key::CatalogKey::for_child(Cnid(next_cnid), &[]);
+                        let next_old =
+                            self.catalog_record_bytes(&next_key)?
+                                .ok_or(Error::NotFound {
+                                    what: "next hard link record",
+                                })?;
+                        let mut next_record = self.read_folder_record(next_cnid)?;
+                        next_record.bsd_info.owner_id = prev_cnid;
+                        if let Err(e) =
+                            self.replace_catalog_body(next_cnid, &next_record.to_bytes())
+                        {
+                            // Restore prev (already in link_old_bytes if modified)
+                            // and any links already patched. The journal
+                            // transaction will undo the inode downgrade on
+                            // abandon.
+                            for (_, bytes) in link_old_bytes.drain(..) {
+                                let _ = self.insert_catalog_record(&bytes);
+                            }
+                            return Err(e);
+                        }
+                        link_old_bytes.push((next_cnid, next_old));
+                    }
+
+                    let now = crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(
+                        |e| Error::Io {
+                            message: e.to_string(),
+                        },
+                    )?;
+                    inode_mut.content_mod_date = now;
+                    inode_mut.attribute_mod_date = now;
+                    if let Err(e) = self.replace_catalog_body(inode_cnid, &inode_mut.to_bytes()) {
+                        for (cnid, bytes) in link_old_bytes.drain(..) {
+                            if let Some(body) = Self::record_body_slice(&bytes) {
+                                let _ = self.replace_catalog_body(cnid, body);
+                            } else {
+                                let _ = self.insert_catalog_record(&bytes);
+                            }
                         }
                         return Err(e);
                     }
-                    link_old_bytes.push((next_cnid, next_old));
                 }
+            } else {
+                let private_folder = self.ensure_file_hardlinks_folder()?;
+                let inode_key = {
+                    use crate::catalog::key::CatalogKey;
+                    let inode_name: Vec<u16> = format!("{}{}", INODE_NAME_PREFIX, inode_cnid)
+                        .encode_utf16()
+                        .collect();
+                    CatalogKey::for_child(Cnid(private_folder), &inode_name)
+                };
+                let inode_thread_key =
+                    crate::catalog::key::CatalogKey::for_child(Cnid(inode_cnid), &[]);
 
-                self.touch_record(&mut inode)?;
-                if let Err(e) = self.replace_catalog_record(inode_cnid, &inode) {
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
-                    let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
-                    for (_, bytes) in link_old_bytes.drain(..) {
-                        let _ = self.insert_catalog_record(&bytes);
+                let inode_old_bytes_val = (
+                    self.catalog_record_bytes(&inode_key)?
+                        .ok_or(Error::NotFound {
+                            what: "hard-link inode record",
+                        })?,
+                    self.catalog_record_bytes(&inode_thread_key)?
+                        .ok_or(Error::NotFound {
+                            what: "hard-link inode thread record",
+                        })?,
+                );
+
+                let mut inode = self.read_file_record(inode_cnid)?;
+                inode.bsd_info.special = new_count;
+
+                if new_count == 0 {
+                    // Free all data and resource-fork blocks, then remove both
+                    // the inode and its thread from the catalog. The inode lived
+                    // inside the private hardlinks folder, so that folder's valence
+                    // must drop too.
+                    self.release_blocks(&mut inode, 0, inode_cnid)?;
+                    self.release_resource_fork_blocks(&mut inode, inode_cnid)?;
+                    self.remove_catalog_record(&inode_key)?;
+                    if let Err(e) = self.remove_catalog_record(&inode_thread_key) {
+                        let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
+                        let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
+                        return Err(e);
                     }
-                    return Err(e);
-                }
-            }
+                    if let Err(e) = self.change_folder_valence(private_folder, -1) {
+                        let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
+                        let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
+                        return Err(e);
+                    }
+                    if let Err(e) = self.write_header_u32(32, self.header.file_count - 1) {
+                        let _ = self.change_folder_valence(private_folder, 1);
+                        let _ = self.insert_catalog_record(&inode_old_bytes_val.0);
+                        let _ = self.insert_catalog_record(&inode_old_bytes_val.1);
+                        return Err(e);
+                    }
+                    self.header.file_count -= 1;
+                    undo_private_valence = Some(private_folder);
+                    inode_deleted = true;
+                } else {
+                    // Decrement the chain: the removed link may be head, tail, or
+                    // a middle link. Splice it out by rewriting its neighbours'
+                    // prev/next pointers, and -- if it was the head -- the inode's
+                    // firstLinkID.
+                    //
+                    // prev/next are the link's own neighbours; link_prev == 0 means
+                    // this link was the head, link_next == 0 means it was the tail.
+                    let prev_cnid = link_prev.unwrap_or(0);
+                    let next_cnid = link_next.unwrap_or(0);
 
-            inode_old_bytes = Some(inode_old_bytes_val);
+                    // Update the previous link's nextLinkID to skip this one.
+                    if prev_cnid != 0 {
+                        let prev_key =
+                            crate::catalog::key::CatalogKey::for_child(Cnid(prev_cnid), &[]);
+                        let prev_old =
+                            self.catalog_record_bytes(&prev_key)?
+                                .ok_or(Error::NotFound {
+                                    what: "previous hard link record",
+                                })?;
+                        let mut prev_record = self.read_file_record(prev_cnid)?;
+                        prev_record.bsd_info.group_id = next_cnid;
+                        if let Err(e) = self.replace_catalog_record(prev_cnid, &prev_record) {
+                            if let Some(body) = Self::record_body_slice(&prev_old) {
+                                let _ = self.replace_catalog_body(prev_cnid, body);
+                            }
+                            return Err(e);
+                        }
+                        link_old_bytes.push((prev_cnid, prev_old));
+                    } else if next_cnid != 0 {
+                        // Head is being removed: the inode's firstLinkID must point
+                        // at the new head.
+                        inode.reserved1 = next_cnid;
+                    }
+
+                    // Update the next link's prevLinkID to skip this one.
+                    if next_cnid != 0 {
+                        let next_key =
+                            crate::catalog::key::CatalogKey::for_child(Cnid(next_cnid), &[]);
+                        let next_old =
+                            self.catalog_record_bytes(&next_key)?
+                                .ok_or(Error::NotFound {
+                                    what: "next hard link record",
+                                })?;
+                        let mut next_record = self.read_file_record(next_cnid)?;
+                        next_record.bsd_info.owner_id = prev_cnid;
+                        if let Err(e) = self.replace_catalog_record(next_cnid, &next_record) {
+                            for (cnid, bytes) in link_old_bytes.drain(..) {
+                                if let Some(body) = Self::record_body_slice(&bytes) {
+                                    let _ = self.replace_catalog_body(cnid, body);
+                                } else {
+                                    let _ = self.insert_catalog_record(&bytes);
+                                }
+                            }
+                            return Err(e);
+                        }
+                        link_old_bytes.push((next_cnid, next_old));
+                    }
+
+                    self.touch_record(&mut inode)?;
+                    if let Err(e) = self.replace_catalog_record(inode_cnid, &inode) {
+                        if let Some(body) = Self::record_body_slice(&inode_old_bytes_val.0) {
+                            let _ = self.replace_catalog_body(inode_cnid, body);
+                        }
+                        for (cnid, bytes) in link_old_bytes.drain(..) {
+                            if let Some(body) = Self::record_body_slice(&bytes) {
+                                let _ = self.replace_catalog_body(cnid, body);
+                            } else {
+                                let _ = self.insert_catalog_record(&bytes);
+                            }
+                        }
+                        return Err(e);
+                    }
+                }
+
+                inode_old_bytes = Some(inode_old_bytes_val);
+            }
         }
 
         let mut undo_inode = |this: &mut Self| {
             if let Some((ref rec_bytes, ref thread_bytes)) = inode_old_bytes {
-                let _ = this.insert_catalog_record(rec_bytes);
-                let _ = this.insert_catalog_record(thread_bytes);
-                if let Some(needed) = this.header.file_count.checked_add(1) {
-                    let _ = this.write_header_u32(32, needed);
-                    this.header.file_count = needed;
-                }
-                if let Some(pf) = undo_private_valence {
-                    let _ = this.change_folder_valence(pf, 1);
+                if is_dir_link {
+                    // The inode was replaced in place, not removed: restore it
+                    // by overwriting the modified record with the old bytes.
+                    if let Some(cnid) = link_ref {
+                        let _ = this.replace_catalog_body(cnid, rec_bytes);
+                    }
+                } else {
+                    if inode_deleted {
+                        // The inode and thread were removed: re-insert.
+                        let _ = this.insert_catalog_record(rec_bytes);
+                        let _ = this.insert_catalog_record(thread_bytes);
+                    } else {
+                        // The inode was modified in place: overwrite the modified
+                        // record body with the old bytes. The thread was not
+                        // changed for a subsequent-link splice.
+                        if let Some(cnid) = link_ref {
+                            if let Some(body) = Self::record_body_slice(rec_bytes) {
+                                let _ = this.replace_catalog_body(cnid, body);
+                            }
+                        }
+                    }
+                    if let Some(needed) = this.header.file_count.checked_add(1) {
+                        let _ = this.write_header_u32(32, needed);
+                        this.header.file_count = needed;
+                    }
+                    if let Some(pf) = undo_private_valence {
+                        let _ = this.change_folder_valence(pf, 1);
+                    }
                 }
             }
-            for (_, bytes) in link_old_bytes.drain(..) {
-                let _ = this.insert_catalog_record(&bytes);
+            for (cnid, bytes) in link_old_bytes.drain(..) {
+                if let Some(body) = Self::record_body_slice(&bytes) {
+                    let _ = this.replace_catalog_body(cnid, body);
+                } else {
+                    let _ = this.insert_catalog_record(&bytes);
+                }
             }
         };
 
@@ -2264,6 +2461,44 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
     }
 
     fn create_hard_link_inner(&mut self, parent: u32, name: &[u16], target: u32) -> Result<u32> {
+        if name.is_empty() {
+            return Err(Error::invalid("link", "a link cannot have an empty name"));
+        }
+
+        // Dispatch file vs. directory hard links. POSIX `link(2)` refuses
+        // directories, but HFS+ supports them via `hfs_makelink`'s `CD_ISDIR`
+        // path. The FUSE adapter calls this same entry point for both.
+        let record_type = self.catalog_record_type(target)?;
+        match record_type {
+            crate::catalog::record::K_HFS_PLUS_FOLDER_RECORD => {
+                self.create_dir_hard_link_inner(parent, name, target)
+            }
+            crate::catalog::record::K_HFS_PLUS_FILE_RECORD => {
+                self.create_file_hard_link_inner(parent, name, target)
+            }
+            other => Err(Error::invalid(
+                "link",
+                format!("CNID {target} is neither a file nor a folder (type {other})"),
+            )),
+        }
+    }
+
+    /// Record type of the catalog entry for `cnid`, so the caller can
+    /// dispatch file vs. directory hard links.
+    fn catalog_record_type(&self, cnid: u32) -> Result<i16> {
+        let bytes = self.find_catalog_record_any(cnid)?.ok_or(Error::NotFound {
+            what: "catalog record",
+        })?;
+        let be = crate::endian::Be::new(&bytes);
+        be.i16(0)
+    }
+
+    fn create_file_hard_link_inner(
+        &mut self,
+        parent: u32,
+        name: &[u16],
+        target: u32,
+    ) -> Result<u32> {
         use crate::catalog::key::CatalogKey;
         use crate::catalog::record::{
             FileRecord, K_HFS_HAS_LINK_CHAIN_MASK, K_HFS_THREAD_EXISTS_MASK, S_IFREG,
@@ -2502,7 +2737,9 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             tail.bsd_info.group_id = link_cnid;
             if let Err(e) = self.replace_catalog_record(tail_cnid, &tail) {
                 if let Some(ref bytes) = tail_old_bytes {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(tail_cnid, body);
+                    }
                 }
                 return Err(e);
             }
@@ -2510,7 +2747,9 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             inode.bsd_info.special = inode.link_count() + 1;
             if let Err(e) = self.replace_catalog_record(target, &inode) {
                 if let Some(ref bytes) = tail_old_bytes {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(tail_cnid, body);
+                    }
                 }
                 return Err(e);
             }
@@ -2521,10 +2760,14 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             if inode_exists {
                 // Undo the chain update.
                 if let Some(ref bytes) = inode_old_bytes_chain {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(target, body);
+                    }
                 }
                 if let Some(ref bytes) = tail_old_bytes {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
                 }
             } else {
                 // Undo the move.
@@ -2538,10 +2781,14 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             let _ = self.remove_catalog_record(&link_thread_key);
             if inode_exists {
                 if let Some(ref bytes) = inode_old_bytes_chain {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(target, body);
+                    }
                 }
                 if let Some(ref bytes) = tail_old_bytes {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
                 }
             } else {
                 let _ = self.remove_catalog_record(&inode_key);
@@ -2586,10 +2833,14 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 }
                 if inode_exists {
                     if let Some(ref bytes) = tail_old_bytes {
-                        let _ = self.insert_catalog_record(bytes);
+                        if let Some(body) = Self::record_body_slice(bytes) {
+                            let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                        }
                     }
                     if let Some(ref bytes) = inode_old_bytes_chain {
-                        let _ = self.insert_catalog_record(bytes);
+                        if let Some(body) = Self::record_body_slice(bytes) {
+                            let _ = self.replace_catalog_body(target, body);
+                        }
                     }
                 } else {
                     let _ = self.remove_catalog_record(&link_key);
@@ -2620,10 +2871,14 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 let _ = self.change_folder_valence(private_folder, -1);
             } else {
                 if let Some(ref bytes) = tail_old_bytes {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
                 }
                 if let Some(ref bytes) = inode_old_bytes_chain {
-                    let _ = self.insert_catalog_record(bytes);
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(target, body);
+                    }
                 }
             }
             let _ = self.remove_catalog_record(&link_key);
@@ -2638,7 +2893,266 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         Ok(link_cnid)
     }
 
-    /// Find the private folder for file hard links, creating it if it is not there.
+    /// Create a directory hard link to `target` named `name` inside `parent`.
+    ///
+    /// Directory hard links differ from file hard links in four respects:
+    /// the original directory is *not* relocated to the private hardlinks
+    /// folder (it stays in place as the indirect node), the link chain is
+    /// threaded by `bsd_info.owner_id` (prev) / `bsd_info.group_id` (next)
+    /// on `FolderRecord` copies rather than `FileRecord`, the link count lives
+    /// in `bsd_info.special` and the head of chain in `folder_count`
+    /// (`hl_firstLinkID`, offset 84) on the indirect node, and directory link
+    /// records carry a folder thread (`kHFSPlusFolderThreadRecordType`) rather
+    /// than a file thread.
+    fn create_dir_hard_link_inner(
+        &mut self,
+        parent: u32,
+        name: &[u16],
+        target: u32,
+    ) -> Result<u32> {
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::record::{
+            FolderRecord, K_HFS_HAS_LINK_CHAIN_MASK, K_HFS_PLUS_FOLDER_THREAD_RECORD,
+            K_HFS_THREAD_EXISTS_MASK, S_IFDIR, THREAD_RECORD_NAME_LEN_OFFSET,
+        };
+
+        let parent_cnid = Cnid(parent);
+        self.read_folder_record(parent)?;
+        let original = self.read_folder_record(target)?;
+
+        // Refuse to link a link: a link record carries the chain flag but
+        // has `folder_count == 0` (no firstLinkID), whereas the indirect node
+        // carries the flag *and* a non-zero firstLinkID. Linking to a link
+        // would create a second-level indirection nothing supports.
+        if original.is_hard_link() && original.folder_count == 0 {
+            return Err(Error::invalid(
+                "link",
+                format!("CNID {target} is itself a hard link; link to the indirect node"),
+            ));
+        }
+
+        // The indirect node may carry the chain flag (set on its first link).
+        // `folder_count` (firstLinkID) distinguishes "inode already has a
+        // chain" from "this is a link copy" -- a link copy carries prev/next
+        // in `bsd_info` but leaves `folder_count` zero.
+        let chain_exists = original.is_hard_link() && original.folder_count != 0;
+
+        let link_cnid = self.header.next_catalog_id;
+        if link_cnid <= ROOT_FOLDER_ID.0 {
+            return Err(Error::invalid(
+                "volume_header.nextCatalogID",
+                format!("{link_cnid} is at or below the reserved CNID range"),
+            ));
+        }
+        let now =
+            crate::timestamp::now_hfs(self.header.has_expanded_times()).map_err(|e| Error::Io {
+                message: e.to_string(),
+            })?;
+
+        // Thread record body for the link: parentID + name of the *link*.
+        let thread_body = |p: u32, n: &[u16]| -> Vec<u8> {
+            let mut v = vec![0u8; THREAD_RECORD_NAME_LEN_OFFSET + 2 + n.len() * 2];
+            v[0..2].copy_from_slice(&K_HFS_PLUS_FOLDER_THREAD_RECORD.to_be_bytes());
+            v[4..8].copy_from_slice(&p.to_be_bytes());
+            v[THREAD_RECORD_NAME_LEN_OFFSET..THREAD_RECORD_NAME_LEN_OFFSET + 2]
+                .copy_from_slice(&(n.len() as u16).to_be_bytes());
+            for (i, unit) in n.iter().enumerate() {
+                let at = THREAD_RECORD_NAME_LEN_OFFSET + 2 + i * 2;
+                v[at..at + 2].copy_from_slice(&unit.to_be_bytes());
+            }
+            v
+        };
+
+        // Walk the existing chain to find the tail (if any).
+        let chain_tail: Option<u32> = if chain_exists {
+            let mut current = original.folder_count;
+            loop {
+                let link_rec = self.read_folder_record(current)?;
+                match link_rec.bsd_info.group_id {
+                    0 => break Some(current),
+                    next => current = next,
+                }
+            }
+        } else {
+            None
+        };
+
+        let link_key = CatalogKey::for_child(parent_cnid, name);
+
+        // ---- Build the indirect node update (original directory, in place) ----
+        let old_indnode = original;
+        let mut indnode = old_indnode;
+        indnode.flags |= K_HFS_HAS_LINK_CHAIN_MASK;
+        let new_count = if chain_exists {
+            indnode.link_count() + 1
+        } else {
+            1
+        };
+        indnode.bsd_info.special = new_count;
+        if !chain_exists {
+            indnode.folder_count = link_cnid; // hl_firstLinkID = head
+        }
+        indnode.attribute_mod_date = now;
+
+        // ---- Build the link record ----
+        let mut link = FolderRecord {
+            folder_id: Cnid(link_cnid),
+            create_date: now,
+            content_mod_date: now,
+            attribute_mod_date: now,
+            access_date: now,
+            backup_date: now,
+            flags: K_HFS_HAS_LINK_CHAIN_MASK | K_HFS_THREAD_EXISTS_MASK,
+            text_encoding: K_TEXT_ENCODING_MAC_UNICODE,
+            bsd_info: crate::catalog::record::BsdInfo {
+                file_mode: S_IFDIR | 0o755,
+                ..old_indnode.bsd_info
+            },
+            ..FolderRecord::EMPTY
+        };
+        link.bsd_info.special = target; // hl_linkReference
+        link.bsd_info.owner_id = chain_tail.unwrap_or(0); // hl_prevLinkID
+        link.bsd_info.group_id = 0; // hl_nextLinkID (new tail)
+
+        let mut link_record = link_key.to_record();
+        link_record.extend_from_slice(&link.to_bytes());
+
+        let link_thread_key = CatalogKey::for_child(Cnid(link_cnid), &[]);
+        let mut link_thread = link_thread_key.to_record();
+        link_thread.extend_from_slice(&thread_body(parent, name));
+
+        // Save old bytes for rollback.
+        let old_tail_bytes: Option<Vec<u8>> = chain_tail.and_then(|tail_cnid| {
+            let tail_key = CatalogKey::for_child(Cnid(tail_cnid), &[]);
+            self.catalog_record_bytes(&tail_key).ok().flatten()
+        });
+
+        // ---- Write nextCatalogID ----
+        self.header.next_catalog_id = link_cnid + 1;
+        self.write_header_u32(64, self.header.next_catalog_id)?;
+
+        // ---- Apply changes ----
+        // 1. Update tail's nextLinkID (subsequent links only).
+        if chain_exists {
+            let tail_cnid = chain_tail.expect("chain_tail is Some when chain_exists");
+            let mut tail = self.read_folder_record(tail_cnid)?;
+            tail.bsd_info.group_id = link_cnid;
+            if let Err(e) = self.replace_catalog_body(tail_cnid, &tail.to_bytes()) {
+                if let Some(ref bytes) = old_tail_bytes {
+                    if let Some(body_slice) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(tail_cnid, body_slice);
+                    }
+                }
+                return Err(e);
+            }
+        }
+
+        // 2. Update the indirect node in place.
+        if let Err(e) = self.replace_catalog_body(target, &indnode.to_bytes()) {
+            if chain_exists {
+                if let Some(ref bytes) = old_tail_bytes {
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
+                }
+            }
+            return Err(e);
+        }
+
+        // 3. Insert the link's thread.
+        if let Err(e) = self.insert_catalog_record(&link_thread) {
+            if chain_exists {
+                if let Some(ref bytes) = old_tail_bytes {
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
+                }
+            }
+            let _ = self.replace_catalog_body(target, &old_indnode.to_bytes());
+            return Err(e);
+        }
+
+        // 4. Insert the link's record.
+        if let Err(e) = self.insert_catalog_record(&link_record) {
+            let _ = self.remove_catalog_record(&link_thread_key);
+            if chain_exists {
+                if let Some(ref bytes) = old_tail_bytes {
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
+                }
+            }
+            let _ = self.replace_catalog_body(target, &old_indnode.to_bytes());
+            return Err(e);
+        }
+
+        // 5. Bump parent's valence.
+        if let Err(e) = self.change_folder_valence(parent, 1) {
+            let _ = self.remove_catalog_record(&link_key);
+            let _ = self.remove_catalog_record(&link_thread_key);
+            if chain_exists {
+                if let Some(ref bytes) = old_tail_bytes {
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
+                }
+            }
+            let _ = self.replace_catalog_body(target, &old_indnode.to_bytes());
+            return Err(e);
+        }
+
+        // 6. Bump folderCount in the volume header.
+        let fc = self.header.folder_count + 1;
+        if let Err(e) = self.write_header_u32(36, fc) {
+            let _ = self.change_folder_valence(parent, -1);
+            let _ = self.remove_catalog_record(&link_key);
+            let _ = self.remove_catalog_record(&link_thread_key);
+            if chain_exists {
+                if let Some(ref bytes) = old_tail_bytes {
+                    if let Some(body) = Self::record_body_slice(bytes) {
+                        let _ = self.replace_catalog_body(chain_tail.unwrap(), body);
+                    }
+                }
+            }
+            let _ = self.replace_catalog_body(target, &old_indnode.to_bytes());
+            return Err(e);
+        }
+        self.header.folder_count = fc;
+
+        Ok(link_cnid)
+    }
+
+    /// Find the (parent ID, name) of the folder or file named `cnid` by reading
+    /// its thread record. Used by [`Self::remove_inner`] to locate an inode's
+    /// original position when deleting a directory hard link whose last link
+    /// is being released.
+    fn inode_location(&self, cnid: u32) -> Result<(u32, Vec<u16>)> {
+        use crate::catalog::key::CatalogKey;
+        let key = CatalogKey::for_child(Cnid(cnid), &[]);
+        let bytes = self.catalog_record_bytes(&key)?.ok_or(Error::NotFound {
+            what: "thread record",
+        })?;
+        let key_size = 2 + usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+        let body = bytes.get(key_size..).ok_or(Error::Truncated {
+            what: "thread record body",
+            needed: key_size,
+            available: bytes.len(),
+        })?;
+        let parent = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
+        let name_len = usize::from(u16::from_be_bytes([body[8], body[9]]));
+        let name: Vec<u16> = body
+            .get(10..10 + name_len * 2)
+            .ok_or(Error::Truncated {
+                what: "thread record name",
+                needed: 10 + name_len * 2,
+                available: body.len(),
+            })?
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]))
+            .collect();
+        Ok((parent, name))
+    }
+
     ///
     /// Every hard link's record belongs *inside* it, named by the link's own CNID --
     /// `hfs_makelink` renames the link inode in there rather than leaving it where
@@ -3180,6 +3694,18 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             }
         }
         Ok(None)
+    }
+
+    /// Extract the record body (everything after the key) from a full
+    /// key+body byte vector, as returned by [`Self::catalog_record_bytes`].
+    ///
+    /// Returns `None` if the record is too short to contain a valid key.
+    fn record_body_slice(record: &[u8]) -> Option<&[u8]> {
+        if record.len() < 2 {
+            return None;
+        }
+        let key_len = 2 + usize::from(u16::from_be_bytes([record[0], record[1]]));
+        record.get(key_len..)
     }
 
     /// Remove the catalog record with exactly this key, if it is there.
