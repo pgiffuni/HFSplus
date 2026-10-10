@@ -445,6 +445,22 @@ messages. Seven checks are absent, including all symlink validation. So passing
 `fsck.hfsplus` is evidence of agreement with an implementation derived from
 Apple's — not proof of Apple compatibility.
 
+## Formatter (hnewfs)
+
+| | |
+| --- | --- |
+| Apple | `newfs_hfs/makehfs.c` (`MakeHFS`, `initVolume`); `core/hfs_format.h` for the layouts written |
+| Structures | `HFSPlusVolumeHeader`, `BTNodeDescriptor`, `BTHeaderRec`, `HFSPlusCatalogFolder`/`File`/`Thread`, `HFSPlusForkData` |
+| Invariants | block 0 is reserved; the primary header lives at byte 1024; the alternate header sits at `volume_bytes - 1024`; the allocation bitmap uses the same MSB-first convention as the volume allocation bitmap; catalog keys order by parentID then name comparison length-before-content; journal pseudo-files (`.journal` CNID 16, `.journal_info_block` CNID 17) account for fileCount when journaled |
+| Rust | `src/format/writer.rs` (`format_volume`), `src/bin/hnewfs.rs` |
+| Differences | timestamps are zeroed rather than seeded from the host clock, since reproducibility matters more than realism in fixtures; `lastMountedVersion` is zero rather than "10.0", as it carries no structural consequence; `hnewfs` writes only an empty journal info block (no journal header), matching `newfs_hfs`'s uninitialised journal that replay takes over |
+
+The writer was built from `core/hfs_format.h` for the on-disk layouts and from
+`newfs_hfs/makehfs.c` for the initialisation order (allocation bitmap, B-tree
+header nodes, catalog root with root folder and thread records). It creates
+volumes that `hfsck` reports as consistent, replacing `mkfs.hfsplus` as the
+primary image generator.
+
 # Not yet mined
 
 Milestones 9 through 13 depend on all of these. Resource fork semantics (7A.1) and
