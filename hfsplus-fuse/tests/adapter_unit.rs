@@ -480,7 +480,7 @@ fn writable_modify_file_metadata() {
         wvol.modify_file_metadata(
             cnid,
             hfsplus::volume::FileMetadataChanges {
-                mode: Some(original_mode as u32),
+                mode: Some(original_mode),
                 uid: None,
                 gid: None,
                 atime: None,
@@ -532,6 +532,80 @@ fn writable_hard_link_round_trips() {
         .lookup(parent_cnid, &name)
         .unwrap()
         .is_none());
+
+    let _ = std::fs::remove_file(&copy);
+}
+
+#[test]
+fn writable_hard_link_unlink_frees_indirect_node() {
+    // Create a file with data, make a hard link to it, then remove the link.
+    // The link's removal must decrement the inode's linkCount to zero, free the
+    // inode's blocks and records, and leave the parent folder's valence correct.
+    let img = image("bootstrapped-with-file");
+    if !img.exists() {
+        eprintln!("skipping: {} not built", img.display());
+        return;
+    }
+
+    let copy = writable_image_copy("unlink_hard_link");
+    let fs = hfsplus_fuse::HfsPlusFilesystem::open_writable(copy.to_str().unwrap()).unwrap();
+
+    let parent_cnid = hfsplus::catalog::ROOT_FOLDER_ID;
+    let file_name: Vec<u16> = "target.bin".encode_utf16().collect();
+    let link_name: Vec<u16> = "alias.bin".encode_utf16().collect();
+    let data = b"hard link data for removal test".to_vec();
+
+    // Create the file and write data.
+    let target_cnid = fs
+        .with_writable(|wvol| {
+            let cnid = wvol.create_file(parent_cnid.0, &file_name)?;
+            wvol.write_file_contents(cnid, &data)?;
+            Ok(cnid)
+        })
+        .expect("create file with data");
+
+    // Create the hard link.
+    let link_cnid = fs
+        .with_writable(|wvol| wvol.create_hard_link(parent_cnid.0, &link_name, target_cnid))
+        .expect("create hard link");
+    assert_ne!(link_cnid, target_cnid, "link must have its own CNID");
+
+    // Record fileCount before removal.
+    let file_count_before = {
+        fs.invalidate_volume();
+        let holder = fs.get_read_volume().unwrap();
+        holder.volume().header().file_count
+    };
+
+    // Remove the link (not the inode).
+    let removed = fs.with_writable(|wvol| wvol.remove(parent_cnid.0, &link_name));
+    assert!(removed.is_ok(), "remove the hard link");
+
+    // Invalidate and re-read to verify state.
+    fs.invalidate_volume();
+    let holder = fs.get_read_volume().unwrap();
+    let vol = holder.volume();
+
+    // The link name must be gone.
+    assert!(
+        vol.lookup(parent_cnid, &link_name).unwrap().is_none(),
+        "link must be gone after removal"
+    );
+
+    // The inode (target CNID) must be gone too -- linkCount reached zero.
+    assert!(
+        vol.lookup_cnid(hfsplus::catalog::cnid::Cnid(target_cnid))
+            .unwrap()
+            .is_none(),
+        "indirect node must be gone when its only link is removed"
+    );
+
+    // fileCount must drop by 2: the link record and the inode record.
+    assert_eq!(
+        vol.header().file_count,
+        file_count_before - 2,
+        "fileCount must account for both link and inode removal"
+    );
 
     let _ = std::fs::remove_file(&copy);
 }

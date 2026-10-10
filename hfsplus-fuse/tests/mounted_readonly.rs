@@ -70,7 +70,7 @@ where
     let fuse_bin = workspace_root().join("target/debug/hfsplus-fuse");
 
     // Start the FUSE mount in a background process.
-    let _child = Command::new(&fuse_bin)
+    let mut _child = Command::new(&fuse_bin)
         .arg(&img)
         .arg(&mp)
         .spawn()
@@ -87,6 +87,8 @@ where
     }
 
     if !mounted {
+        let _ = _child.kill();
+        let _ = _child.wait();
         let _ = Command::new("fusermount").arg("-u").arg(&mp).status();
         eprintln!("skipping: mount timed out");
         return;
@@ -94,8 +96,9 @@ where
 
     let result = std::panic::catch_unwind(|| check_fn(&mp));
     unmount(&mp);
+    let _ = _child.wait();
 
-    if let Err(_) = result {
+    if result.is_err() {
         panic!("test assertion failed");
     }
 }

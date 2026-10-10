@@ -127,7 +127,7 @@ where
     // Clean up the test image copy.
     let _ = std::fs::remove_file(&img);
 
-    if let Err(_) = result {
+    if result.is_err() {
         panic!("test assertion failed");
     }
 }
@@ -384,7 +384,7 @@ fn can_create_and_read_symlink() {
         let link_name = mp.join("mylink");
         let target = "/hello/world";
 
-        std::os::unix::fs::symlink(&target, &link_name).expect("create symlink");
+        std::os::unix::fs::symlink(target, &link_name).expect("create symlink");
         assert!(link_name.exists());
 
         let read_target = std::fs::read_link(&link_name).expect("read link");
@@ -402,7 +402,7 @@ fn can_read_existing_symlink() {
         let link_name = mp.join("mylink");
         let target = "/hello/world";
 
-        std::os::unix::fs::symlink(&target, &link_name).expect("create symlink");
+        std::os::unix::fs::symlink(target, &link_name).expect("create symlink");
 
         let read_target = std::fs::read_link(&link_name).expect("read link");
         assert_eq!(
