@@ -7462,6 +7462,7 @@ pub struct StatFs {
 #[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
+    use crate::catalog::cnid::JOURNAL_FILE_ID;
     use crate::catalog::record::S_IFREG;
 
     #[test]
@@ -7523,7 +7524,7 @@ mod tests {
                 record_type: 2,
                 flags: 0,
                 reserved1: 0,
-                file_id: Cnid(16),
+                file_id: JOURNAL_FILE_ID,
                 create_date: 0,
                 content_mod_date: 0,
                 attribute_mod_date: 0,
@@ -7549,7 +7550,7 @@ mod tests {
         .expect("a file record becomes an object");
         assert!(obj.is_symlink());
         assert!(!obj.is_dir());
-        assert_eq!(obj.cnid(), Cnid(16));
+        assert_eq!(obj.cnid(), JOURNAL_FILE_ID);
         assert_eq!(obj.bsd_info().permissions(), 0o777);
     }
 
@@ -7561,7 +7562,7 @@ mod tests {
                 record_type: 2,
                 flags: 0,
                 reserved1: 0,
-                file_id: Cnid(16),
+                file_id: JOURNAL_FILE_ID,
                 create_date: 0,
                 content_mod_date: 0,
                 attribute_mod_date: 0,
@@ -7587,7 +7588,7 @@ mod tests {
         .expect("a file record becomes an object");
         assert!(!obj.is_dir());
         assert!(!obj.is_symlink());
-        assert_eq!(obj.cnid(), Cnid(16));
+        assert_eq!(obj.cnid(), JOURNAL_FILE_ID);
     }
 
     #[test]
@@ -7599,7 +7600,7 @@ mod tests {
                 record_type: 2,
                 flags: 0,
                 reserved1: 0,
-                file_id: Cnid(16),
+                file_id: JOURNAL_FILE_ID,
                 create_date: 0,
                 content_mod_date: 0,
                 attribute_mod_date: 0,
@@ -7632,7 +7633,7 @@ mod tests {
                 record_type: 2,
                 flags: 0,
                 reserved1: 0,
-                file_id: Cnid(16),
+                file_id: JOURNAL_FILE_ID,
                 create_date: 0,
                 content_mod_date: 0,
                 attribute_mod_date: 0,
@@ -7706,7 +7707,7 @@ mod tests {
                 record_type: 2,
                 flags: 0,
                 reserved1: 0,
-                file_id: Cnid(16),
+                file_id: JOURNAL_FILE_ID,
                 create_date: 0,
                 content_mod_date: 0,
                 attribute_mod_date: 0,
@@ -7752,7 +7753,7 @@ mod tests {
         let dir = Object::from_record(
             "d".encode_utf16().collect(),
             CatalogRecord::Folder(crate::catalog::record::FolderRecord {
-                folder_id: Cnid(16),
+                folder_id: JOURNAL_FILE_ID,
                 ..crate::catalog::record::FolderRecord::EMPTY
             }),
             false,
@@ -7772,7 +7773,7 @@ mod tests {
                     record_type: 2,
                     flags,
                     reserved1: 0,
-                    file_id: Cnid(16),
+                    file_id: JOURNAL_FILE_ID,
                     create_date: 1_000_000_000,
                     content_mod_date: 1_000_000_000,
                     attribute_mod_date: 0,

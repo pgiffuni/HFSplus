@@ -18,8 +18,12 @@ use crate::btree::header::{
     BTreeHeader, KeyCompareType, HEADER_RECORD_OFFSET, HEADER_RECORD_SIZE, HEADER_USER_BYTES,
     K_HFS_BINARY_COMPARE, K_HFS_CASE_FOLDING,
 };
+use crate::btree::key::{K_BT_BIG_KEYS_MASK, K_BT_VARIABLE_INDEX_KEYS_MASK};
 use crate::btree::node::{NodeKind, NODE_DESCRIPTOR_SIZE, OFFSET_SIZE};
-use crate::catalog::cnid::{Cnid, FIRST_USER_CATALOG_NODE_ID, ROOT_FOLDER_ID, ROOT_PARENT_ID};
+use crate::catalog::cnid::{
+    Cnid, FIRST_POST_JOURNAL_CNID, FIRST_USER_CATALOG_NODE_ID, JOURNAL_FILE_ID,
+    JOURNAL_INFO_FILE_ID, ROOT_FOLDER_ID, ROOT_PARENT_ID,
+};
 use crate::catalog::key::CatalogKey;
 use crate::catalog::record::{
     BsdInfo, FileRecord, FolderRecord, FINDER_OPAQUE_INFO_SIZE, FINDER_USER_INFO_SIZE,
@@ -47,12 +51,12 @@ fn default_clump_size(block_size: u32) -> u32 {
     blocks_in_clump * block_size
 }
 
-/// `kBTBigKeysMask | kBTVariableIndexKeysMask`.
-const K_BT_BIG_KEYS_MASK: u32 = 0x0000_0002;
-/// `kBTVariableIndexKeysMask`.
-const K_BT_VARIABLE_INDEX_KEYS_MASK: u32 = 0x0000_0004;
 /// `kHFSPlusMaxNameLength * 2 + 4 + 2`: longest catalog key body (parentID
 /// + UTF-16 name, with the 2-byte key length prefix counted by Apple).
+///
+/// Mining reference: `core/hfs_format.h` `kHFSPlusMaxNameLength` is 255, so
+/// the maximum key body is 2 (key length) + 4 (parentID) + 255 * 2 (UTF-16)
+/// = 516.
 const K_HFS_PLUS_MAX_KEY_LENGTH: u16 = 516;
 
 /// `kHFSBTreeType`: the B-tree type byte for catalog, extents and attributes trees.
@@ -349,7 +353,7 @@ fn build_volume_header(
         rsrc_clump_size: default_clump_size(block_size),
         data_clump_size: default_clump_size(block_size),
         next_catalog_id: if journal.is_some() {
-            18
+            FIRST_POST_JOURNAL_CNID.0
         } else {
             FIRST_USER_CATALOG_NODE_ID.0
         },
@@ -375,7 +379,6 @@ fn write_allocation_bitmap<D: BlockDeviceMut + ?Sized>(
     let bytes = crate::volume::bytes_for_blocks(total_blocks)?;
     let mut bitmap = vec![0u8; bytes];
 
-    eprintln!("bitmap bytes={}, total_blocks={}", bytes, total_blocks);
     let mut mark = |start: u32, count: u32| {
         for b in start..start.saturating_add(count) {
             if b >= total_blocks {
@@ -416,36 +419,12 @@ fn write_allocation_bitmap<D: BlockDeviceMut + ?Sized>(
         layout.attributes_fork.total_blocks,
     );
     if let Some(j) = journal {
-        eprintln!(
-            "journal: info_block={}, start={}, end={}",
-            j.info_block, j.start_block, j.end_block
-        );
         mark(j.info_block, 1);
         mark(j.start_block, j.end_block - j.start_block);
     }
 
-    let mut count = 0u32;
-    for i in 0..total_blocks {
-        let byte = i as usize / 8;
-        let bit = i as usize % 8;
-        if byte < bitmap.len() && bitmap[byte] & (0x80 >> bit) != 0 {
-            count += 1;
-        }
-    }
-    eprintln!(
-        "Total marked blocks: {}, bitmap len: {}",
-        count,
-        bitmap.len()
-    );
-
     let bm_off =
         u64::from(layout.allocation_fork.extents.raw[0].start_block) * u64::from(block_size);
-    eprintln!(
-        "Writing bitmap to offset {} (block {}), {} bytes",
-        bm_off,
-        layout.allocation_fork.extents.raw[0].start_block,
-        bitmap.len()
-    );
     device.write_at(bm_off, &bitmap)?;
     Ok(())
 }
@@ -511,15 +490,22 @@ fn write_empty_btree_header<D: BlockDeviceMut + ?Sized>(
     Ok(())
 }
 
-/// Compute the `attributes` field for a B-tree header: Apple's `BTOpenPath`
-/// ORs in `kBTBigKeysMask` whenever `maxKeyLength > 40`, and `newfs_hfs`
-/// always sets `kBTVariableIndexKeysMask`.
+/// Compute the `attributes` field for a B-tree header.
+///
+/// Every tree `newfs_hfs` creates has `kBTBigKeysMask` set, regardless of key
+/// size — the checker (`BTMapChk` in `lib_fsck_hfs`) treats a tree with 8-bit
+/// length keys as not written by Apple. `kBTVariableIndexKeysMask` is added
+/// when `maxKeyLength > 40`, matching `BTOpenPath`'s threshold.
+///
+/// Mining reference: `newfs_hfs/makehfs.c` `initBTree` sets the attributes;
+/// `lib_fsck_hfs/dfalib/SVerify2.c` `BTMapChk` validates the bit.
 fn btree_attributes(max_key_length: u16) -> u32 {
-    let mut attrs = K_BT_BIG_KEYS_MASK;
+    let attrs = K_BT_BIG_KEYS_MASK;
     if max_key_length > 40 {
-        attrs |= K_BT_VARIABLE_INDEX_KEYS_MASK;
+        attrs | K_BT_VARIABLE_INDEX_KEYS_MASK
+    } else {
+        attrs
     }
-    attrs
 }
 
 /// Write the catalog B-tree header node (node 0) for a non-empty tree.
@@ -654,7 +640,7 @@ fn write_catalog_btree<D: BlockDeviceMut + ?Sized>(
     if let Some(j) = journal {
         // Record 2: .journal file record (CNID 16).
         let journal_name: Vec<u16> = ".journal".encode_utf16().collect();
-        let journal_file = build_journal_file_record(j, block_size, 16);
+        let journal_file = build_journal_file_record(j, block_size, JOURNAL_FILE_ID.0);
         let journal_key = CatalogKey::for_child(ROOT_FOLDER_ID, &journal_name);
         let journal_rec = {
             let mut v = journal_key.to_record();
@@ -665,7 +651,7 @@ fn write_catalog_btree<D: BlockDeviceMut + ?Sized>(
 
         // Record 3: .journal_info_block file record (CNID 17).
         let jib_name: Vec<u16> = ".journal_info_block".encode_utf16().collect();
-        let jib_file = build_journal_file_record(j, block_size, 17);
+        let jib_file = build_journal_file_record(j, block_size, JOURNAL_INFO_FILE_ID.0);
         let jib_key = CatalogKey::for_child(ROOT_FOLDER_ID, &jib_name);
         let jib_rec = {
             let mut v = jib_key.to_record();
@@ -675,7 +661,7 @@ fn write_catalog_btree<D: BlockDeviceMut + ?Sized>(
         records.push(jib_rec);
 
         // Record 4: thread for CNID 16 (.journal).
-        let journal_thread_key = CatalogKey::for_child(Cnid(16), &[]);
+        let journal_thread_key = CatalogKey::for_child(JOURNAL_FILE_ID, &[]);
         let journal_thread_body = build_file_thread_record(ROOT_FOLDER_ID, &journal_name);
         let journal_thread_rec = {
             let mut v = journal_thread_key.to_record();
@@ -685,7 +671,7 @@ fn write_catalog_btree<D: BlockDeviceMut + ?Sized>(
         records.push(journal_thread_rec);
 
         // Record 5: thread for CNID 17 (.journal_info_block).
-        let jib_thread_key = CatalogKey::for_child(Cnid(17), &[]);
+        let jib_thread_key = CatalogKey::for_child(JOURNAL_INFO_FILE_ID, &[]);
         let jib_thread_body = build_file_thread_record(ROOT_FOLDER_ID, &jib_name);
         let jib_thread_rec = {
             let mut v = jib_thread_key.to_record();
@@ -784,7 +770,7 @@ fn build_journal_file_record(journal: &JournalLayout, block_size: u32, cnid: u32
     rec.flags = 0;
     rec.file_id = Cnid(cnid);
 
-    if cnid == 16 {
+    if cnid == JOURNAL_FILE_ID.0 {
         // .journal: logical size = total journal size, data fork covers it.
         let journal_size =
             u64::from(journal.end_block - journal.start_block) * u64::from(block_size);
@@ -849,27 +835,23 @@ fn build_file_thread_record(parent: Cnid, name: &[u16]) -> Vec<u8> {
     out
 }
 
-/// Write the journal info block and journal header for a journaled volume.
+/// Write the journal info block for a journaled volume.
+///
+/// Sets `kJIJournalInFSMask | kJIJournalNeedInitMask`: the journal lives inside
+/// the filesystem and has no transactions yet. Apple's `newfs_hfs` leaves the
+/// journal header area as zeros in exactly this state, and a reader treats that
+/// as "nothing to replay".
 fn write_journal_info<D: BlockDeviceMut + ?Sized>(
     device: &mut D,
     journal: &JournalLayout,
     block_size: u32,
 ) -> Result<()> {
     use crate::journal::info::JOURNAL_INFO_BLOCK_SIZE;
+    use crate::journal::info::{K_JI_JOURNAL_IN_FS_MASK, K_JI_JOURNAL_NEED_INIT_MASK};
 
-    // JournalInfoBlock: flags at 0, deviceSignature at 4 (32 bytes),
-    // offset at 36, size at 44.
     let jib_size = u64::from(journal.end_block - journal.start_block) * u64::from(block_size);
     let mut jib_buf = vec![0u8; JOURNAL_INFO_BLOCK_SIZE];
-    // flags: kJIJournalNeedInitMask (bit 0) | kJICleanMask? Let's check what
-    // mkfs.hfsplus writes: flags = 0x00000005.
-    // kJIJournalNeedInitMask = 0x01, kJHMBit = 0x04? No.
-    // 0x05 = 0x01 | 0x04. Actually from the header file:
-    // kJIJournalNeedInitMask = 0x01
-    // kJIColdJournalMask = 0x04? No, that's not a standard mask.
-    // Actually 0x05 is kJIJournalNeedInitMask | kJISignedJournalMask? Not sure.
-    // Real images show flags=5, so use that.
-    let flags: u32 = 0x05;
+    let flags = K_JI_JOURNAL_IN_FS_MASK | K_JI_JOURNAL_NEED_INIT_MASK;
     let jib_offset = u64::from(journal.start_block) * u64::from(block_size);
     jib_buf[0..4].copy_from_slice(&flags.to_be_bytes());
     jib_buf[36..44].copy_from_slice(&jib_offset.to_be_bytes());
@@ -878,8 +860,9 @@ fn write_journal_info<D: BlockDeviceMut + ?Sized>(
     let info_off = u64::from(journal.info_block) * u64::from(block_size);
     device.write_at(info_off, &jib_buf)?;
 
-    // The journal data area is left as zeros — mkfs.hfsplus does not write a
-    // journal header. The header is written on first use by the journal replay.
+    // The journal data area is left as zeros: mkfs.hfsplus does not write a
+    // journal header at creation time. The header is written on first use
+    // by the journal writer.
     Ok(())
 }
 

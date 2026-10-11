@@ -77,6 +77,23 @@ pub const BAD_DIR_FILE_ID: Cnid = Cnid(5);
 /// `kHFSFirstUserCatalogNodeID`: the first CNID available to the user.
 pub const FIRST_USER_CATALOG_NODE_ID: Cnid = Cnid(16);
 
+/// CNID of `.journal`, the journal data file.
+///
+/// Mining reference: Apple `core/hfs_format.h` does not name this explicitly,
+/// but `newfs_hfs` allocates CNID 16 to the journal data file and 17 to the
+/// journal info block. The reader in `src/volume/mod.rs` and the writer in
+/// `src/format/writer.rs` both hardcode these CNIDs.
+pub const JOURNAL_FILE_ID: Cnid = Cnid(16);
+
+/// CNID of `.journal_info_block`, the block that locates the journal.
+pub const JOURNAL_INFO_FILE_ID: Cnid = Cnid(17);
+
+/// The CNID that immediately follows the two journal pseudo-files.
+///
+/// On a journaled volume `nextCatalogID` starts here, because CNIDs 16 and 17
+/// are consumed by the journal files the formatter creates.
+pub const FIRST_POST_JOURNAL_CNID: Cnid = Cnid(18);
+
 impl Cnid {
     /// Whether this is one of the five reserved pseudo-file IDs.
     ///
@@ -117,6 +134,14 @@ mod tests {
         assert_eq!(CATALOG_FILE_ID.0, 4);
         assert_eq!(BAD_DIR_FILE_ID.0, 5);
         assert_eq!(FIRST_USER_CATALOG_NODE_ID.0, 16);
+    }
+
+    #[test]
+    fn journal_pseudo_file_ids_match_apple() {
+        assert_eq!(JOURNAL_FILE_ID.0, 16);
+        assert_eq!(JOURNAL_INFO_FILE_ID.0, 17);
+        assert_eq!(FIRST_POST_JOURNAL_CNID.0, 18);
+        assert_eq!(FIRST_POST_JOURNAL_CNID.0, JOURNAL_INFO_FILE_ID.0 + 1);
     }
 
     #[test]
