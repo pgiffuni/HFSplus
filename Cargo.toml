@@ -29,11 +29,14 @@ path = "src/bin/hfsinspect.rs"
 name = "hfsls"
 path = "src/bin/hfsls.rs"
 
-# No third-party dependencies are used by the library at this stage.
 # The format, B-tree and catalog layers are pure Rust so that every
 # on-disk field is decoded explicitly and bounds-checked, which is a
 # hard requirement for treating disk images as untrusted input.
+#
+# zlib-rs provides RFC 1950 compression for decmpfs type 2 (CMP_Type2),
+# matching Apple's use of the standard C zlib library.
 [dependencies]
+zlib-rs = "0.6"
 
 [dev-dependencies]
 

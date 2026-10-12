@@ -141,8 +141,15 @@ wrapping at `size`, sequence bump), `release_transaction` (start advance), `Jour
 journal offset), the deferred-header-write flag, the `TransactionBuffer` in-memory block
 buffer (the port of `block_list_header_in_memory`), and `commit_transaction` the full
 commit path (encode, write with ring-wrap, barrier sync, advance cursor, write header).
-What remains is wiring `commit_transaction` into the mutating write paths so a journalled
-volume accepts writes.
+`commit_transaction` is wired in and called by every mutating write path in
+`WritableVolume`: each mutation method wraps its writes in
+`begin_transaction` / `end_transaction`, records before-images via
+`journal_write`, and commits or abandons the transaction on success or failure.
+
+The `nextAllocation` hint advances after allocation (mirroring `HFS_UPDATE_NEXT_ALLOCATION`
+in `BlockFindAny`) and retreats on free when the freed range abuts the hint
+(mirroring `BlockDeallocate`), persisting each update to the primary and alternate
+volume headers so a crash or replay sees a consistent value.
 
 ## Timestamps
 
@@ -251,8 +258,8 @@ Three findings, none of which the crate had recorded:
 | Apple | `bsd/sys/decmpfs.h` `struct decmpfs_disk_header`; `core/hfs_xattr.c` `hfs_vnop_getxattr` (filtering); `core/hfs_readwrite.c` `hfs_read` (read redirection); `livefiles_hfs_plugin/lf_hfs_vnode.c` (live read of the decmpfs xattr) |
 | Structures | on-disk `decmpfs_disk_header`: magic, type, uncompressed_size (16 bytes, little-endian) |
 | Invariants | the attribute is hidden from the extended-attribute interface; for fork-backed types the xattr is exactly 16 bytes |
-| Rust | `src/compression/mod.rs` — `DecmpfsHeader`, `CompressionType`, `decompress` |
-| Differences | the HFS+ metadata layer is native; the compression algorithms beneath it are custom pure-Rust decoders (see below) |
+| Rust | `src/compression/mod.rs` — `DecmpfsHeader`, `CompressionType`, `decompress`, `compress` |
+| Differences | the HFS+ metadata layer is native; the compression algorithms beneath it are custom pure-Rust decoders (see below); `compress` uses `zlib-rs` for type 2 |
 
 Where the metadata lives: an attribute named `com.apple.decmpfs`, **filtered out
 of `listxattr` and `getxattr`**. So a reader that enumerates attributes does not
@@ -298,17 +305,17 @@ The named constant in Apple's header is only `CMP_Type1 = 1` ("uncompressed data
 in xattr"). Types 2–7 are defined in the AppleFSCompression kext (not
 open-sourced), but their numeric assignments are established by macOS practice:
 
-| value | meaning | decompressor |
-|-------|---------|-------------|
-| 1 | uncompressed (inline in xattr) | returns raw bytes |
-| 2 | ZLIB (RFC 1950/1951) | `src/compression/zlib.rs` |
-| 3 | LZFSE | `src/compression/lzfse.rs` (V1, V2, LZVN-in-LZFSE) |
-| 4 | LZVN | `src/compression/lzvn.rs` |
-| 5 | BZIP2 | unsupported |
-| 6 | LZMA | unsupported |
-| 7 | LZ4 frame | `src/compression/lz4.rs` |
-| 0x80000001 | DATALESS_CMPFS_TYPE | rejected |
-| 0x80000002 | DATALESS_PKG_CMPFS_TYPE | rejected |
+| value | meaning | decompressor | encoder |
+|-------|---------|-------------|---------|
+| 1 | uncompressed (inline in xattr) | returns raw bytes | returns data verbatim (`compress`) |
+| 2 | ZLIB (RFC 1950/1951) | `zlib-rs` (type 2) | `zlib-rs` streaming `Deflate`/`Inflate` |
+| 3 | LZFSE | `src/compression/lzfse.rs` (V1, V2, LZVN-in-LZFSE) | not yet implemented |
+| 4 | LZVN | `src/compression/lzvn.rs` | not yet implemented |
+| 5 | BZIP2 | unsupported | not yet implemented |
+| 6 | LZMA | unsupported | not yet implemented |
+| 7 | LZ4 frame | `src/compression/lz4.rs` | not yet implemented |
+| 0x80000001 | DATALESS_CMPFS_TYPE | rejected | N/A |
+| 0x80000002 | DATALESS_PKG_CMPFS_TYPE | rejected | N/A |
 
 ### Compression decoders
 
@@ -321,16 +328,12 @@ final choice.
 
 | aspect | detail |
 | --- | --- |
-| Upstream implementation | Apple kernel links the standard C zlib; `zlib-rs` is the canonical pure-Rust port |
-| Upstream license | zlib License (BSD-compatible) for C zlib; `zlib-rs` is MIT OR Apache-2.0 |
-| Why retained (custom) | the custom decoder in `src/compression/zlib.rs` was fixed (Huffman leaf-check ordering, zero-length code counting, code-length overflow clamping) and now passes 19 tests; replacing it is a future option, not required for correctness |
-| Test vectors | 19 tests in `src/compression/zlib.rs` including RFC 1951 dynamic-Huffman round-trips, fixed-Huffman blocks, stored blocks, and round-trip verification against Python `zlib.compress` output |
-| `unsafe` present | none — `#![deny(unsafe_code)]` is set crate-wide |
+| Upstream implementation | Apple kernel links the standard C zlib; `zlib-rs` (v0.6) is the canonical pure-Rust port |
+| Upstream license | MIT OR Apache-2.0 (compatible with the crate's BSD-2-Clause) |
+| Why retained | previously a custom decoder in `src/compression/zlib.rs` was written from scratch and fixed (Huffman leaf-check ordering, zero-length code counting, code-length overflow clamping); with the introduction of `zlib-rs` as a compression dependency, the custom decoder was replaced by `zlib-rs` for both compression and decompression to avoid maintaining two implementations of the same algorithm |
+| Test vectors | round-trip tests in `src/compression/mod.rs` and end-to-end read/write tests in `tests/compression.rs` and `tests/write.rs` |
+| `unsafe` present | none in crate code — `#![deny(unsafe_code)]` is set crate-wide; `zlib-rs` uses internal `unsafe` as a dependency |
 | Fuzz/property testing | none; decoders are covered by known-answer tests only |
-
-**Replacement candidate:** `zlib-rs` (MIT OR Apache-2.0) is an acceptable
-license-compatible pure-Rust alternative. It is noted as a future option in
-case the custom decoder proves untenable, but is not required for correctness.
 
 #### LZ4 Frame (type 7)
 
@@ -362,6 +365,23 @@ case the custom decoder proves untenable, but is not required for correctness.
 | Upstream license | BSD-2-Clause for libbz2; Public Domain for liblzma |
 | Why unsupported | no license-compatible pure-Rust decoder exists in the crate cache; vendoring would require a C build step (violating the pure-Rust constraint in `Cargo.toml`) |
 | Error behavior | these types return `Error::Unsupported` so callers can distinguish "compressed but decoder absent" from "not compressed"
+
+### Compression writer
+
+| | |
+| --- | --- |
+| Apple | `core/hfs_vfsops.c` `hfs_vnop_write` (refuses compressed); `core/hfs_cnode.c` `hfs_set_bsd_flags` (sets `UF_COMPRESSED` in `admin_flags`); `core/hfs_xattr.c` `hfs_vnop_setxattr` (writes `com.apple.decmpfs`) |
+| Structures | `DecmpfsHeader` serialised as 16 little-endian bytes; `UF_COMPRESSED` (0x20) in `BsdInfo.admin_flags` |
+| Invariants | a file transitions to compressed as a unit: set the xattr, write the resource fork (for types 2+), then set `UF_COMPRESSED` in the catalog record; `write_file_contents` refuses writes to an existing compressed file with `EOPNOTSUPP` |
+| Rust | `src/compression/mod.rs` `compress`; `src/volume/mod.rs` `create_compressed_file`, `UF_COMPRESSED` constant |
+| Differences | type 1 stores the payload inline in the xattr (16-byte header + raw data); type 2 stores only the header in the xattr and the zlib stream in the resource fork, mirroring Apple's fork-backed layout for types 2–7 |
+
+`compress` is the write-side counterpart to `decompress`. For type 1 it returns
+the data verbatim; for type 2 it produces an RFC 1950 zlib stream using `zlib-rs`
+(the pure-Rust port). Types 3–7 encoders are not yet implemented; their decoder
+implementations are complete and could serve as a reference once an encoder
+strategy is chosen, but the LZFSE encoder source lives in the external
+`lzfse/lzfse` repo (BSD-3-Clause) and translating it is a separate milestone.
 
 The other attribute names HFS+ writes for its own bookkeeping are pinned in
 `src/attributes/names.rs`, verified against the source rather than recalled: they
@@ -471,25 +491,25 @@ compression metadata (7B.2) are done and appear above.
 | Catalog record updates | `core/hfs_catalog.c` `cat_update`, `catrec_update`, `buildrecord`; `core/hfs_xattr.c` | Milestone 9B |
 | A rename between two spellings of one name | `core/hfs_catalog.c` `cat_rename`'s `btExists` path | done |
 | Moving a folder beneath itself | `core/hfs_catalog.c` `cat_rename`'s cycle check | done |
-| Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | Milestone 11 |
+| Attribute-list and FinderInfo writes | `core/hfs_xattr.c` | done (Milestone 11) |
 | **The private hardlinks folder** | `core/hfs_link.c` `hfs_private_names`, `HFSPLUSMETADATAFOLDER` in `core/hfs_format.h` | Milestone 10, first |
 | **Threading** a second link's chain | `cat_lookup_lastlink`; `hl_prevLinkID`/`hl_nextLinkID` | done (Milestone 10B) |
 | **Removing** through a link | `cat_delete` refusing a record with siblings; `decvalency` | done (Milestone 10C) |
 | **The firstlink attribute** | `core/hfs_link.c` `setfirstlink`/`getfirstlink`, `FIRST_LINK_XATTR_NAME`; directory links only | not implemented (uses `hl_firstLinkID` in-folder-record instead) |
-| **The attributes-file writer** | `core/hfs_xattr.c` | Milestone 11 |
+| **The attributes-file writer** | `core/hfs_xattr.c` | done (Milestone 11) |
 | **Unlinking** through a link | `cat_delete` refusing a record with siblings | done (Milestone 10C) |
 | Extents overflow | `core/hfs_extents.c` `extents_search` for lookup, `hfs_ext_iter_next_group` for traversal; overflow records | done (Milestone 15: insert; Milestone 8F: delete) |
-| Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | Milestone 8G |
+| Splitting an index node | `core/BTreeNodeOps.c` `SplitRecord`, `SplitLeafNode`; `core/BTree.c` `BTInsertRecord`'s split path | done (Milestone 8G) |
 | Deleting a leaf record | `core/BTree.c` `BTDeleteRecord` — the remove path: `RemoveRecord`, `DeleteNode` | done (Milestone 8F) |
-| Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | Milestone 8F |
+| Freeing B-tree nodes | `core/BTreeAllocate.c` `ReleaseNode`, `free_nodes` | done (Milestone 8F) |
 | Directory hard links | `hfs_makelink`'s `CD_ISDIR` path; `HFSPLUS_DIR_METADATA_FOLDER`; the `firstlink` attribute | **done** (Milestone 10D) |
 | Opened-but-deleted files in the metadata directory | `HFS_DELETE_PREFIX "temp"`; TN1150's Hard Links section | Milestone 10D |
 | The metadata zone | `core/VolumeAllocation.c` `HFS_METADATA_ZONE`, `hfs_metazone_end`; `core/hfs_meta_zone.c` | not planned |
 | **Writing** a journal transaction -- ordering, space, header advance | `core/hfs_vfsutils.c` `hfs_start_transaction`/`hfs_end_transaction`; `core/hfs_journal.c` `check_free_space`, `journal_open` | done |
-| The transaction's in-memory block buffer | `core/hfs_journal.c` the `block_list_header_in_memory` buffers a dirty block is copied into | Milestone 12 |
-| `binfo[]` capacity and multi-list splitting | `MAX_BLISTHDR_BLKS` | Milestone 12 |
+| The transaction's in-memory block buffer | `core/hfs_journal.c` the `block_list_header_in_memory` buffers a dirty block is copied into | done |
+| `binfo[]` capacity and multi-list splitting | `MAX_BLISTHDR_BLKS` | done |
 | Deferred journal-header writes | `tr->delayed_header_write`, `write_header_thread` | done |
-| The syncer and `nextAllocation` interactions | `hfs_syncer`, `HFS_SKIP_UPDATE_NEXT_ALLOCATION` | Milestone 12 |
+| The syncer and `nextAllocation` interactions | `hfs_syncer`, `HFS_SKIP_UPDATE_NEXT_ALLOCATION` | done |
 
 ### The "exchange" is not an exchange
 
@@ -561,7 +581,7 @@ move would leave four entries where there should be three.
 
 ## Hard links: what `fsck` says, and why writing one is blocked
 
-Hard links are the next milestone and they are **not started**. The reading side is
+Hard links were the next milestone. As of Milestone 10, creation and removal are implemented and fsck-verified. The reading side is
 already in place from an earlier milestone -- `is_hard_link()`, `link_count()`,
 `link_reference()`, `first_link_id()`, and a `BsdInfo` whose fields already
 document that `ownerID` is "`ownerID`, or `prevLinkID` for a hard link". What is
@@ -1180,14 +1200,30 @@ rather than approximated:
   a refusal naming 8D. That is also what stops a catalog growing indefinitely.
   (Overflow records *can* be deleted on truncation — Milestone 8F – but the tree
   cannot grow new nodes to hold further insertions.)
-- **Nothing can be written to a journaled volume.** `WritableVolume::open` refuses
-  one, because a write that is not journalled leaves a journal that does not
-  describe the volume.
+- **Nothing can be written to a non-replayed journaled volume.** `WritableVolume::open`
+  requires the journal to be replayed before accepting writes, because a volume whose
+  journal holds un-applied transactions has a filesystem state that does not exist.
 
-Two things are refused for a different reason, because the alternative is worse
-than a refusal. A catalog more than two levels deep, whose parent index node would
-itself need splitting, is Milestone 8G; and a leaf split divides by bytes, so a
-tree that would end up three levels deep is refused rather than half-split.
+1187|◊| Two things are refused for a different reason, because the alternative is worse
+1188|◊| than a refusal. A catalog more than three levels deep, whose root index node would
+1189|◊| itself need splitting, is refused — that is Milestone 8G's limit (the depth-2→3
+1190|◊| transition is implemented, depth 3→4 is not); and a leaf split divides by bytes, so a
+1191|◊| tree that would end up three levels deep is refused rather than half-split.
+1192|◊| 
+1193|◊| The catalog's growth is bounded by eight inline extent slots, which -- with contiguous
+1194|◊| extent merging -- now reaches far past the point where it ran out before. Past eight
+1195|◊| non-contiguous growths the answer is still a refusal naming the Extents B-tree
+1196|◊| (Milestone 8D).
+1197|◊| 
+1198|◊| ### 8F: Deleting B-tree records (done)
+1199|◊| 
+1200|◊| | | |
+1201|◊| | --- | --- |
+1202|◊| | Apple | `core/BTree.c` `BTDeleteRecord` (walk to leaf, call `RemoveRecord`, delete empty nodes up the tree); `core/BTree.c` `DeleteNode` (free the node, decrement parent count, possibly merge) |
+1201|◊| | Structures | the index chain in a B-tree records the first key of each subtree; removing that key from a leaf invalidates the separator in the parent index node; removing all a parent's children leaves it empty and it must be freed too |
+1203|◊| | Invariants | removing the first record of a leaf invalidates the sibling's index separator; freeing an emptied leaf requires splicing it out of the leaf chain (forward/backward links), fixing `firstLeafNode`/`lastLeafNode` in the header record, removing its index record from the parent, incrementing `freeNodes`, and clearing its bit in the node map; an emptied parent index node must be freed recursively, collapsing the tree depth when the root is emptied |
+1204|◊| | Rust | `src/volume/mod.rs` `remove_catalog_record` (now captures the parent index node *before* removal, since an emptied leaf has no first record for `parent_of_leaf` to descend with); `free_empty_leaf` (splices the leaf out of the chain, fixes header pointers, frees the node, removes the index record from the captured parent); `remove_index_child` (finds and excises the child's index record from an index node); `shrink_index_chain` (frees an emptied middle index node by removing it from the root, and collapses the tree to depth 1 when the root is emptied) |
+1205|◊| | Differences | empty leaves are freed (not merged with a sibling that has room); the B-tree never rebalances on underflow, so a depth-3 tree with one leaf surviving under a middle index node stays at depth 3 rather than collapsing to depth 1. This matches Apple's behaviour of not merging non-empty nodes during deletion, but differs from a fully rebalanced tree — fsck is satisfied, the structure is correct, and subsequent inserts split from the correct depth. |
 
 ## Symbolic links
 

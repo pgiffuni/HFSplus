@@ -6,6 +6,10 @@
 //! extended attribute. A file marked compressed has its real contents stored in a
 //! compressed form, and a reader must decompress them on demand.
 //!
+//! This module also provides [`compress`], the inverse operation: it produces
+//! the on-disk payload for a given [`CompressionType`], so that callers can
+//! create compressed files that round-trip through [`decompress`].
+//!
 //! ## On-disk layout
 //!
 //! The `com.apple.decmpfs` attribute value begins with a 16-byte header stored
@@ -94,7 +98,6 @@ use crate::error::{Error, Result};
 mod lz4;
 mod lzfse;
 mod lzvn;
-mod zlib;
 
 /// The `0x636d7066` literal Apple writes in `compression_magic`.
 ///
@@ -103,6 +106,10 @@ mod zlib;
 ///
 /// Mining reference: `bsd/sys/decmpfs.h` `CMP_MAGIC`.
 pub const CMP_MAGIC: u32 = 0x636d7066;
+
+/// Default compression level for ZLIB (type 2), matching Apple's use of
+/// `Z_DEFAULT_COMPRESSION` (level 6) in `decmpfs_update_attributes`.
+pub const ZLIB_DEFAULT_LEVEL: i32 = 6;
 
 /// The on-disk `decmpfs_disk_header` structure, decoded as little-endian bytes.
 ///
@@ -193,6 +200,15 @@ impl DecmpfsHeader {
             0
         }
     }
+
+    /// Serialise the 16-byte header to little-endian bytes.
+    pub fn to_bytes(&self) -> [u8; Self::SIZE] {
+        let mut out = [0u8; Self::SIZE];
+        out[0..4].copy_from_slice(&self.compression_magic.to_le_bytes());
+        out[4..8].copy_from_slice(&self.compression_type.as_raw().to_le_bytes());
+        out[8..16].copy_from_slice(&self.uncompressed_size.to_le_bytes());
+        out
+    }
 }
 
 /// Compression algorithm identifiers used in `decmpfs_header.compression_type`.
@@ -276,7 +292,7 @@ pub fn decompress(
     uncompressed_size: u64,
 ) -> Result<Vec<u8>> {
     match compression_type {
-        CompressionType::Zlib => zlib::inflate(data, uncompressed_size),
+        CompressionType::Zlib => inflate_zlib(data, uncompressed_size),
         CompressionType::Lz4 => lz4::decode_frame(data, uncompressed_size),
         CompressionType::Uncompressed => {
             if data.len() != uncompressed_size as usize {
@@ -301,6 +317,108 @@ pub fn decompress(
             format!("unknown compression type {v}"),
         )),
     }
+}
+
+/// Compress `data` using the algorithm selected by `compression_type`.
+///
+/// This is the write-side counterpart to [`decompress`]. It produces the
+/// on-disk payload that, when stored alongside a [`DecmpfsHeader`] of the
+/// matching type, will decompress back to `data`.
+///
+/// - **Type 1** (`Uncompressed`): returns `data` verbatim — the payload is
+///   stored inline in the `com.apple.decmpfs` attribute after the 16-byte header.
+/// - **Type 2** (`Zlib`): produces an RFC 1950 zlib stream via `zlib-rs`,
+///   matching Apple's use of the standard C `zlib` library.
+/// - Types 3–7 and the data-less markers are not yet supported for writing.
+pub fn compress(data: &[u8], compression_type: CompressionType) -> Result<Vec<u8>> {
+    match compression_type {
+        CompressionType::Uncompressed => Ok(data.to_vec()),
+        CompressionType::Zlib => {
+            use zlib_rs::{Deflate, DeflateFlush, Status};
+
+            // RFC 1950 bound: compressed data is at most 0.03% larger than
+            // the input, plus 12 bytes of overhead.
+            let max_out = data.len() / 1000 + 12 + data.len();
+            let mut output = vec![0u8; max_out];
+
+            let mut deflate = Deflate::new(ZLIB_DEFAULT_LEVEL, true, 15);
+            let before = deflate.total_out() as usize;
+            let status = deflate
+                .compress(data, &mut output, DeflateFlush::Finish)
+                .map_err(|e| Error::Io {
+                    message: format!("zlib compress: {e:?}"),
+                })?;
+            let after = deflate.total_out() as usize;
+
+            if status != Status::StreamEnd {
+                return Err(Error::Io {
+                    message: format!("zlib compress did not finish: {status:?}"),
+                });
+            }
+
+            Ok(output[before..after].to_vec())
+        }
+        CompressionType::Lzfse
+        | CompressionType::Lzvn
+        | CompressionType::Bzip2
+        | CompressionType::Lzma
+        | CompressionType::Lz4 => Err(Error::unsupported(format!(
+            "compression type {compression_type:?} is not yet implemented for writing"
+        ))),
+        CompressionType::Dataless | CompressionType::DatalessPkg => Err(Error::invalid(
+            "compression type",
+            "data-less markers cannot carry payload",
+        )),
+        CompressionType::Unknown(v) => Err(Error::invalid(
+            "compression type",
+            format!("unknown compression type {v}"),
+        )),
+    }
+}
+
+/// Inflate a zlib (RFC 1950) stream using `zlib-rs`.
+///
+/// `data` must begin with the 2-byte zlib header (CMF, FLG). The
+/// `uncompressed_size` is used as a hint for the output buffer and for
+/// validation.
+fn inflate_zlib(data: &[u8], expected_size: u64) -> Result<Vec<u8>> {
+    use zlib_rs::{Inflate, InflateFlush, Status};
+
+    // Allocate generously; the output can be at most `expected_size` bytes.
+    let hint = expected_size.min(1u64 << 20) as usize;
+    let mut out = vec![0u8; hint.max(1)];
+    let mut result = Vec::new();
+    let mut inflater = Inflate::new(true, 15);
+    let mut input_pos = 0;
+
+    loop {
+        let status = inflater
+            .decompress(&data[input_pos..], &mut out, InflateFlush::Finish)
+            .map_err(|e| Error::Io {
+                message: format!("zlib inflate: {e:?}"),
+            })?;
+
+        let written = inflater.total_out() as usize - result.len();
+        result.extend_from_slice(&out[..written]);
+
+        input_pos = inflater.total_in() as usize;
+        if input_pos >= data.len() || status == Status::StreamEnd {
+            break;
+        }
+    }
+
+    if result.len() != expected_size as usize {
+        return Err(Error::invalid(
+            "zlib stream",
+            format!(
+                "decompressed {} bytes but header claims {}",
+                result.len(),
+                expected_size
+            ),
+        ));
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]

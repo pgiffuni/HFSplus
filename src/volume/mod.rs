@@ -3763,8 +3763,20 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             });
         };
 
-        let (at, buf, count) = {
-            use crate::btree::io::BTreeFile;
+        let tree_depth = self.btree_header_u16(crate::btree::header::TREE_DEPTH_OFFSET)?;
+
+        // Capture the parent index node *before* the removal. Once a leaf is
+        // emptied it has no first record, so `parent_of_leaf` can no longer
+        // descend through it. Finding the parent now (using the leaf's first
+        // record while it still has one) gives us the node to patch when the
+        // leaf must be freed.
+        let parent_num = if tree_depth >= 3 {
+            Some(self.parent_of_leaf(node_num)?)
+        } else {
+            None
+        };
+
+        let (at, buf, count, first_changed) = {
             let bt = BTreeFile::open(
                 &*self.device,
                 &self.header.catalog_file,
@@ -3772,9 +3784,22 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 self.header.is_hfsx(),
             )?;
             let mut buf = bt.read_node_bytes(node_num)?;
+            // Capture the first record before removal, so the caller can tell
+            // whether the index separator for this leaf needs refreshing.
+            let first_before = if buf[10] > 0 {
+                Some(Self::record_at(&buf, 0))
+            } else {
+                None
+            };
             remove_record(&mut buf, usize::from(index))?;
             let count = num_records(&buf)?;
-            (bt.node_offset(node_num)?, buf, count)
+            let first_after = if count > 0 {
+                Some(Self::record_at(&buf, 0))
+            } else {
+                None
+            };
+            let first_changed = first_before != first_after && first_after.is_some();
+            (bt.node_offset(node_num)?, buf, count, first_changed)
         };
         self.journal_write(at, &buf)?;
 
@@ -3784,10 +3809,242 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         })?;
         self.write_btree_header_u32(crate::btree::header::LEAF_RECORDS_OFFSET, leaf_records)?;
 
-        let _ = count;
         // A removal can change the leaf's *first* record, which is what the index
-        // separator for it is.
-        self.refresh_index()
+        // separator for it is. At depth 2 the entire root is rebuilt from the leaf
+        // chain; at depth 3+ the specific separator in the parent index node is
+        // updated in place.
+        if first_changed && count > 0 {
+            self.refresh_separator(node_num)?;
+        }
+
+        // If the leaf is now empty it must be freed, otherwise the node bitmap,
+        // `freeNodes`, and `leafRecords` all disagree -- which `fsck.hfsplus`
+        // reports as "Invalid node structure".
+        if count == 0 {
+            self.free_empty_leaf(node_num, parent_num, tree_depth)?;
+        }
+
+        Ok(())
+    }
+
+    /// Merge an emptied leaf into a sibling and return the node to the free list.
+    ///
+    /// Called when `remove_record` left `leaf_num` with zero records. The leaf is
+    /// spliced out of the doubly-linked leaf chain, the parent index separator for
+    /// the remaining sibling (or the next leaf's first key) is refreshed, the node
+    /// bitmap and `freeNodes`/`totalNodes` are updated, and first/last leaf
+    /// pointers in the header record are corrected if the freed node was an end
+    /// point.
+    ///
+    /// If the leaf had no sibling (the only leaf), the leaf is left in place -- the
+    /// tree stays at depth 1 with an empty root leaf, which is the state `mkfs`
+    /// produces and a re-insert will refill.
+    fn free_empty_leaf(
+        &mut self,
+        leaf_num: u32,
+        pre_parent: Option<u32>,
+        tree_depth: u16,
+    ) -> Result<()> {
+        use crate::btree::header::{
+            free_node, FREE_NODES_OFFSET, LAST_LEAF_OFFSET, ROOT_NODE_OFFSET, TREE_DEPTH_OFFSET,
+        };
+
+        let f_link = {
+            let leaf = self.read_catalog_node(leaf_num)?;
+            u32::from_be_bytes([leaf[0], leaf[1], leaf[2], leaf[3]])
+        };
+        let b_link = {
+            let leaf = self.read_catalog_node(leaf_num)?;
+            u32::from_be_bytes([leaf[4], leaf[5], leaf[6], leaf[7]])
+        };
+
+        // The victim's right sibling is preferred: it inherits the freed node's
+        // position in the chain and its first record becomes the separator. If
+        // there is no right sibling, the left sibling takes over. If neither
+        // exists this was the only leaf and stays put.
+        let (_survivor, prev_sibling) = if f_link != 0 {
+            (f_link, leaf_num)
+        } else if b_link != 0 {
+            (b_link, leaf_num)
+        } else {
+            return Ok(());
+        };
+
+        // Relink the chain around the survivor, skipping the freed node.
+        // `survivor` is either the old forward link or the old back link of
+        // `leaf_num`; splicing `leaf_num` out means connecting its back to its
+        // forward link directly.
+        {
+            let (sb, bb) = {
+                let leaf = self.read_catalog_node(leaf_num)?;
+                (
+                    u32::from_be_bytes([leaf[0], leaf[1], leaf[2], leaf[3]]),
+                    u32::from_be_bytes([leaf[4], leaf[5], leaf[6], leaf[7]]),
+                )
+            };
+            // Walk the chain to fix the back link of f_link and the forward
+            // link of b_link.
+            if sb != 0 {
+                let mut succ = self.read_catalog_node(sb)?;
+                succ[4..8].copy_from_slice(&bb.to_be_bytes());
+                self.write_catalog_node(sb, &succ)?;
+            }
+            if bb != 0 {
+                let mut pred = self.read_catalog_node(bb)?;
+                pred[0..4].copy_from_slice(&sb.to_be_bytes());
+                self.write_catalog_node(bb, &pred)?;
+            }
+        }
+
+        // Fix first/last leaf pointers in the B-tree header record.
+        let first_leaf = self.btree_header_u32(crate::btree::header::FIRST_LEAF_OFFSET)?;
+        let last_leaf = self.btree_header_u32(LAST_LEAF_OFFSET)?;
+        if first_leaf == leaf_num {
+            self.write_btree_header_u32(crate::btree::header::FIRST_LEAF_OFFSET, f_link)?;
+        }
+        if last_leaf == leaf_num {
+            self.write_btree_header_u32(LAST_LEAF_OFFSET, b_link)?;
+        }
+
+        // Free the node: update the bitmap and freeNodes.
+        let mut free_nodes = self.btree_header_u32(FREE_NODES_OFFSET)?;
+        {
+            let mut header = self.read_catalog_node(0)?;
+            free_node(&mut header, &mut free_nodes, leaf_num)?;
+            self.write_catalog_node(0, &header)?;
+        }
+        self.write_btree_header_u32(FREE_NODES_OFFSET, free_nodes)?;
+
+        // The parent index node still references `leaf_num`. At depth 2 the root
+        // is rebuilt from the chain (which no longer includes `leaf_num`), so
+        // `refresh_index` handles it. At depth 3 the parent's separator must be
+        // patched: remove the index record pointing at `leaf_num`.
+        let parent_maybe_empty = if tree_depth >= 3 {
+            let Some(parent_num) = pre_parent else {
+                return Err(Error::invalid(
+                    "catalog parent",
+                    "depth >= 3 but no parent was captured before removal",
+                ));
+            };
+            self.remove_index_child(parent_num, leaf_num)?;
+            parent_num
+        } else {
+            // depth 2: root rebuilt from the surviving leaf chain.
+            self.refresh_index()?;
+            0
+        };
+
+        // If the parent index node is now empty, walk up the tree freeing empty
+        // ancestors.
+        if tree_depth >= 3 && parent_maybe_empty != 0 {
+            let parent_after = self.read_catalog_node(parent_maybe_empty)?;
+            let parent_count = crate::btree::node::num_records(&parent_after)?;
+            if parent_count == 0 {
+                self.shrink_index_chain(parent_maybe_empty)?;
+            }
+        }
+
+        let _ = prev_sibling;
+        let _ = ROOT_NODE_OFFSET;
+        let _ = TREE_DEPTH_OFFSET;
+        Ok(())
+    }
+
+    /// Remove the index record in `node_num` that points at `child_num`.
+    ///
+    /// Searches the index node's records for the one whose child pointer equals
+    /// `child_num` and excises that record from the node, compacting the offset
+    /// array.
+    fn remove_index_child(&mut self, node_num: u32, child_num: u32) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+
+        let (at, buf) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if !matches!(node.kind(), NodeKind::Index) {
+                return Err(Error::invalid("node kind", "expected an index node"));
+            }
+            let mut found = None;
+            for index in 0..node.num_records() {
+                if node.child(index)? == child_num {
+                    found = Some(usize::from(index));
+                    break;
+                }
+            }
+            let Some(idx) = found else {
+                return Ok(());
+            };
+            let mut buf = bytes;
+            crate::btree::node::remove_record(&mut buf, idx)?;
+            (bt.node_offset(node_num)?, buf)
+        };
+        self.journal_write(at, &buf)?;
+        Ok(())
+    }
+
+    /// Walk up the tree from an emptied index node, freeing empty ancestors.
+    ///
+    /// Called after removing a record from a parent index node leaves it with
+    /// zero records. At depth 3 the parent of a middle index node is the root
+    /// (read from the header, no descent needed). If the root is emptied the
+    /// tree collapses: depth drops to 1, the root becomes an empty leaf, and
+    /// first/last leaf point at it. This is the state a freshly formatted but
+    /// empty volume is in, so a subsequent insert will split and rebuild.
+    fn shrink_index_chain(&mut self, empty_node: u32) -> Result<()> {
+        use crate::btree::header::{
+            free_node, FIRST_LEAF_OFFSET, FREE_NODES_OFFSET, LAST_LEAF_OFFSET, ROOT_NODE_OFFSET,
+            TREE_DEPTH_OFFSET,
+        };
+
+        let root_node = self.btree_header_u32(ROOT_NODE_OFFSET)?;
+        if empty_node == root_node {
+            // The root itself is empty: collapse to depth 1 with an empty leaf root.
+            self.write_btree_header_u16(TREE_DEPTH_OFFSET, 1)?;
+            let node_size = self.catalog_node_size()?;
+            let empty_root = Self::build_node(node_size, 0xFF, 1, 0, 0, &[])?;
+            self.write_catalog_node(root_node, &empty_root)?;
+            self.write_btree_header_u32(FIRST_LEAF_OFFSET, root_node)?;
+            self.write_btree_header_u32(LAST_LEAF_OFFSET, root_node)?;
+            // The root node is already allocated; just mark it as in-use (bit set).
+            // No free_nodes change needed because we're reusing the root.
+            return Ok(());
+        }
+
+        // At depth 3, the parent of a middle index node is always the root.
+        // Remove `empty_node` from the root, free it, and check if the root
+        // is now empty.
+        self.remove_index_child(root_node, empty_node)?;
+
+        // Free the empty index node.
+        let mut free_nodes = self.btree_header_u32(FREE_NODES_OFFSET)?;
+        {
+            let mut header = self.read_catalog_node(0)?;
+            free_node(&mut header, &mut free_nodes, empty_node)?;
+            self.write_catalog_node(0, &header)?;
+        }
+        self.write_btree_header_u32(FREE_NODES_OFFSET, free_nodes)?;
+
+        // Check if the root is now empty.
+        let root = self.read_catalog_node(root_node)?;
+        let root_recs = crate::btree::node::num_records(&root)?;
+        if root_recs == 0 {
+            // Root has no more children: collapse to depth 1.
+            self.write_btree_header_u16(TREE_DEPTH_OFFSET, 1)?;
+            let node_size = self.catalog_node_size()?;
+            let empty_root = Self::build_node(node_size, 0xFF, 1, 0, 0, &[])?;
+            self.write_catalog_node(root_node, &empty_root)?;
+            self.write_btree_header_u32(FIRST_LEAF_OFFSET, root_node)?;
+            self.write_btree_header_u32(LAST_LEAF_OFFSET, root_node)?;
+        }
+
+        Ok(())
     }
 
     /// Read a folder record by CNID.
@@ -3845,6 +4102,28 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         self.sync_backup_header()
     }
 
+    /// Update the `nextAllocation` hint after a successful allocation.
+    ///
+    /// Apple's `BlockFindAny` only advances the hint when the allocation succeeds
+    /// *past* the current hint position -- if the allocator finds a hole earlier in
+    /// the volume, the hint stays put, because the next search from the old hint
+    /// would still find the remaining space at that position. The hint is purely
+    /// advisory: a stale value causes the next allocation to start scanning from an
+    /// old position rather than failing, but a stale hint degrades to a full bitmap
+    /// scan on every allocation, which is the throughput cost the hint exists to
+    /// prevent.
+    ///
+    /// Mining reference: `core/hfs.h` `HFS_UPDATE_NEXT_ALLOCATION`; `core/VolumeAllocation.c`
+    /// `BlockFindAny` sets `updateAllocPtr = true` only when `extent->startBlock > startingBlock`
+    /// (line 1242), then calls `HFS_UPDATE_NEXT_ALLOCATION(hfsmp, extent->startBlock)` (line 1407).
+    fn advance_next_allocation(&mut self, start: u32) -> Result<()> {
+        if start > self.header.next_allocation {
+            self.header.next_allocation = start;
+            self.write_header_u32(52, self.header.next_allocation)?;
+        }
+        Ok(())
+    }
+
     /// Split the first leaf so `record` has somewhere to go, and insert it.
     ///
     /// Called only when an insertion into a leaf has been refused for want of room.
@@ -3895,20 +4174,26 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         };
 
         let node_size = self.catalog_node_size()?;
-        // 2 is the normal depth for a catalog with an index node above its leaves,
-        // so it is not a case to refuse. 3 or more means the leaf's parent is *not*
-        // the root, and adding a key to it may require splitting that parent too --
-        // the same algorithm one level up, and refused rather than half-done.
         let tree_depth = self.btree_header_u16(TREE_DEPTH_OFFSET)?;
-        if tree_depth > 2 {
-            return Err(Error::invalid(
-                "catalog leaf",
-                format!(
-                    "the catalog is {tree_depth} levels deep and its leaf is full; \
-                     splitting the parent index node as well is not implemented"
-                ),
-            ));
-        }
+        // A tree whose leaf is the root (depth 1) takes one node. A tree with an
+        // index node above leaves (depth 2) takes none -- the root is rebuilt in
+        // place. A tree with a second index level (depth 3) may need two more: one
+        // for the leaf split and one if the parent index node also splits. Depth 4
+        // would need another level still, and is refused.
+        let needed = match tree_depth {
+            1 => 2u32,
+            2 => 1u32,
+            3 => 2u32,
+            _ => {
+                return Err(Error::invalid(
+                    "catalog leaf",
+                    format!(
+                        "the catalog is {tree_depth} levels deep and its leaf is full; \
+                         splitting the parent index node as well is not implemented"
+                    ),
+                ));
+            }
+        };
 
         let mut total_nodes = self.btree_header_u32(crate::btree::header::TOTAL_NODES_OFFSET)?;
         let mut free_nodes = self.btree_header_u32(FREE_NODES_OFFSET)?;
@@ -3921,10 +4206,6 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         let root_node = self.btree_header_u32(ROOT_NODE_OFFSET)?;
         let leaf_is_root = root_node == leaf_num;
 
-        // Two nodes when the leaf is the root -- a new leaf and a new index node --
-        // and one otherwise. Checked before allocating anything, so a refusal leaves
-        // the map exactly as it was.
-        let needed = if leaf_is_root { 2u32 } else { 1u32 };
         if free_nodes < needed {
             // No node free. Growing the catalog is the alternative to refusing, and
             // it is what makes a volume writable more than a few dozen times. The
@@ -4054,19 +4335,278 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             // before the depth is 2 reads a header describing a deeper tree than the
             // nodes do.
             self.write_btree_header_u16(TREE_DEPTH_OFFSET, tree_depth + 1)?;
+        } else if tree_depth == 3 {
+            // tree_depth == 3: root index node → middle index node → leaf.
+            //
+            // The leaf split above produced `new_leaf`. The middle index node (the
+            // parent) must learn the first key of `new_leaf` as a new separator. If
+            // the parent has room that is a simple insertion; if the parent is also
+            // full it is split in two and its own separator is pushed to the root,
+            // which is the depth-3 instance of the same split-and-promote that
+            // `split_leaf_and_insert` performs one level down.
+            let parent_num = self.parent_of_leaf(leaf_num)?;
+            let new_leaf_first = Self::record_at(&self.read_catalog_node(new_leaf)?, 0)?;
+            let separator = Self::index_record(&new_leaf_first, new_leaf)?;
+            let parent_bytes = self.read_catalog_node(parent_num)?;
+            let parent_free = crate::btree::node::free_space(&parent_bytes)?;
+            let need = separator.len() + crate::btree::node::OFFSET_SIZE;
+            if parent_free >= need {
+                self.insert_index_record(parent_num, &separator)?;
+            } else {
+                // Parent is full: split it and push a separator to the root.
+                let mut header = self.read_catalog_node(0)?;
+                let new_parent = allocate_node(&mut header, total_nodes, &mut free_nodes)?;
+                self.write_catalog_node(0, &header)?;
+                self.write_btree_header_u32(FREE_NODES_OFFSET, free_nodes)?;
+                let (lower_parent, upper_parent, push_sep) =
+                    self.split_index_node(parent_num, &separator, new_parent, node_size)?;
+                self.write_catalog_node(parent_num, &lower_parent)?;
+                self.write_catalog_node(new_parent, &upper_parent)?;
+                // The root gains one record. If it fits, insert; if not, the tree
+                // would need depth 4, which is not implemented.
+                let root_bytes = self.read_catalog_node(root_node)?;
+                let root_free = crate::btree::node::free_space(&root_bytes)?;
+                let root_need = push_sep.len() + crate::btree::node::OFFSET_SIZE;
+                if root_free < root_need {
+                    return Err(Error::invalid(
+                        "catalog root",
+                        "the root index node is full and splitting it (depth 4) is not implemented",
+                    ));
+                }
+                self.insert_index_record(root_node, &push_sep)?;
+            }
         } else {
-            let records = self.index_records_for_chain()?;
-            let root = self.read_catalog_node(root_node)?;
-            let node = Self::build_node(node_size, 0x00, root[9], 0, 0, &records)?;
-            self.write_catalog_node(root_node, &node)?;
+            // tree_depth == 2: root index node → leaf. The root gains a separator
+            // for the new leaf. If it fits, insert it in place; if the root index
+            // node is full, the tree transitions to depth 3 by splitting the root
+            // index node and promoting a new root above it.
+            let new_leaf_first = Self::record_at(&self.read_catalog_node(new_leaf)?, 0)?;
+            let separator = Self::index_record(&new_leaf_first, new_leaf)?;
+            let root_bytes = self.read_catalog_node(root_node)?;
+            let root_free = crate::btree::node::free_space(&root_bytes)?;
+            let root_need = separator.len() + crate::btree::node::OFFSET_SIZE;
+            if root_free >= root_need {
+                self.insert_index_record(root_node, &separator)?;
+            } else {
+                // Root index is full: split it and grow to depth 3.
+                // Allocate the new root and new middle index node.
+                let mut header = self.read_catalog_node(0)?;
+                let new_root = allocate_node(&mut header, total_nodes, &mut free_nodes)?;
+                let new_middle = allocate_node(&mut header, total_nodes, &mut free_nodes)?;
+                self.write_catalog_node(0, &header)?;
+                self.write_btree_header_u32(FREE_NODES_OFFSET, free_nodes)?;
+
+                // Split the root index: the old root keeps the lower half, the new
+                // middle node gets the upper half. The separator promoted to the new
+                // root uses the upper half's first key.
+                let (lower, upper, push_sep) =
+                    self.split_index_node(root_node, &separator, new_middle, node_size)?;
+                self.write_catalog_node(root_node, &lower)?;
+                self.write_catalog_node(new_middle, &upper)?;
+                // The new root's height is tree_depth + 1: a depth-2 tree has root at
+                // height 2, so the new root sits at height 3.
+                let height = (tree_depth + 1) as u8;
+                let lower_sep = Self::index_record(&Self::record_at(&lower, 0)?, root_node)?;
+                let new_root_node =
+                    Self::build_node(node_size, 0x00, height, 0, 0, &[lower_sep, push_sep])?;
+                self.write_catalog_node(new_root, &new_root_node)?;
+                self.write_btree_header_u32(ROOT_NODE_OFFSET, new_root)?;
+                self.write_btree_header_u16(TREE_DEPTH_OFFSET, tree_depth + 1)?;
+            }
         }
         Ok(())
     }
 
-    /// One index record per leaf, in chain order: each leaf's first record's key,
-    /// then that leaf's node number.
+    /// Find the parent index node of `leaf_num` by descending from the root.
     ///
-    /// The index record is `[u16 keyLength][key][u32 child]` -- the key copied
+    /// Meaningful for trees of depth 3, where the leaf's parent is an index node
+    /// at height 2 and is not the root. At depth 2 the parent *is* the root, which
+    /// is handled in place by the caller.
+    ///
+    /// The descent follows the same rule as the reader's: the child for a key is
+    /// the child of the last index record whose key does not exceed it. The parent
+    /// is the node reached one level above the leaf.
+    fn parent_of_leaf(&self, leaf_num: u32) -> Result<u32> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        let bt = BTreeFile::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let btree_header = *bt.header();
+        let tree_depth = usize::from(btree_header.tree_depth);
+        if tree_depth < 2 {
+            return Err(Error::invalid(
+                "catalog parent",
+                format!("tree depth {tree_depth} has no index parent"),
+            ));
+        }
+        let max_key = usize::from(btree_header.max_key_length);
+        let leaf_first = Self::record_at(&self.read_catalog_node(leaf_num)?, 0)?;
+        let incoming = CatalogKey::from_record(&leaf_first, max_key)
+            .map_err(|e| Error::invalid("catalog key", e.to_string()))?;
+        let catalog = crate::catalog::lookup::Catalog::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let mut node_num = btree_header.root_node;
+        // Descend tree_depth - 2 levels: from root (height = depth) down to the
+        // parent (height = 2).
+        for _ in 0..tree_depth.saturating_sub(2) {
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if !matches!(node.kind(), NodeKind::Index) {
+                return Err(Error::invalid(
+                    "catalog parent",
+                    format!("node {node_num} is not an index node"),
+                ));
+            }
+            // The child for this key is the last child whose key does not exceed it.
+            let mut lo = 0u16;
+            let mut hi = node.num_records();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let Some((k, _)) = split_record(node.record(mid)?) else {
+                    return Err(Error::invalid(
+                        "catalog index record",
+                        "key could not be decoded",
+                    ));
+                };
+                if catalog.compare_keys(&k, &incoming) == Ordering::Greater {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            let lo = lo.saturating_sub(1);
+            node_num = node.child(lo)?;
+        }
+        Ok(node_num)
+    }
+
+    /// Insert an index record into node `node_num` at its key-sorted position.
+    ///
+    /// Used at depth 3 to add a separator into the root or a parent index node after
+    /// a split. The position is found by the same lower-bound comparison the reader
+    /// uses: the record goes at the first slot whose key is >= the incoming key.
+    fn insert_index_record(&mut self, node_num: u32, record: &[u8]) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::insert_record;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        // All reads inside a scope that borrows `self` immutably, then write outside.
+        let (at, buf) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if !matches!(node.kind(), NodeKind::Index) {
+                return Err(Error::invalid("node kind", "expected an index node"));
+            }
+            let max_key = usize::from(bt.header().max_key_length);
+            let incoming = CatalogKey::from_record(record, max_key)
+                .map_err(|e| Error::invalid("index record", e.to_string()))?;
+            let catalog = crate::catalog::lookup::Catalog::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let mut at = node.num_records();
+            for index in 0..node.num_records() {
+                let Some((k, _)) = split_record(node.record(index)?) else {
+                    continue;
+                };
+                if catalog.compare_keys(&k, &incoming) != Ordering::Less {
+                    at = index;
+                    break;
+                }
+            }
+            let mut buf = bytes;
+            insert_record(&mut buf, usize::from(at), record)?;
+            (at, buf)
+        };
+        let _ = at;
+        self.write_catalog_node(node_num, &buf)?;
+        Ok(())
+    }
+
+    /// Divide a full index node's records at the midpoint, returning the two halves
+    /// and the separator to push to the parent.
+    ///
+    /// `promoted` is the new index record that could not be inserted into the leaf's
+    /// parent because the parent was full. It is merged into the parent's record
+    /// list, the combined set is split at the byte midpoint, and the first key of the
+    /// upper half becomes the separator pushed to the root. The separator's child is
+    /// `new_upper`, the node number allocated by the caller for the upper half.
+    ///
+    /// Both halves are rebuilt from scratch by `build_node`, carrying the original
+    /// node's height. Index nodes have no sibling links (fLink/bLink are 0) and no
+    /// leaf-chain pointers, so the descriptor is written as zeros except for kind and
+    /// height.
+    fn split_index_node(
+        &self,
+        node_num: u32,
+        promoted: &[u8],
+        new_upper: u32,
+        node_size: usize,
+    ) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let parent_bytes = self.read_catalog_node(node_num)?;
+        let height = parent_bytes[9];
+        let node = crate::btree::node::Node::parse(&parent_bytes, node_size)?;
+        let incoming = crate::catalog::lookup::split_record(promoted)
+            .ok_or(Error::invalid(
+                "index record",
+                "could not split promoted record",
+            ))?
+            .0;
+        let catalog = crate::catalog::lookup::Catalog::open(
+            &*self.device,
+            &self.header.catalog_file,
+            self.header.block_size,
+            self.header.is_hfsx(),
+        )?;
+        let mut records: Vec<Vec<u8>> = (0..node.num_records())
+            .map(|i| Self::record_at(&parent_bytes, usize::from(i)))
+            .collect::<Result<Vec<_>>>()?;
+        let mut at = records.len();
+        for (i, r) in records.iter().enumerate() {
+            let Some((k, _)) = crate::catalog::lookup::split_record(r) else {
+                continue;
+            };
+            if catalog.compare_keys(&k, &incoming) != crate::unicode::Ordering::Less {
+                at = i;
+                break;
+            }
+        }
+        records.insert(at.min(records.len()), promoted.to_vec());
+
+        // Split by bytes at the midpoint, like the leaf split, so a node with one
+        // large record and many small ones divides evenly instead of leaving one
+        // half nearly empty.
+        let split_at = Self::split_point(&parent_bytes, records.len(), node_size)?;
+        let lower = &records[..split_at];
+        let upper = &records[split_at..];
+        let sep = Self::index_record(&upper[0], new_upper)?;
+        let lower_node = Self::build_node(node_size, 0x00, height, 0, 0, lower)?;
+        let upper_node = Self::build_node(node_size, 0x00, height, 0, 0, upper)?;
+        Ok((lower_node, upper_node, sep))
+    }
     /// verbatim from the leaf record, including its length prefix, so the two can
     /// never disagree about how long the key is. Mining reference:
     /// `GetChildNodeNum` reads the child from `CalcKeySize` bytes past the record,
@@ -4624,6 +5164,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         use crate::format::extents::ExtentDescriptor;
 
         let node_size = self.catalog_node_size()? as u64;
+        let block_size = u64::from(self.header.block_size);
         let clump = u64::from(self.header.catalog_file.clump_size.max(1));
         let old_total = self.btree_header_u32(TOTAL_NODES_OFFSET)?;
         let want_nodes = want_nodes.max(old_total + 1);
@@ -4641,50 +5182,82 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         // `div_ceil` is 1.73 and this crate is 1.70.
         bytes_to_add = (bytes_to_add + node_size - 1) / node_size * node_size;
 
-        // Blocks needed, and where they go.
-        let blocks_needed = u32::try_from(bytes_to_add / node_size)
+        // Blocks needed: bytes_to_add is in file bytes, block_size is the
+        // allocation-block size, so dividing by block_size -- not node_size --
+        // gives the allocation-block count. When node_size equals block_size the
+        // two are interchangeable; when they differ (e.g. 1 KiB nodes in 4 KiB
+        // blocks) the old code over-allocated by a factor of block_size / node_size.
+        let blocks_needed = u32::try_from((bytes_to_add + block_size - 1) / block_size)
             .map_err(|_| Error::overflow("catalog fork block count"))?;
+
         let mut map = self.load_allocation_map()?;
         let hint = self.header.next_allocation.max(1);
 
-        // Contiguous first, as `kEFContigMask` asks: a node is read with one I/O, so
-        // a tree whose nodes are scattered pays for it on every read afterwards.
-        // `reserve` searches from the hint and then from the first allocatable
-        // block, so it covers the whole range exactly once, and it returns the whole
-        // run or an error. A B-tree cannot be extended by part of a node, which is
-        // why the short-run case is not a result here.
         let start = map.reserve(hint, blocks_needed)?;
-        let count = blocks_needed;
 
         // The catalog's extents live in the volume header, so extending the fork is
         // a header write: append the extent, then raise the two counts.
         let mut fork = self.header.catalog_file;
-        let slot = fork.extents.next_free().ok_or_else(|| {
-            Error::invalid(
-                "catalogFile",
-                "the catalog fork has no free inline extent; growing it past eight \
-                 extents needs the extents B-tree, which is not implemented",
-            )
-        })?;
-        fork.extents.set(
-            slot,
-            ExtentDescriptor {
-                start_block: start,
-                block_count: count,
-            },
-        )?;
-        fork.total_blocks += count;
-        fork.logical_size += u64::from(count) * node_size;
+
+        // If the new allocation is contiguous with the last extent, extend that
+        // extent in place instead of consuming a new inline slot. Eight inline
+        // extents are all the catalog fork gets before it must overflow to the
+        // Extents B-tree (not implemented), so merging contiguous runs keeps the
+        // catalog growing far past the point where a naïve append would exhaust the
+        // slot count. Mining reference: `AddFileExtent` in Apple
+        // `core/hfs_extents.c` extends the last group when the allocator returns a
+        // contiguous run, and `hfs_ext_iter_next_group` walks inline descriptors first.
+        //
+        // Only the *last* extent is a candidate: merging into a non-terminal
+        // extent would leave a duplicate descriptor whose range another extent
+        // already claims, producing overlapping forks.
+        let mut merged = false;
+        for i in 0..fork.extents.raw.len() {
+            let ext = &fork.extents.raw[i];
+            if ext.is_terminator() {
+                // The slot before the terminator is the last used extent. Check
+                // it for contiguity with the new allocation.
+                if i > 0 {
+                    let prev = &fork.extents.raw[i - 1];
+                    if prev.start_block.wrapping_add(prev.block_count) == start {
+                        let mut extended = *prev;
+                        extended.block_count += blocks_needed;
+                        fork.extents.set(i - 1, extended)?;
+                        merged = true;
+                    }
+                }
+                break;
+            }
+        }
+        if !merged {
+            let slot = fork.extents.next_free().ok_or_else(|| {
+                Error::invalid(
+                    "catalogFile",
+                    "the catalog fork has no free inline extent; growing it past eight \
+                     extents needs the Extents B-tree, which is not implemented",
+                )
+            })?;
+            fork.extents.set(
+                slot,
+                ExtentDescriptor {
+                    start_block: start,
+                    block_count: blocks_needed,
+                },
+            )?;
+        }
+        fork.total_blocks += blocks_needed;
+        fork.logical_size += bytes_to_add;
 
         let free_blocks = self
             .header
             .free_blocks
-            .checked_sub(count)
+            .checked_sub(blocks_needed)
             .ok_or_else(|| Error::overflow("volume_header.freeBlocks"))?;
         // Bitmap and free count first: a crash in between leaves the fork claiming
         // blocks the bitmap still calls free, which is the one ordering that lets
         // two things share them.
         self.write_allocation_bitmap(&map, free_blocks)?;
+        self.advance_next_allocation(start)?;
         self.write_catalog_fork(&fork, free_blocks)?;
         // The in-memory header moves with the on-disk one *here*, not at the end of
         // this method. Everything below re-opens the B-tree through
@@ -4693,7 +5266,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         // `totalNodes` with the old `logicalSize` and the tree refuses to open.
         self.header.catalog_file = fork;
 
-        let new_total = u32::try_from(fork.logical_size / node_size).unwrap_or(old_total + count);
+        let new_total = u32::try_from(fork.logical_size / node_size).unwrap_or(old_total + 1);
         let new_map_nodes = self.extend_node_map(old_total, new_total)?;
         let added = new_total - old_total;
         self.write_btree_header_u32(TOTAL_NODES_OFFSET, new_total)?;
@@ -4864,12 +5437,137 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         if tree_depth < 2 {
             return Ok(());
         }
+        if tree_depth > 2 {
+            // At depth 3+ the root does not point at leaves directly -- it points
+            // at middle index nodes -- so rebuilding it from the leaf chain would
+            // write a root whose children are leaves, not index nodes. The
+            // per-leaf refresh is handled incrementally in `split_leaf_and_insert`
+            // (and the in-place insert path below), which knows the parent.
+            return Ok(());
+        }
         let root_node = self.btree_header_u32(crate::btree::header::ROOT_NODE_OFFSET)?;
         let node_size = self.catalog_node_size()?;
         let records = self.index_records_for_chain()?;
         let root = self.read_catalog_node(root_node)?;
         let node = Self::build_node(node_size, 0x00, root[9], 0, 0, &records)?;
         self.write_catalog_node(root_node, &node)
+    }
+
+    /// Update the index separator for `leaf_num` in its parent index node.
+    ///
+    /// Called after a leaf's first record changes — by a split (the new leaf's
+    /// separator is inserted by the split path) or by a deletion that removed the
+    /// first record. At depth 2 the root is rebuilt wholesale by `refresh_index`;
+    /// at depth 3+ the specific separator in the middle index node is patched in
+    /// place, because rebuilding the root from the leaf chain would write children
+    /// that are leaves, not index nodes.
+    fn refresh_separator(&mut self, leaf_num: u32) -> Result<()> {
+        let tree_depth = self.btree_header_u16(crate::btree::header::TREE_DEPTH_OFFSET)?;
+        if tree_depth < 3 {
+            return Ok(());
+        }
+        let parent_num = self.parent_of_leaf(leaf_num)?;
+        let leaf_first = Self::record_at(&self.read_catalog_node(leaf_num)?, 0)?;
+        let new_sep = Self::index_record(&leaf_first, leaf_num)?;
+        self.replace_index_record(parent_num, leaf_num, &new_sep)?;
+        Ok(())
+    }
+
+    /// Replace the index record that points at `child_num` with `new_record`.
+    ///
+    /// Searches `node_num`'s records for the one whose child pointer equals
+    /// `child_num` and overwrites just the key bytes in place, leaving the child
+    /// pointer untouched. The key length never changes in practice (the first
+    /// record of a leaf keeps the same key size), but the function checks for a
+    /// length mismatch and refuses rather than corrupting the offset array.
+    fn replace_index_record(
+        &mut self,
+        node_num: u32,
+        child_num: u32,
+        new_record: &[u8],
+    ) -> Result<()> {
+        use crate::btree::io::BTreeFile;
+        use crate::btree::node::NodeKind;
+        use crate::catalog::key::CatalogKey;
+        use crate::catalog::lookup::split_record;
+        use crate::unicode::Ordering;
+
+        let (at, buf, found_idx) = {
+            let bt = BTreeFile::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let bytes = bt.read_node_bytes(node_num)?;
+            let node = bt.parse_node(&bytes)?;
+            if !matches!(node.kind(), NodeKind::Index) {
+                return Err(Error::invalid(
+                    "catalog index node",
+                    format!("node {node_num} is not an index node"),
+                ));
+            }
+            let max_key = usize::from(bt.header().max_key_length);
+            let catalog = crate::catalog::lookup::Catalog::open(
+                &*self.device,
+                &self.header.catalog_file,
+                self.header.block_size,
+                self.header.is_hfsx(),
+            )?;
+            let mut found = None;
+            for index in 0..node.num_records() {
+                if node.child(index)? == child_num {
+                    found = Some(index);
+                    break;
+                }
+            }
+            let Some(idx) = found else {
+                return Err(Error::NotFound {
+                    what: "index record for leaf",
+                });
+            };
+            let idx = usize::from(idx);
+            // Verify the sort order is consistent: the incoming key should not
+            // be greater than the next record's key, nor less than the previous.
+            let incoming = CatalogKey::from_record(new_record, max_key)
+                .map_err(|e| Error::invalid("index record", e.to_string()))?;
+            if idx > 0 {
+                let prev = node.record(u16::try_from(idx - 1).unwrap())?;
+                let Some((pk, _)) = split_record(prev) else {
+                    return Err(Error::invalid("catalog key", "previous key unreadable"));
+                };
+                if catalog.compare_keys(&pk, &incoming) == Ordering::Greater {
+                    return Err(Error::invalid(
+                        "catalog index",
+                        "the new separator is out of order with its predecessor",
+                    ));
+                }
+            }
+            let start = crate::btree::node::read_offset(&bytes, idx)?;
+            let end = crate::btree::node::read_offset(&bytes, idx + 1)?;
+            let old = bytes.get(start..end).ok_or(Error::Truncated {
+                what: "index record",
+                needed: end,
+                available: bytes.len(),
+            })?;
+            let old_key_len = 2 + usize::from(u16::from_be_bytes([old[0], old[1]]));
+            let new_key_len = 2 + usize::from(u16::from_be_bytes([new_record[0], new_record[1]]));
+            if old_key_len != new_key_len {
+                return Err(Error::invalid(
+                    "index record",
+                    format!(
+                        "key length changed from {old_key_len} to {new_key_len}; \
+                         in-place replacement would corrupt the offset array"
+                    ),
+                ));
+            }
+            let mut buf = bytes.clone();
+            buf[start..start + new_record.len()].copy_from_slice(new_record);
+            (bt.node_offset(node_num)?, buf, idx)
+        };
+        let _ = found_idx;
+        self.journal_write(at, &buf)?;
+        Ok(())
     }
 
     /// The leaf that should receive `record`.
@@ -5549,8 +6247,14 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         }
 
         let mut map = self.load_allocation_map()?;
+        let mut next_allocation = self.header.next_allocation;
         for (start, count) in ranges {
             map.release(start, count)?;
+            // Mirror Apple's `BlockDeallocate`: only when the freed range ends
+            // exactly at `nextAllocation` does the hint move back.
+            if start.checked_add(count) == Some(next_allocation) {
+                next_allocation = next_allocation.saturating_sub(count);
+            }
         }
 
         for start_block in overflow_to_delete {
@@ -5561,7 +6265,15 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             .free_blocks
             .checked_add(freed)
             .ok_or_else(|| Error::overflow("volume_header.freeBlocks"))?;
-        self.write_allocation_bitmap(&map, free_blocks)
+
+        // Only persist the hint if it actually changed, since `write_header_u32`
+        // forces a backup-header sync that is unnecessary otherwise.
+        let result = self.write_allocation_bitmap(&map, free_blocks);
+        if result.is_ok() && next_allocation != self.header.next_allocation {
+            self.header.next_allocation = next_allocation;
+            self.write_header_u32(52, self.header.next_allocation)?;
+        }
+        result
     }
 
     /// Set an extended attribute `name` to `value` on the file identified by `cnid`.
@@ -5627,6 +6339,141 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         file_record.flags |= crate::catalog::record::K_HFS_HAS_ATTRIBUTES_MASK;
         self.touch_record(&mut file_record)?;
         self.replace_catalog_record(cnid, &file_record)
+    }
+
+    /// Write a compressed file to the volume.
+    ///
+    /// Creates a new file at `parent/name` whose contents are `data`, stored
+    /// in the compression format indicated by `compression_type`. The file's
+    /// data fork holds the compressed bytes (for fork-backed types) or is empty
+    /// (for type 1, where the data lives inline in the `com.apple.decmpfs`
+    /// xattr), and the `UF_COMPRESSED` flag is set so that readers redirect
+    /// data-fork reads to the decmpfs decompression path.
+    ///
+    /// For type 1 (`Uncompressed`) the payload is stored inline in the xattr.
+    /// For type 2 (`Zlib`) the compressed bytes are written to the resource
+    /// fork and the xattr holds only the 16-byte header.
+    ///
+    /// Mining reference: Apple `core/hfs_vfsops.c` `hfs_vnop_write` checks
+    /// `ap->a_is_compressed`; `core/hfs_readwrite.c` `hfs_read` redirects
+    /// compressed reads; `core/hfs_cnode.c` `hfs_set_bsd_flags` sets
+    /// `UF_COMPRESSED` and writes the decmpfs xattr.
+    pub fn create_compressed_file(
+        &mut self,
+        parent: u32,
+        name: &[u16],
+        data: &[u8],
+        compression_type: crate::compression::CompressionType,
+    ) -> Result<u32> {
+        self.begin_transaction()?;
+        let result = self.create_compressed_file_inner(parent, name, data, compression_type);
+        if result.is_ok() {
+            self.end_transaction()?;
+        } else {
+            self.abandon_transaction();
+        }
+        result
+    }
+
+    fn create_compressed_file_inner(
+        &mut self,
+        parent: u32,
+        name: &[u16],
+        data: &[u8],
+        compression_type: crate::compression::CompressionType,
+    ) -> Result<u32> {
+        let cnid = self.create_file_inner(parent, name)?;
+
+        // For fork-backed types, only commit to compression if the compressed
+        // payload is actually smaller than the raw data. If compression makes
+        // the file larger, fall back to type 1 (inline uncompressed) when the
+        // data fits the inline attribute limit, or write as a plain file
+        // otherwise. Apple's decmpfs writer follows the same logic: a compressed
+        // stream that is not smaller than the original is rejected and the data
+        // is stored uncompressed.
+        if matches!(compression_type, crate::compression::CompressionType::Zlib) {
+            let compressed = crate::compression::compress(data, compression_type)?;
+            if compressed.len() >= data.len() {
+                // Compression did not help: fall back to uncompressed inline
+                // if the data fits, or as a plain file otherwise.
+                let inline_limit = self.attributes_inline_limit()?;
+                if crate::compression::DecmpfsHeader::SIZE + data.len() <= inline_limit {
+                    return self.create_compressed_file_inner(
+                        parent,
+                        name,
+                        data,
+                        crate::compression::CompressionType::Uncompressed,
+                    );
+                }
+                // Too large for inline: write as a regular uncompressed file.
+                self.write_file_contents_inner(cnid, data)?;
+                return Ok(cnid);
+            }
+            return self.store_compressed_fork_backed(cnid, data.len() as u64, &compressed);
+        }
+
+        match compression_type {
+            crate::compression::CompressionType::Uncompressed => {
+                let header = crate::compression::DecmpfsHeader {
+                    attr_size: (crate::compression::DecmpfsHeader::SIZE + data.len()) as u32,
+                    compression_magic: crate::compression::CMP_MAGIC,
+                    compression_type,
+                    uncompressed_size: data.len() as u64,
+                };
+                let mut attr_value = header.to_bytes().to_vec();
+                attr_value.extend_from_slice(data);
+                self.setxattr_inner(
+                    cnid,
+                    crate::attributes::names::DECOMPRESSION_NAME,
+                    &attr_value,
+                )?;
+            }
+            crate::compression::CompressionType::Zlib => {
+                // Handled above via the compress-and-check path.
+                unreachable!("Zlib is handled in the size-checking branch");
+            }
+            _ => {
+                return Err(Error::unsupported(format!(
+                    "compression type {compression_type:?} is not yet supported for file creation"
+                )));
+            }
+        }
+
+        let mut record = self.read_file_record(cnid)?;
+        record.bsd_info.admin_flags |= UF_COMPRESSED;
+        self.touch_record(&mut record)?;
+        self.replace_catalog_record(cnid, &record)?;
+
+        Ok(cnid)
+    }
+
+    /// Write a fork-backed compressed file (type 2: data in resource fork).
+    fn store_compressed_fork_backed(
+        &mut self,
+        cnid: u32,
+        uncompressed_size: u64,
+        compressed: &[u8],
+    ) -> Result<u32> {
+        let header = crate::compression::DecmpfsHeader {
+            attr_size: crate::compression::DecmpfsHeader::SIZE as u32,
+            compression_magic: crate::compression::CMP_MAGIC,
+            compression_type: crate::compression::CompressionType::Zlib,
+            uncompressed_size,
+        };
+        let attr_value = header.to_bytes();
+        self.setxattr_inner(
+            cnid,
+            crate::attributes::names::DECOMPRESSION_NAME,
+            &attr_value,
+        )?;
+        self.write_resource_fork_inner(cnid, compressed)?;
+
+        let mut record = self.read_file_record(cnid)?;
+        record.bsd_info.admin_flags |= UF_COMPRESSED;
+        self.touch_record(&mut record)?;
+        self.replace_catalog_record(cnid, &record)?;
+
+        Ok(cnid)
     }
 
     /// Highest inline value size that fits in the attributes tree's nodes.
@@ -6159,6 +7006,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         // The bitmap goes to disk before the data blocks and before the record.
         // See the method doc for why that order and not the other.
         self.write_allocation_bitmap(&map, declared - extra as u32)?;
+        self.advance_next_allocation(start)?;
 
         // Try to place the descriptor in the inline extent record. If all eight
         // slots are used, it overflows into the Extents B-tree instead.
@@ -6961,6 +7809,18 @@ pub const K_HFS_THREAD_EXISTS_MASK: u16 = 0x0002;
 /// `UF_IMMUTABLE`, which `createindirectlink` sets on a hard link: a link is not
 /// something to write through, only a second name to read by.
 pub const UF_IMMUTABLE: u8 = 0x0002;
+
+/// `UF_COMPRESSED` (0x20); stored in `bsd_info.admin_flags` on a decmpfs file.
+///
+/// Apple's `bsd/sys/file.h` defines this as bit 5 of the BSD flags word.
+/// `hfs_set_bsd_flags` (`core/hfs_cnode.c`) writes it into `admin_flags`
+/// when a file transitions to `UF_COMPRESSED`. A reader consults
+/// `ap->a_is_compressed` (the kernel caches the flag) to decide whether to
+/// redirect data-fork reads to the decmpfs path.
+///
+/// Mining reference: `bsd/sys/fcntl.h` `UF_COMPRESSED`; `core/hfs_readwrite.c`
+/// `hfs_vnop_write` refues writes to compressed files.
+pub const UF_COMPRESSED: u8 = 0x0020;
 
 /// `kHardLinkFileType` -- `'hlnk'`, in a hard link's **`userInfo`**.
 ///

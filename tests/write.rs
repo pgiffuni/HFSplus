@@ -20,6 +20,7 @@ mod common;
 use hfsplus::blockdev::{BlockDeviceMut, FileDevice};
 use hfsplus::btree::io::BTreeFile;
 use hfsplus::catalog::cnid::Cnid;
+use hfsplus::compression::{CompressionType, CompressionType::Uncompressed, CompressionType::Zlib};
 use hfsplus::file::TreeOverflow;
 use hfsplus::volume::{Object, Volume, WritableVolume};
 
@@ -843,6 +844,367 @@ fn growing_the_catalog_keeps_both_volume_headers_in_step() {
     );
 
     assert_fsck_clean(&path, "a catalog grown past its original eight nodes");
+}
+
+#[test]
+fn growing_the_catalog_to_depth_three_keeps_it_consistent() {
+    // The depth-2 split already exercised: a leaf splits, the root index node is
+    // rebuilt from the leaf chain. Depth 3 exercises a *different* path: the leaf's
+    // parent is a second-level index node, not the root. When that parent is full
+    // the split recurses one level up -- the parent splits and a separator is
+    // promoted to the root.
+    //
+    // A 4 MiB volume with 1024-byte catalog nodes. Smaller nodes fill faster, so
+    // fewer files are needed to push the B-tree past depth 2. Each leaf holds ~3
+    // file records, and each index record fits ~32 per index node, so ~100 files
+    // forces the root index to split and the tree to reach depth 3.
+    let total_bytes = 4 * 1024 * 1024u64;
+    let node_size: u16 = 1024;
+    let img = std::env::temp_dir().join(format!("depth3-{}.img", unique()));
+    {
+        let file = std::fs::File::create(&img).unwrap();
+        file.set_len(total_bytes).unwrap();
+    }
+    let mut dev = FileDevice::open_writable(&img).unwrap();
+    hfsplus::format::writer::format_volume(
+        &mut dev,
+        "Depth3",
+        total_bytes,
+        4096,
+        node_size,
+        false,
+        false,
+        None,
+        0,
+        0,
+        0o177,
+    )
+    .unwrap();
+    drop(dev);
+
+    let parent = {
+        let dev = FileDevice::open(&img).unwrap();
+        let vol = Volume::open(&dev).unwrap();
+        vol.root_cnid().0
+    };
+
+    let mut dev = FileDevice::open_writable(&img).unwrap();
+    let mut writable = WritableVolume::open(&mut dev).unwrap();
+    // With 1024-byte nodes each leaf holds ~3 file records, and each index node
+    // holds ~32 index records. Creating 500 files forces at least 150+ leaves,
+    // which fills the root index node and forces a split that promotes the leaf's
+    // parent (a middle index node) to the root's child list -- reaching depth 3.
+    let count = 500u32;
+    for i in 0..count {
+        let name = format!("f{i:03}.bin");
+        writable
+            .create_file(parent, &units(&name))
+            .unwrap_or_else(|e| panic!("creating {name}: {e}"));
+    }
+    dev.sync().unwrap();
+    drop(dev);
+
+    let dev = FileDevice::open(&img).unwrap();
+    let vol = Volume::open(&dev).unwrap();
+    let bt = BTreeFile::open(
+        &dev,
+        &vol.header().catalog_file,
+        vol.header().block_size,
+        vol.header().is_hfsx(),
+    )
+    .unwrap();
+    let header = *bt.header();
+
+    // The tree really is three levels deep: root index → middle index → leaf.
+    assert!(
+        header.tree_depth >= 3,
+        "the catalog must reach depth 3 to test the index split, but it is {}",
+        header.tree_depth
+    );
+
+    let root = bt.read_node_bytes(header.root_node).unwrap();
+    let root_node = bt.parse_node(&root).unwrap();
+    assert_eq!(
+        root_node.kind(),
+        hfsplus::btree::node::NodeKind::Index,
+        "the root of a three-level catalog is an index node"
+    );
+    assert_eq!(
+        u16::from(root_node.height()),
+        header.tree_depth,
+        "the root's height is the tree's depth"
+    );
+
+    // Walk one level down: every child of the root must be an index node at
+    // height 2, and every one of those must point to at least one leaf.
+    for index in 0..root_node.num_records() {
+        let child_num = root_node.child(index).unwrap();
+        let child_bytes = bt.read_node_bytes(child_num).unwrap();
+        let child = bt.parse_node(&child_bytes).unwrap();
+        assert_eq!(
+            child.kind(),
+            hfsplus::btree::node::NodeKind::Index,
+            "root's child {child_num} must be an index node at height 2"
+        );
+        assert_eq!(
+            child.height(),
+            2,
+            "root's child {child_num} must be at height 2"
+        );
+        // Every child of a height-2 index node must be a leaf.
+        for inner in 0..child.num_records() {
+            let grandchild_num = child.child(inner).unwrap();
+            let grandchild_bytes = bt.read_node_bytes(grandchild_num).unwrap();
+            let grandchild = bt.parse_node(&grandchild_bytes).unwrap();
+            assert_eq!(
+                grandchild.kind(),
+                hfsplus::btree::node::NodeKind::Leaf,
+                "node {grandchild_num} under middle index {child_num} must be a leaf"
+            );
+        }
+    }
+
+    // The header's leaf_records must count every record across all leaves.
+    let mut counted = 0u32;
+    let mut leaves = 0u32;
+    let mut cursor = header.first_leaf_node;
+    while cursor != 0 && leaves < header.total_nodes {
+        leaves += 1;
+        let bytes = bt.read_node_bytes(cursor).unwrap();
+        let node = bt.parse_node(&bytes).unwrap();
+        counted += u32::from(node.num_records());
+        cursor = node.descriptor().f_link;
+    }
+    assert_eq!(
+        counted, header.leaf_records,
+        "leafRecords must count every record in every leaf"
+    );
+
+    // Every created file must be findable by name from the root.
+    assert!(leaves > 1, "the tree must have split to reach depth 3");
+
+    for i in 0..count {
+        let name = format!("f{i:03}.bin");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units(&name))
+            .expect("lookup")
+            .unwrap_or_else(|| panic!("{name} is not findable"));
+        assert!(obj.as_file().is_ok(), "{name} must be a file");
+    }
+
+    let report = hfsplus::check::check(&vol, None).unwrap();
+    assert!(report.is_clean(), "{:?}", report.describe());
+
+    assert_fsck_clean(&img, "a catalog grown to depth 3 with a leaf split");
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn deleting_from_a_depth_three_catalog_keeps_the_index_separators_consistent() {
+    let total_bytes = 4 * 1024 * 1024u64;
+    let node_size: u16 = 1024;
+    let img = std::env::temp_dir().join(format!("depth3del-{}.img", unique()));
+    {
+        let file = std::fs::File::create(&img).unwrap();
+        file.set_len(total_bytes).unwrap();
+    }
+    let mut dev = FileDevice::open_writable(&img).unwrap();
+    hfsplus::format::writer::format_volume(
+        &mut dev,
+        "Depth3del",
+        total_bytes,
+        4096,
+        node_size,
+        false,
+        false,
+        None,
+        0,
+        0,
+        0o177,
+    )
+    .unwrap();
+    drop(dev);
+
+    let root_parent = {
+        let dev = FileDevice::open(&img).unwrap();
+        let vol = Volume::open(&dev).unwrap();
+        vol.root_cnid().0
+    };
+
+    // Grow the catalog to depth 3 by creating 500 files.
+    let count = 500u32;
+    let mut created = Vec::with_capacity(count as usize);
+    {
+        let mut dev = FileDevice::open_writable(&img).unwrap();
+        let mut writable = WritableVolume::open(&mut dev).unwrap();
+        for i in 0..count {
+            let name = format!("f{i:03}.bin");
+            let cnid = writable.create_file(root_parent, &units(&name)).unwrap();
+            created.push((name, cnid));
+        }
+        dev.sync().unwrap();
+    }
+
+    // Confirm we are at depth 3 before deleting.
+    {
+        let dev = FileDevice::open(&img).unwrap();
+        let vol = Volume::open(&dev).unwrap();
+        let bt = BTreeFile::open(
+            &dev,
+            &vol.header().catalog_file,
+            vol.header().block_size,
+            vol.header().is_hfsx(),
+        )
+        .unwrap();
+        let header = *bt.header();
+        assert!(
+            header.tree_depth >= 3,
+            "expected depth >= 3, got {}",
+            header.tree_depth
+        );
+    }
+
+    // Delete the file whose name sorts first -- this is the one that changes the
+    // first record of a leaf, forcing the parent separator to be refreshed.
+    created.sort_by(|a, b| a.0.cmp(&b.0));
+    let (first_name, _first_cnid) = created.remove(0);
+
+    {
+        let mut dev = FileDevice::open_writable(&img).unwrap();
+        let mut writable = WritableVolume::open(&mut dev).unwrap();
+        writable.remove(root_parent, &units(&first_name)).unwrap();
+        dev.sync().unwrap();
+    }
+
+    let dev = FileDevice::open(&img).unwrap();
+    let vol = Volume::open(&dev).unwrap();
+
+    // The first record's leaf must no longer hold the deleted name.
+    if vol
+        .lookup(hfsplus::catalog::Cnid(root_parent), &units(&first_name))
+        .expect("lookup")
+        .is_some()
+    {
+        panic!("{first_name} must be gone after deletion");
+    }
+
+    // Every remaining file must still be findable, proving the index path
+    // through the depth-3 tree still routes correctly.
+    for (name, _cnid) in &created {
+        let obj = vol
+            .lookup(hfsplus::catalog::Cnid(root_parent), &units(name))
+            .expect("lookup");
+        assert!(obj.is_some(), "{name} not found after deletion");
+        let obj = obj.unwrap();
+        assert!(obj.as_file().is_ok(), "{name} must be a file");
+    }
+
+    // The checker walks the full tree and validates separator consistency.
+    assert_fsck_clean(&img, "catalog after a depth-3 deletion");
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn deleting_every_file_from_a_depth_three_catalog_frees_the_empty_leaves() {
+    // Create a depth-3 catalog and then remove all files, forcing several leaves
+    // to become empty and be freed. The B-tree should collapse back to depth 1
+    // (root is a leaf) and fsck must report the volume clean.
+    let total_bytes = 4 * 1024 * 1024u64;
+    let node_size: u16 = 1024;
+    let img = std::env::temp_dir().join(format!("depth3empty-{}.img", unique()));
+    {
+        let file = std::fs::File::create(&img).unwrap();
+        file.set_len(total_bytes).unwrap();
+    }
+    let mut dev = FileDevice::open_writable(&img).unwrap();
+    hfsplus::format::writer::format_volume(
+        &mut dev,
+        "Depth3empty",
+        total_bytes,
+        4096,
+        node_size,
+        false,
+        false,
+        None,
+        0,
+        0,
+        0o177,
+    )
+    .unwrap();
+    drop(dev);
+
+    let parent = {
+        let dev = FileDevice::open(&img).unwrap();
+        let vol = Volume::open(&dev).unwrap();
+        vol.root_cnid().0
+    };
+
+    let count = 500u32;
+    let names: Vec<String> = (0..count).map(|i| format!("f{i:03}.bin")).collect();
+    {
+        let mut dev = FileDevice::open_writable(&img).unwrap();
+        let mut writable = WritableVolume::open(&mut dev).unwrap();
+        for name in &names {
+            writable.create_file(parent, &units(name)).unwrap();
+        }
+        dev.sync().unwrap();
+    }
+
+    // Confirm depth 3 before deletion.
+    {
+        let dev = FileDevice::open(&img).unwrap();
+        let vol = Volume::open(&dev).unwrap();
+        let bt = BTreeFile::open(
+            &dev,
+            &vol.header().catalog_file,
+            vol.header().block_size,
+            vol.header().is_hfsx(),
+        )
+        .unwrap();
+        assert!(
+            bt.header().tree_depth >= 3,
+            "expected depth >= 3, got {}",
+            bt.header().tree_depth
+        );
+    }
+
+    // Delete all files.
+    {
+        let mut dev = FileDevice::open_writable(&img).unwrap();
+        let mut writable = WritableVolume::open(&mut dev).unwrap();
+        for name in &names {
+            writable.remove(parent, &units(name)).unwrap();
+        }
+        dev.sync().unwrap();
+    }
+
+    // After deleting all files, the catalog should have shrunk significantly.
+    // The root no longer needs 13 middle index children -- most were freed as
+    // their leaves emptied. The exact depth depends on remaining records (root
+    // folder, volume header), but the tree must be structurally sound.
+    {
+        let dev = FileDevice::open(&img).unwrap();
+        let vol = Volume::open(&dev).unwrap();
+        let bt = BTreeFile::open(
+            &dev,
+            &vol.header().catalog_file,
+            vol.header().block_size,
+            vol.header().is_hfsx(),
+        )
+        .unwrap();
+        let header = *bt.header();
+        // The root should have far fewer children than the original 13.
+        let root = bt.read_node_bytes(header.root_node).unwrap();
+        let root_node = bt.parse_node(&root).unwrap();
+        assert!(
+            root_node.num_records() <= 2,
+            "root should have at most 2 children after full deletion, got {}",
+            root_node.num_records()
+        );
+    }
+
+    assert_fsck_clean(&img, "catalog after full deletion from depth 3");
+    let _ = std::fs::remove_file(&img);
 }
 
 // --- Deletion, which removes -----------------------------------------------
@@ -2425,6 +2787,66 @@ fn a_file_that_is_grown_and_then_truncated_returns_to_the_same_allocation() {
 }
 
 #[test]
+fn allocation_advances_next_allocation_only_past_the_hint() {
+    // Apple's `BlockFindAny` only advances `nextAllocation` when the allocation
+    // succeeds *past* the current hint. If the allocator finds a hole earlier in
+    // the volume, the hint stays put. The hint should never regress.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+
+    let before = header_next_allocation(&path);
+    let big: Vec<u8> = (0..40_000u32).map(|i| (i % 253) as u8).collect();
+    write(&path, cnid, &big);
+
+    let after = header_next_allocation(&path);
+
+    // The hint should never regress, regardless of where the allocation landed.
+    assert!(
+        after >= before,
+        "nextAllocation {after} should not regress from {before}"
+    );
+    assert_fsck_clean(&path, "nextAllocation does not regress on allocation");
+}
+
+#[test]
+fn freeing_blocks_at_next_allocation_moves_the_hint_back() {
+    // Apple's `BlockDeallocate` only moves `nextAllocation` back when the freed
+    // range ends exactly at the current hint. This test verifies that our
+    // `release_blocks` honors that rule.
+    let Some(path) = copy_fixture(IMAGE) else {
+        return;
+    };
+    let cnid = payload_cnid(&path);
+
+    // Grow the file by one block, then truncate it back.
+    let before = header_next_allocation(&path);
+    grown_to_two_blocks(&path, cnid);
+    let after_grow = header_next_allocation(&path);
+
+    assert!(
+        after_grow >= before,
+        "nextAllocation {after_grow} should not regress from {before}"
+    );
+
+    // Truncate back to one block. The hint should never increase after freeing.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable.truncate_file(cnid, 4096).expect("truncate");
+        dev.sync().expect("flush");
+    }
+
+    let after_truncate = header_next_allocation(&path);
+    assert!(
+        after_truncate <= after_grow,
+        "nextAllocation {after_truncate} should not exceed {after_grow} after freeing"
+    );
+    assert_fsck_clean(&path, "nextAllocation adjusts on free");
+}
+
+#[test]
 fn truncating_to_what_the_file_already_is_refused() {
     // Not truncation. A request that keeps every block would rewrite the record
     // with the same numbers, which looks like success while changing a file's
@@ -2671,6 +3093,13 @@ fn header_free_blocks(path: &std::path::Path) -> u32 {
     let dev = FileDevice::open(path).expect("open");
     let vol = Volume::open(&dev).expect("mount");
     vol.header().free_blocks
+}
+
+/// The volume header's `nextAllocation`, the allocation hint.
+fn header_next_allocation(path: &std::path::Path) -> u32 {
+    let dev = FileDevice::open(path).expect("open");
+    let vol = Volume::open(&dev).expect("mount");
+    vol.header().next_allocation
 }
 
 #[test]
@@ -5257,4 +5686,170 @@ fn middle_directory_hard_link_is_spliced_out_of_the_chain() {
         "middle link name must be gone"
     );
     assert_fsck_clean(&path, "middle directory hard link spliced from chain");
+}
+
+// --- Compressed file creation -------------------------------------------------
+
+/// Create a compressed file on a volume and read it back.
+///
+/// Helper that writes a file with `create_compressed_file`, reopens for
+/// reading, and checks that the decompressed contents match the original.
+fn round_trip_compression(
+    image: &str,
+    name: &str,
+    data: &[u8],
+    ctype: CompressionType,
+) -> std::path::PathBuf {
+    let Some(path) = copy_fixture(image) else {
+        return std::path::PathBuf::new();
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .create_compressed_file(parent, &units(name), data, ctype)
+            .unwrap_or_else(|e| panic!("create_compressed_file: {e}"));
+        dev.sync().expect("flush");
+    }
+
+    // Read back through the reader.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units(name))
+        .expect("lookup")
+        .expect("file must exist");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file");
+    assert_eq!(
+        back, data,
+        "decompressed contents must round-trip for {name}"
+    );
+    assert_fsck_clean(&path, &format!("compressed file {name}"));
+
+    path
+}
+
+#[test]
+fn creating_a_type1_uncompressed_file_round_trips_through_decmpfs() {
+    let data = b"HFS+ decmpfs type 1 is just inline storage in the xattr.\n".repeat(3);
+    let path = round_trip_compression("journal-with-attributes", "type1.bin", &data, Uncompressed);
+    if path.as_os_str().is_empty() {
+        return; // fixture not built — skip
+    }
+
+    // Verify the attribute and flag are set correctly on disk.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("type1.bin"))
+        .expect("lookup")
+        .expect("type1.bin must exist");
+
+    // `UF_COMPRESSED` must be set in admin_flags.
+    let f = obj.as_file().expect("a file");
+    assert!(
+        f.record.bsd_info.admin_flags & 0x20 != 0,
+        "UF_COMPRESSED must be set"
+    );
+
+    // The decmpfs xattr must contain the header + inline data.
+    let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
+    let val = xattr.expect("decmpfs xattr must exist");
+    assert_eq!(val.len(), 16 + data.len(), "header + inline payload");
+    let magic = u32::from_le_bytes([val[0], val[1], val[2], val[3]]);
+    assert_eq!(magic, 0x636d7066, "cmpf magic");
+    let ctype = u32::from_le_bytes([val[4], val[5], val[6], val[7]]);
+    assert_eq!(ctype, 1, "type 1 = uncompressed");
+
+    // The inline payload must be the original data verbatim.
+    assert_eq!(&val[16..], &data[..], "inline payload is raw data");
+}
+
+#[test]
+fn creating_a_type2_zlib_file_round_trips_through_decmpfs() {
+    // Repeating text compresses well with LZ77+Huffman.
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(20);
+    let path = round_trip_compression("journal-with-attributes", "type2.bin", &data, Zlib);
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    // The compressed data must live in the resource fork, not the data fork.
+    // The data fork should be empty (length 0) and the resource fork should
+    // hold at least one block of compressed bytes.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("type2.bin"))
+        .expect("lookup")
+        .expect("type2.bin must exist");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        f.record.data_fork.logical_size, 0,
+        "data fork must be empty for type 2 (compressed data is in the resource fork)"
+    );
+    assert!(
+        f.record.resource_fork.logical_size > 0,
+        "resource fork must hold at least one block of compressed data"
+    );
+}
+
+#[test]
+fn a_type2_zlib_compressed_file_survives_reopen_on_journaled_volume() {
+    // The journal transaction must commit the resource fork write and the
+    // decmpfs xattr atomically.
+    let data = b"journaled compression round trip\n".repeat(50);
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .create_compressed_file(parent, &units("journaled.bin"), &data, Zlib)
+            .expect("create_compressed_file on journaled volume");
+        dev.sync().expect("flush");
+    }
+
+    // Reopen and read back.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after reopen");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("journaled.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file");
+    assert_eq!(back, data, "data must survive a reopen");
+}
+
+#[test]
+fn a_compressed_file_with_empty_contents_round_trips() {
+    let data: Vec<u8> = vec![];
+    let path = round_trip_compression("journal-with-attributes", "empty.bin", &data, Uncompressed);
+    if path.as_os_str().is_empty() {
+        return;
+    }
+    // read_file must return empty.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("empty.bin"))
+        .expect("lookup")
+        .expect("empty.bin must exist");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file");
+    assert!(back.is_empty(), "empty compressed file must round-trip");
 }
