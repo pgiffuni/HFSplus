@@ -133,8 +133,8 @@ adapter. This is sound because:
 
 The adapter supports two modes:
 
-- **Read-only** (default): `hfsplus-fuse <image> <mountpoint>`
-- **Writable** (`-w`/`--writable`): `hfsplus-fuse <image> <mountpoint> -w`
+- **Writable** (default): `hfsplus-fuse <image> <mountpoint>`
+- **Read-only** (`-r`/`--readonly`): `hfsplus-fuse <image> <mountpoint> -r`
 
 Read-only mounts use `-o ro`; writable mounts use `-o rw`. Both use
 `FSName("hfsplus")` for identification.

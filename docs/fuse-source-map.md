@@ -59,7 +59,7 @@ See `docs/source-map.md` for the Apple-to-Rust mappings of those library functio
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | CLI entry point; parses `-w`/`--writable` flag, configures mount options |
+| `src/main.rs` | CLI entry point; parses `-r`/`--readonly` flag, defaults to writable, configures mount options |
 | `src/filesystem.rs` | `Filesystem` trait impl: all FUSE callbacks, volume lifecycle management |
 | `src/handles.rs` | `HandleTable`: FUSE file-handle to internal state mapping |
 | `src/attr.rs` | `FileAttr` conversion: HFS+ modes, timestamps, sizes ↔ FUSE attributes |

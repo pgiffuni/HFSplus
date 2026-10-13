@@ -8,8 +8,8 @@
 //! hfsplus-fuse <image> <mountpoint> [options]
 //! ```
 //!
-//! By default the mount is read-only. Pass `--writable` or `-w` for a writable
-//! mount.
+//! By default the mount is read-write. Pass `--readonly` or `-r` for a
+//! read-only mount.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -21,18 +21,18 @@ use hfsplus_fuse::HfsPlusFilesystem;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: {} <image> <mountpoint> [-w|--writable]", args[0]);
+        eprintln!("usage: {} <image> <mountpoint> [-r|--readonly]", args[0]);
         return ExitCode::from(1);
     }
 
     let image = &args[1];
     let mountpoint = &args[2];
-    let writable = args.iter().any(|a| a == "-w" || a == "--writable");
+    let readonly = args.iter().any(|a| a == "-r" || a == "--readonly");
 
-    let fs = if writable {
-        HfsPlusFilesystem::open_writable(image)
-    } else {
+    let fs = if readonly {
         HfsPlusFilesystem::open(image)
+    } else {
+        HfsPlusFilesystem::open_writable(image)
     };
 
     let fs = match fs {
@@ -45,10 +45,10 @@ fn main() -> ExitCode {
 
     let mountpoint_path = PathBuf::from(mountpoint);
     let mut config = Config::default();
-    if writable {
-        config.mount_options = vec![MountOption::FSName("hfsplus".to_string()), MountOption::RW];
-    } else {
+    if readonly {
         config.mount_options = vec![MountOption::RO, MountOption::FSName("hfsplus".to_string())];
+    } else {
+        config.mount_options = vec![MountOption::FSName("hfsplus".to_string()), MountOption::RW];
     }
 
     match fuser::mount(fs, &mountpoint_path, &config) {
