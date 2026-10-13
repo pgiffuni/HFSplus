@@ -3319,6 +3319,64 @@ fn a_journaled_write_is_durable_after_reopen() {
 }
 
 #[test]
+fn a_journaled_write_to_a_compressed_file_is_durable_after_reopen() {
+    // Create a compressed file on a journaled volume, then write new
+    // content through write_file_contents. The re-encode transaction must
+    // commit atomically: the decmpfs xattr, the resource fork, and the
+    // catalog record must all survive a close/reopen cycle.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let (cnid, _original_data) = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let original = b"The quick brown fox jumps over the lazy dog. ".repeat(20);
+        let cnid = writable
+            .create_compressed_file(parent, &units("jrwc.bin"), &original, Zlib)
+            .expect("create_compressed_file on journaled volume");
+        dev.sync().expect("flush");
+        (cnid, original)
+    };
+
+    let new_data = b"re-encoded content for journaled write test. ".repeat(15);
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_file_contents(cnid, &new_data)
+            .expect("write to compressed file should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Reopen and verify.
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after journaled compressed write");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file after write");
+    assert_eq!(back, new_data, "re-encoded data must survive reopen");
+    assert!(
+        vol.getxattr(&obj, "com.apple.decmpfs")
+            .expect("getxattr")
+            .is_some(),
+        "file must still be compressed after re-encode"
+    );
+    assert_fsck_clean(&path, "journaled write to compressed file");
+}
+
+#[test]
 fn a_failed_journaled_write_does_not_modify_the_image() {
     // A write that fails (e.g. writing to a CNID that does not exist) must
     // not commit any journal transaction: the before-images captured so far
