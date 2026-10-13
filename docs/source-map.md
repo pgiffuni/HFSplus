@@ -309,8 +309,8 @@ open-sourced), but their numeric assignments are established by macOS practice:
 |-------|---------|-------------|---------|
 | 1 | uncompressed (inline in xattr) | returns raw bytes | returns data verbatim (`compress`) |
 | 2 | ZLIB (RFC 1950/1951) | `zlib-rs` (type 2) | `zlib-rs` streaming `Deflate`/`Inflate` |
-| 3 | LZFSE | `src/compression/lzfse.rs` (V1, V2, LZVN-in-LZFSE) | not yet implemented |
-| 4 | LZVN | `src/compression/lzvn.rs` | not yet implemented |
+| 3 | LZFSE | `src/compression/lzfse.rs` (V1, V2, LZVN-in-LZFSE) | `encode()` translates Apple `lzfse/lzfse` BSD-3-Clause `lzfse_encode_base.c`; 4-stream FSE encoder with backwards literal ordering, 8-byte LMD payload padding, and "same-as-previous" distance encoding |
+| 4 | LZVN | `src/compression/lzvn.rs` | `encode()` translates Apple `lzvn_encode_base.c` (BSD-3-Clause) |
 | 5 | BZIP2 | unsupported | not yet implemented |
 | 6 | LZMA | unsupported | not yet implemented |
 | 7 | LZ4 frame | `src/compression/lz4.rs` | not yet implemented |
@@ -378,10 +378,25 @@ final choice.
 
 `compress` is the write-side counterpart to `decompress`. For type 1 it returns
 the data verbatim; for type 2 it produces an RFC 1950 zlib stream using `zlib-rs`
-(the pure-Rust port). Types 3–7 encoders are not yet implemented; their decoder
-implementations are complete and could serve as a reference once an encoder
-strategy is chosen, but the LZFSE encoder source lives in the external
-`lzfse/lzfse` repo (BSD-3-Clause) and translating it is a separate milestone.
+(the pure-Rust port). Types 3 (LZFSE) and 4 (LZVN) encode via custom encoders in
+`src/compression/lzfse.rs` and `src/compression/lzvn.rs`, translating Apple
+`lzfse/lzfse` BSD-3-Clause `lzfse_encode_base.c`. Types 5–7 encoders are not
+implemented; their decoder implementations are complete and could serve as a
+reference once an encoder strategy is chosen, but the LZFSE/LZVN encoder sources
+live in the external `lzfse/lzfse` repo (BSD-3-Clause) and translating them is a
+separate milestone.
+
+Truncating a compressed file decompresses, resizes, and re-compresses:
+`truncate_file_inner` in `src/volume/mod.rs` delegates to
+`truncate_compressed_file_inner`, which preserves the original compression type
+when a re-encoder exists, falls back to type 1 (inline uncompressed) when the
+payload fits the inline attribute limit but re-compression does not help or the
+type is unsupported, and falls back to a plain uncompressed file otherwise.
+`rewrite_compressed_file` dispatches to `store_compressed_fork_backed` for
+fork-backed types and directly writes the xattr for type 1. A key fix in
+`write_allocation_bitmap` keeps `self.header.free_blocks` in sync with the
+on-disk bitmap so that a release-then-allocate cycle does not trigger the
+free-count disagreement check.
 
 The other attribute names HFS+ writes for its own bookkeeping are pinned in
 `src/attributes/names.rs`, verified against the source rather than recalled: they

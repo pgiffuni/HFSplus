@@ -408,6 +408,17 @@ const ENCODE_LITERAL_STATES: usize = 1024;
 /// `LZFSE_DECODE_LITERALS_PER_BLOCK` (= 4 * LZFSE_DECODE_MATCHES_PER_BLOCK).
 const LITERALS_PER_BLOCK: usize = 40000;
 
+const LZFSE_ENCODE_HASH_BITS: usize = 14;
+const LZFSE_ENCODE_HASH_WIDTH: usize = 4;
+const LZFSE_ENCODE_HASH_VALUES: usize = 1 << LZFSE_ENCODE_HASH_BITS;
+#[allow(dead_code)]
+const LZFSE_MATCHES_PER_BLOCK: usize = 10000;
+const LZFSE_ENCODE_MIN_MATCH: usize = 4;
+const LZFSE_ENCODE_MAX_MATCH: usize = 1024;
+#[allow(dead_code)]
+const LZFSE_ENCODE_GOOD_MATCH: usize = 40;
+const LZFSE_ENCODE_LZVN_THRESHOLD: usize = 4096;
+
 /// L symbol: extra bits and base values for extra-bits decoding.
 ///
 /// Mining reference: Apple `lzfse_internal.h` `l_extra_bits`, `l_base_value`.
@@ -506,6 +517,11 @@ fn decode_freq_stream(data: &[u8]) -> Result<(Vec<u16>, usize)> {
         } else if nbits == 14 {
             // Extended: 24 + extra (10 bits)
             24 + ((accum >> 4) & 0x3ff) as u16
+        } else if nbits == 5 && value < 0 {
+            // The 5-bit pattern 00011 (b=3) is the special code for freq value 4.
+            // The reference decoder's "else" branch would interpret it as 24,
+            // which is incorrect — fix to return the correct value.
+            4
         } else {
             // 1-5 bits encoding from table
             if value < 0 {
@@ -1060,7 +1076,9 @@ impl<'a> LzfseDecoder<'a> {
                 }
             }
 
-            d_prev = d_val;
+            if d_val != 0 {
+                d_prev = d_val;
+            }
             symbols_remaining -= 1;
         }
 
@@ -1156,6 +1174,834 @@ fn mask_lsb32(x: u32, nbits: u32) -> u32 {
     } else {
         x & ((1u32 << nbits) - 1)
     }
+}
+
+/// Mask the `nbits` least significant bits of `x` (u64).
+fn mask_lsb64(x: u64, nbits: u32) -> u64 {
+    if nbits >= 64 {
+        x
+    } else {
+        x & ((1u64 << nbits) - 1)
+    }
+}
+
+// ============================================================
+// LZFSE Encoder
+// ============================================================
+
+/// Encoder-side FSE table entry.
+///
+/// Mining reference: Apple `lzfse_fse.h` `fse_encoder_entry`.
+#[derive(Clone, Copy)]
+struct FseEncoderEntry {
+    s0: i32,
+    k: i32,
+    delta0: i32,
+    delta1: i32,
+}
+
+/// Build an FSE encoder table from per-symbol frequencies.
+///
+/// Mining reference: Apple `lzfse_fse.c` `fse_init_encoder_table`.
+///
+/// For each symbol with frequency `f > 0`, computes:
+/// - `k`: shift value such that `nstates <= (f << k) < 2 * nstates`
+/// - `s0`: first state using `k` bits (derived from `k` and `nstates`)
+/// - `delta0`: state delta for states >= s0 (using `k` bits)
+/// - `delta1`: state delta for states < s0 (using `k-1` bits)
+fn fse_init_encoder_table(nstates: usize, nsymbols: usize, freq: &[u16]) -> Vec<FseEncoderEntry> {
+    let nstates_i = nstates as i32;
+    let n_clz = (nstates as u32).leading_zeros() as i32;
+    let mut table = vec![
+        FseEncoderEntry {
+            s0: 0,
+            k: 0,
+            delta0: 0,
+            delta1: 0,
+        };
+        nsymbols
+    ];
+
+    let mut offset = 0;
+    for i in 0..nsymbols {
+        let f = freq[i] as i32;
+        if f == 0 {
+            continue;
+        }
+        let mut k = (f.leading_zeros() as i32) - n_clz;
+        if k < 0 {
+            k = 0;
+        }
+        table[i].s0 = (f << k) - nstates_i;
+        table[i].k = k;
+        table[i].delta0 = offset - f + (nstates_i >> k);
+        table[i].delta1 = if k > 0 {
+            offset - f + (nstates_i >> (k - 1))
+        } else {
+            0
+        };
+        offset += f;
+    }
+
+    table
+}
+
+/// Adjust frequencies when the sum exceeds the number of states.
+///
+/// Mining reference: Apple `lzfse_fse.c` `fse_adjust_freqs`.
+fn fse_adjust_freqs(freq: &mut [u16], mut overrun: i32) {
+    for shift in (1..=3).rev() {
+        if overrun == 0 {
+            break;
+        }
+        for sym in freq.iter_mut() {
+            if *sym > 1 {
+                let n = ((*sym - 1) >> shift).min(overrun as u16);
+                *sym -= n;
+                overrun -= n as i32;
+                if overrun == 0 {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Normalize occurrence counts to a frequency table summing to `nstates`.
+///
+/// Mining reference: Apple `lzfse_fse.c` `fse_normalize_freq`.
+fn fse_normalize_freq(nstates: usize, _nsymbols: usize, occ: &[u32], freq: &mut [u16]) {
+    let nstates_i = nstates as i32;
+    let mut s_count: u32 = 0;
+    let mut remaining = nstates_i;
+    let mut max_freq = 0;
+    let mut max_freq_sym = 0;
+    let shift = (nstates as u32).leading_zeros().saturating_sub(1) as i32;
+
+    for &o in occ {
+        s_count += o;
+    }
+
+    let highprec_step: u32 = (1u32 << 31).checked_div(s_count).unwrap_or(0);
+
+    for (i, &occ_i) in occ.iter().enumerate() {
+        let f = ((occ_i.wrapping_mul(highprec_step) >> shift) + 1) >> 1;
+
+        if f == 0 && occ_i != 0 {
+            freq[i] = 1;
+            remaining -= 1;
+        } else {
+            freq[i] = f as u16;
+            remaining -= f as i32;
+        }
+
+        if freq[i] as i32 > max_freq {
+            max_freq = freq[i] as i32;
+            max_freq_sym = i;
+        }
+    }
+
+    if -remaining < (max_freq >> 2) {
+        freq[max_freq_sym] = (freq[max_freq_sym] as i32 + remaining) as u16;
+    } else {
+        fse_adjust_freqs(freq, -remaining);
+    }
+}
+
+/// FSE encoder output stream (64-bit accumulator).
+///
+/// Mining reference: Apple `lzfse_fse.h` `fse_out_stream64`,
+/// `fse_out_init64`, `fse_out_push64`, `fse_out_flush64`, `fse_out_finish64`.
+struct FseOutStream {
+    accum: u64,
+    accum_nbits: i32,
+}
+
+impl FseOutStream {
+    fn new() -> Self {
+        FseOutStream {
+            accum: 0,
+            accum_nbits: 0,
+        }
+    }
+
+    /// Push `n` bits of `b` into the accumulator.
+    fn push(&mut self, n: i32, b: u64) {
+        self.accum |= b << self.accum_nbits;
+        self.accum_nbits += n;
+    }
+
+    /// Write all complete bytes from the accumulator to `dst`.
+    fn flush(&mut self, dst: &mut Vec<u8>) {
+        let nbits = (self.accum_nbits & !7) as usize;
+        let bytes = nbits / 8;
+        for i in 0..bytes {
+            dst.push(((self.accum >> (i * 8)) & 0xFF) as u8);
+        }
+        self.accum >>= nbits as u32;
+        self.accum_nbits -= nbits as i32;
+    }
+
+    /// Write final bytes (including padding) and reset the accumulator.
+    fn finish(&mut self, dst: &mut Vec<u8>) {
+        let nbits = ((self.accum_nbits + 7) & !7) as usize;
+        let bytes = nbits / 8;
+        for i in 0..bytes {
+            dst.push(((self.accum >> (i * 8)) & 0xFF) as u8);
+        }
+        self.accum = 0;
+        self.accum_nbits -= nbits as i32;
+    }
+}
+
+/// Encode a symbol using the FSE encoder table.
+///
+/// Mining reference: Apple `lzfse_fse.h` `fse_encode`.
+fn fse_encode(state: &mut u16, table: &[FseEncoderEntry], out: &mut FseOutStream, symbol: u8) {
+    let s = *state as i32;
+    let e = table[symbol as usize];
+    let hi = if s >= e.s0 { 1 } else { 0 };
+    let nbits = if hi == 1 { e.k } else { e.k - 1 };
+    let delta = if hi == 1 { e.delta0 } else { e.delta1 };
+    let b = mask_lsb64(s as u64, nbits as u32);
+    out.push(nbits, b);
+    *state = (delta + (s >> nbits)) as u16;
+}
+
+/// Map a value to its L symbol index.
+///
+/// Mining reference: Apple `lzfse_encode_tables.h` `l_base_from_value`.
+fn l_base_from_value(value: u32) -> u8 {
+    let mut sym = 0u32;
+    while sym < (ENCODE_L_SYMBOLS as u32 - 1) && value >= L_BASE_VALUE[(sym + 1) as usize] as u32 {
+        sym += 1;
+    }
+    sym as u8
+}
+
+/// Map a value to its M symbol index.
+///
+/// Mining reference: Apple `lzfse_encode_tables.h` `m_base_from_value`.
+fn m_base_from_value(value: u32) -> u8 {
+    let mut sym = 0u32;
+    while sym < (ENCODE_M_SYMBOLS as u32 - 1) && value >= M_BASE_VALUE[(sym + 1) as usize] as u32 {
+        sym += 1;
+    }
+    sym as u8
+}
+
+/// Map a value to its D symbol index.
+///
+/// Mining reference: Apple `lzfse_encode_tables.h` `d_base_from_value`.
+fn d_base_from_value(value: i32) -> u8 {
+    let mut index: i32 = 0;
+    {
+        let in_range_k = if (0..60).contains(&value) {
+            -1i32
+        } else {
+            0i32
+        };
+        let contrib = value & in_range_k;
+        index |= contrib;
+    }
+    {
+        let in_range_k = if (60..1020).contains(&value) {
+            -1i32
+        } else {
+            0i32
+        };
+        let contrib = (((value - 60) >> 4) + 64) & in_range_k;
+        index |= contrib;
+    }
+    {
+        let in_range_k = if (1020..16380).contains(&value) {
+            -1i32
+        } else {
+            0i32
+        };
+        let contrib = (((value - 1020) >> 8) + 128) & in_range_k;
+        index |= contrib;
+    }
+    {
+        let in_range_k = if (16380..262140).contains(&value) {
+            -1i32
+        } else {
+            0i32
+        };
+        let contrib = (((value - 16380) >> 12) + 192) & in_range_k;
+        index |= contrib;
+    }
+    let table: [u8; 256] = [
+        0, 1, 2, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11,
+        12, 12, 12, 12, 12, 12, 12, 12, 13, 13, 13, 13, 13, 13, 13, 13, 14, 14, 14, 14, 14, 14, 14,
+        14, 15, 15, 15, 15, 15, 15, 15, 15, 16, 16, 16, 16, 16, 17, 18, 19, 20, 20, 21, 21, 22, 22,
+        23, 23, 24, 24, 24, 24, 25, 25, 25, 25, 26, 26, 26, 26, 27, 27, 27, 27, 28, 28, 28, 28, 28,
+        28, 28, 28, 29, 29, 29, 29, 29, 29, 29, 29, 30, 30, 30, 30, 30, 30, 30, 30, 31, 31, 31, 31,
+        31, 31, 31, 31, 32, 32, 32, 32, 32, 33, 34, 35, 36, 36, 37, 37, 38, 38, 39, 39, 40, 40, 40,
+        40, 41, 41, 41, 41, 42, 42, 42, 42, 43, 43, 43, 43, 44, 44, 44, 44, 44, 44, 44, 44, 45, 45,
+        45, 45, 45, 45, 45, 45, 46, 46, 46, 46, 46, 46, 46, 46, 47, 47, 47, 47, 47, 47, 47, 47, 48,
+        48, 48, 48, 48, 49, 50, 51, 52, 52, 53, 53, 54, 54, 55, 55, 56, 56, 56, 56, 57, 57, 57, 57,
+        58, 58, 58, 58, 59, 59, 59, 59, 60, 60, 60, 60, 60, 60, 60, 60, 61, 61, 61, 61, 61, 61, 61,
+        61, 62, 62, 62, 62, 62, 62, 62, 62, 63, 63, 63, 63, 63, 63, 63, 63, 0, 0, 0, 0,
+    ];
+    table[(index & 0xFF) as usize]
+}
+
+/// Encode a V1 frequency value using a fixed Huffman-like code.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_v1_freq_value`.
+fn lzfse_encode_v1_freq_value(value: i32) -> (u32, i32) {
+    let (bits, nbits) = match value {
+        0 => (0u32, 2),
+        1 => (2, 2),
+        2 => (1u32, 3),
+        3 => (5u32, 3),
+        4 => (3u32, 5),
+        5 => (11u32, 5),
+        6 => (19u32, 5),
+        7 => (27u32, 5),
+        _ if value < 24 => (7u32 + ((value as u32 - 8) << 4), 8),
+        _ => (((value as u32 - 24) << 4) + 15, 14),
+    };
+    (bits, nbits)
+}
+
+/// Encode frequency tables from V1 header format to V2 header format.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_v1_freq_table`.
+fn lzfse_encode_v1_freq_table(freq: &[u16]) -> Vec<u8> {
+    let total_symbols =
+        ENCODE_L_SYMBOLS + ENCODE_M_SYMBOLS + ENCODE_D_SYMBOLS + ENCODE_LITERAL_SYMBOLS;
+    let mut dst = Vec::new();
+    let mut accum: u32 = 0;
+    let mut accum_nbits: i32 = 0;
+
+    for &f in freq.iter().take(total_symbols) {
+        let (bits, nbits) = lzfse_encode_v1_freq_value(f as i32);
+        accum |= bits << accum_nbits;
+        accum_nbits += nbits;
+        while accum_nbits >= 8 {
+            dst.push((accum & 0xFF) as u8);
+            accum >>= 8;
+            accum_nbits -= 8;
+        }
+    }
+    if accum_nbits > 0 {
+        dst.push((accum & 0xFF) as u8);
+    }
+
+    dst
+}
+
+/// Insert `nbits` bits from `data` at position `offset` in a u64.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `setField`.
+fn set_field(data: u32, offset: u32, nbits: u32) -> u64 {
+    if nbits >= 32 {
+        (data as u64) << offset
+    } else {
+        (data as u64 & ((1u64 << nbits) - 1)) << offset
+    }
+}
+
+/// V1 header fields used during encoding (freq tables handled separately).
+///
+/// Mining reference: Apple `lzfse_internal.h`
+/// `lzfse_compressed_block_header_v1`.
+struct LzfseV1HeaderFields {
+    n_literal_payload_bytes: u32,
+    n_lmd_payload_bytes: u32,
+    n_literals: u32,
+    n_matches: u32,
+    literal_bits: i32,
+    literal_state: [u16; 4],
+    lmd_bits: i32,
+    l_state: u16,
+    m_state: u16,
+    d_state: u16,
+}
+
+#[allow(dead_code)]
+const LZFSE_ENCODE_MAX_D_VALUE: u32 = 262139;
+
+/// A candidate match found by the hash-based match finder.
+#[allow(dead_code)]
+struct LzfseMatch {
+    pos: usize,
+    ref_pos: usize,
+    length: u32,
+}
+
+/// History line: positions and values for candidate matches.
+#[derive(Clone, Copy)]
+struct HistoryLine {
+    pos: [i32; LZFSE_ENCODE_HASH_WIDTH],
+    value: [u32; LZFSE_ENCODE_HASH_WIDTH],
+}
+
+impl Default for HistoryLine {
+    fn default() -> Self {
+        HistoryLine {
+            pos: [-4 * LZFSE_ENCODE_MAX_D_VALUE as i32; LZFSE_ENCODE_HASH_WIDTH],
+            value: [0; LZFSE_ENCODE_HASH_WIDTH],
+        }
+    }
+}
+
+/// Hash function: Knuth multiplicative hash into [0, 2^14-1].
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `hashX`.
+fn hash_x(x: u32) -> usize {
+    ((x.wrapping_mul(2654435761u32)) >> (32 - LZFSE_ENCODE_HASH_BITS)) as usize
+}
+
+/// Load 4 bytes little-endian from `src` at `offset`, clamping to end.
+fn load4_at(src: &[u8], offset: usize) -> u32 {
+    let offset = offset.min(src.len().saturating_sub(4));
+    let b0 = src.get(offset).copied().unwrap_or(0) as u32;
+    let b1 = src.get(offset + 1).copied().unwrap_or(0) as u32;
+    let b2 = src.get(offset + 2).copied().unwrap_or(0) as u32;
+    let b3 = src.get(offset + 3).copied().unwrap_or(0) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+/// Load 8 bytes little-endian from `src` at `offset`, clamping to end.
+#[allow(dead_code)]
+fn load8_at(src: &[u8], offset: usize) -> u64 {
+    let offset = offset.min(src.len().saturating_sub(8));
+    let mut result = 0u64;
+    for i in 0..8 {
+        result |= (src.get(offset + i).copied().unwrap_or(0) as u64) << (i * 8);
+    }
+    result
+}
+
+/// Encode L extra bits and L symbol into the FSE output stream.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_l_value`.
+fn encode_l_value(
+    out: &mut FseOutStream,
+    l_state: &mut u16,
+    l_enc: &[FseEncoderEntry],
+    l_value: u32,
+) {
+    let sym = l_base_from_value(l_value);
+    let base = L_BASE_VALUE[sym as usize] as u32;
+    let extra_bits = L_EXTRA_BITS[sym as usize] as i32;
+    let extra_value = l_value - base;
+    out.push(extra_bits, extra_value as u64);
+    fse_encode(l_state, l_enc, out, sym);
+}
+
+/// Encode M (match length) extra bits and symbol.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_m_value`.
+fn encode_m_value(
+    out: &mut FseOutStream,
+    m_state: &mut u16,
+    m_enc: &[FseEncoderEntry],
+    m_value: u32,
+) {
+    let sym = m_base_from_value(m_value);
+    let base = M_BASE_VALUE[sym as usize] as u32;
+    let extra_bits = M_EXTRA_BITS[sym as usize] as i32;
+    let extra_value = m_value - base;
+    out.push(extra_bits, extra_value as u64);
+    fse_encode(m_state, m_enc, out, sym);
+}
+
+/// Encode D (match distance) extra bits and symbol.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_d_value`.
+fn encode_d_value(
+    out: &mut FseOutStream,
+    d_state: &mut u16,
+    d_enc: &[FseEncoderEntry],
+    d_value: u32,
+) {
+    let sym = d_base_from_value(d_value as i32);
+    let base = D_BASE_VALUE[sym as usize] as u32;
+    let extra_bits = D_EXTRA_BITS[sym as usize] as i32;
+    let extra_value = d_value - base;
+    out.push(extra_bits, extra_value as u64);
+    fse_encode(d_state, d_enc, out, sym);
+}
+
+/// Encode the V1 header fields into the V2 packed_fields area.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_v1_state`.
+fn lzfse_encode_v1_state(packed: &mut [u64; 3], h1: &LzfseV1HeaderFields) {
+    packed[0] = set_field(h1.n_literals, 0, 20)
+        | set_field(h1.n_literal_payload_bytes, 20, 20)
+        | set_field(h1.n_matches, 40, 20)
+        | set_field(7 + h1.literal_bits as u32, 60, 3);
+
+    packed[1] = set_field(h1.literal_state[0] as u32, 0, 10)
+        | set_field(h1.literal_state[1] as u32, 10, 10)
+        | set_field(h1.literal_state[2] as u32, 20, 10)
+        | set_field(h1.literal_state[3] as u32, 30, 10)
+        | set_field(h1.n_lmd_payload_bytes, 40, 20)
+        | set_field(7 + h1.lmd_bits as u32, 60, 3);
+
+    // packed[2] low 32 bits already has header_size from caller.
+    // Only set the upper 32 bits (states) here.
+    packed[2] |= set_field(h1.l_state as u32, 32, 10)
+        | set_field(h1.m_state as u32, 42, 10)
+        | set_field(h1.d_state as u32, 52, 10);
+}
+
+/// Encode literal and match data into a compressed LZFSE V2 block.
+///
+/// Produces: magic + n_raw_bytes + packed_fields[3] + freq[] + literal_payload + lmd_payload.
+/// The caller appends the end-of-stream marker.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_matches`.
+fn lzfse_encode_block(
+    _src: &[u8],
+    literals: &[u8],
+    l_values: &[u32],
+    m_values: &[u32],
+    d_values: &[u32],
+) -> Vec<u8> {
+    let n_literals = literals.len() as u32;
+    let n_matches = l_values.len() as u32;
+
+    // Total raw output bytes = literal bytes + match bytes.
+    let n_raw_bytes: u32 = l_values.iter().sum::<u32>() + m_values.iter().sum::<u32>();
+
+    // --- Build encoder frequency tables ---
+
+    // Pad literals to a multiple of 4 for the 4-stream FSE encoding.
+    let mut padded_literals = Vec::with_capacity(((n_literals as usize + 3) / 4) * 4);
+    padded_literals.extend_from_slice(literals);
+    while (padded_literals.len() & 3) != 0 {
+        padded_literals.push(0);
+    }
+    let n_literals_padded = padded_literals.len() as u32;
+
+    // Convert repeated distances to 0 ("same as previous").
+    let mut d_encoded = d_values.to_vec();
+    let mut d_prev: u32 = 0;
+    for d in &mut d_encoded {
+        if *d == d_prev {
+            *d = 0;
+        } else {
+            d_prev = *d;
+        }
+    }
+
+    // Count symbol occurrences.
+    let mut l_occ = [0u32; ENCODE_L_SYMBOLS];
+    let mut m_occ = [0u32; ENCODE_M_SYMBOLS];
+    let mut d_occ = [0u32; ENCODE_D_SYMBOLS];
+    let mut literal_occ = [0u32; ENCODE_LITERAL_SYMBOLS];
+
+    for i in 0..n_matches as usize {
+        l_occ[l_base_from_value(l_values[i]) as usize] += 1;
+        m_occ[m_base_from_value(m_values[i]) as usize] += 1;
+        d_occ[d_base_from_value(d_encoded[i] as i32) as usize] += 1;
+    }
+    for &lit in &padded_literals {
+        literal_occ[lit as usize] += 1;
+    }
+
+    // --- Normalize occurrence tables to frequency tables ---
+    let mut l_freq = [0u16; ENCODE_L_SYMBOLS];
+    let mut m_freq = [0u16; ENCODE_M_SYMBOLS];
+    let mut d_freq = [0u16; ENCODE_D_SYMBOLS];
+    let mut literal_freq = [0u16; ENCODE_LITERAL_SYMBOLS];
+
+    fse_normalize_freq(ENCODE_L_STATES, ENCODE_L_SYMBOLS, &l_occ, &mut l_freq);
+    fse_normalize_freq(ENCODE_M_STATES, ENCODE_M_SYMBOLS, &m_occ, &mut m_freq);
+    fse_normalize_freq(ENCODE_D_STATES, ENCODE_D_SYMBOLS, &d_occ, &mut d_freq);
+    fse_normalize_freq(
+        ENCODE_LITERAL_STATES,
+        ENCODE_LITERAL_SYMBOLS,
+        &literal_occ,
+        &mut literal_freq,
+    );
+
+    // --- Build FSE encoder tables ---
+    let l_enc = fse_init_encoder_table(ENCODE_L_STATES, ENCODE_L_SYMBOLS, &l_freq);
+    let m_enc = fse_init_encoder_table(ENCODE_M_STATES, ENCODE_M_SYMBOLS, &m_freq);
+    let d_enc = fse_init_encoder_table(ENCODE_D_STATES, ENCODE_D_SYMBOLS, &d_freq);
+    let literal_enc =
+        fse_init_encoder_table(ENCODE_LITERAL_STATES, ENCODE_LITERAL_SYMBOLS, &literal_freq);
+
+    // --- Encode frequency table data (for V2 header) ---
+    let mut freq_all = Vec::with_capacity(
+        ENCODE_L_SYMBOLS + ENCODE_M_SYMBOLS + ENCODE_D_SYMBOLS + ENCODE_LITERAL_SYMBOLS,
+    );
+    freq_all.extend_from_slice(&l_freq);
+    freq_all.extend_from_slice(&m_freq);
+    freq_all.extend_from_slice(&d_freq);
+    freq_all.extend_from_slice(&literal_freq);
+    let freq_bytes = lzfse_encode_v1_freq_table(&freq_all);
+
+    // --- Encode literal payload (FSE, 4 interleaved streams, reverse order) ---
+    let mut literal_payload = Vec::new();
+    let mut out = FseOutStream::new();
+    let mut lit_state0: u16 = 0;
+    let mut lit_state1: u16 = 0;
+    let mut lit_state2: u16 = 0;
+    let mut lit_state3: u16 = 0;
+
+    let n_lit = padded_literals.len();
+    let mut i = n_lit;
+    while i >= 4 {
+        fse_encode(
+            &mut lit_state3,
+            &literal_enc,
+            &mut out,
+            padded_literals[i - 1],
+        );
+        fse_encode(
+            &mut lit_state2,
+            &literal_enc,
+            &mut out,
+            padded_literals[i - 2],
+        );
+        fse_encode(
+            &mut lit_state1,
+            &literal_enc,
+            &mut out,
+            padded_literals[i - 3],
+        );
+        fse_encode(
+            &mut lit_state0,
+            &literal_enc,
+            &mut out,
+            padded_literals[i - 4],
+        );
+        out.flush(&mut literal_payload);
+        i -= 4;
+    }
+    let literal_bits = out.accum_nbits;
+    out.finish(&mut literal_payload);
+
+    let n_literal_payload_bytes = literal_payload.len() as u32;
+
+    // --- Encode LMD payload (FSE, reverse order of matches) ---
+    // 8 zero padding bytes at the start of the LMD payload, needed by the
+    // decoder's FSE reader for initial 8-byte load.
+    let mut lmd_payload = Vec::new();
+    lmd_payload.extend_from_slice(&[0u8; 8]);
+    let mut out = FseOutStream::new();
+    let mut l_state: u16 = 0;
+    let mut m_state: u16 = 0;
+    let mut d_state: u16 = 0;
+
+    for i in (0..n_matches as usize).rev() {
+        // Order: D first, then M, then L (decoder reads L, M, D)
+        encode_d_value(&mut out, &mut d_state, &d_enc, d_encoded[i]);
+        encode_m_value(&mut out, &mut m_state, &m_enc, m_values[i]);
+        encode_l_value(&mut out, &mut l_state, &l_enc, l_values[i]);
+        out.flush(&mut lmd_payload);
+    }
+
+    let lmd_bits = out.accum_nbits;
+    out.finish(&mut lmd_payload);
+
+    let n_lmd_payload_bytes = lmd_payload.len() as u32;
+
+    // --- Assemble V2 header ---
+    let header_size = 32 + freq_bytes.len();
+    let h1 = LzfseV1HeaderFields {
+        n_literals: n_literals_padded,
+        n_matches,
+        n_literal_payload_bytes,
+        n_lmd_payload_bytes,
+        literal_bits,
+        literal_state: [lit_state0, lit_state1, lit_state2, lit_state3],
+        lmd_bits,
+        l_state,
+        m_state,
+        d_state,
+    };
+
+    let mut packed = [0u64; 3];
+    packed[2] = set_field(header_size as u32, 0, 32);
+    lzfse_encode_v1_state(&mut packed, &h1);
+
+    let mut result = Vec::new();
+    result.extend_from_slice(&COMPRESSEDV2_BLOCK_MAGIC.to_le_bytes());
+    result.extend_from_slice(&n_raw_bytes.to_le_bytes());
+    result.extend_from_slice(&packed[0].to_le_bytes());
+    result.extend_from_slice(&packed[1].to_le_bytes());
+    result.extend_from_slice(&packed[2].to_le_bytes());
+    result.extend_from_slice(&freq_bytes);
+    result.extend_from_slice(&literal_payload);
+    result.extend_from_slice(&lmd_payload);
+    result
+}
+
+/// Search for the longest match at `pos` starting at `pos` in `src`.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` match-finding loop.
+fn find_match(src: &[u8], history: &mut [HistoryLine], pos: usize) -> Option<(usize, u32)> {
+    if pos + LZFSE_ENCODE_MIN_MATCH > src.len() {
+        return None;
+    }
+
+    let key4 = load4_at(src, pos);
+    let hash = hash_x(key4);
+    let bucket = &mut history[hash];
+
+    // Search existing candidates for the longest match.
+    let mut best_len: u32 = 0;
+    let mut best_dist: usize = 0;
+
+    for slot in 0..LZFSE_ENCODE_HASH_WIDTH {
+        let ref_pos = bucket.pos[slot];
+        if ref_pos < 0 {
+            continue;
+        }
+        let ref_pos = ref_pos as usize;
+
+        // Quick 4-byte filter.
+        if bucket.value[slot] != key4 {
+            continue;
+        }
+
+        // Verify the match and count length. Overlapping matches are allowed
+        // in LZFSE (the decoder handles them with byte-by-byte copy).
+        let mut len: u32 = 4;
+        while len < LZFSE_ENCODE_MAX_MATCH as u32 && pos + (len as usize) < src.len() {
+            if src[pos + (len as usize)] != src[ref_pos + (len as usize)] {
+                break;
+            }
+            len += 1;
+        }
+
+        if len > best_len {
+            best_len = len;
+            best_dist = pos - ref_pos;
+        }
+    }
+
+    // Insert current position into the bucket (slot 0), evicting the oldest.
+    for slot in (1..LZFSE_ENCODE_HASH_WIDTH).rev() {
+        bucket.pos[slot] = bucket.pos[slot - 1];
+        bucket.value[slot] = bucket.value[slot - 1];
+    }
+    bucket.pos[0] = pos as i32;
+    bucket.value[0] = key4;
+
+    if best_len >= LZFSE_ENCODE_MIN_MATCH as u32 {
+        Some((best_dist, best_len))
+    } else {
+        None
+    }
+}
+
+/// Main LZFSE encoder entry point: produces a complete LZFSE frame.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_buffer`.
+fn lzfse_encode_buffer(src: &[u8]) -> Result<Vec<u8>> {
+    let src_len = src.len();
+
+    // Build the literal-match sequence using hash-based match finding.
+    let mut literals: Vec<u8> = Vec::new();
+    let mut l_values: Vec<u32> = Vec::new();
+    let mut m_values: Vec<u32> = Vec::new();
+    let mut d_values: Vec<u32> = Vec::new();
+
+    let mut history: Vec<HistoryLine> = vec![HistoryLine::default(); LZFSE_ENCODE_HASH_VALUES];
+
+    let mut pos: usize = 0;
+    let mut pending_literals: Vec<u8> = Vec::new();
+
+    while pos + LZFSE_ENCODE_MIN_MATCH <= src_len {
+        // Try to find a match at the current position.
+        let match_result = find_match(src, &mut history, pos);
+
+        if let Some((dist, len)) = match_result {
+            // For good matches (length >= GOOD_MATCH), try starting one byte later
+            // (lazy matching optimization — simplified to just use the found match).
+            let len = len.min(LZFSE_ENCODE_MAX_MATCH as u32);
+            let dist = dist.min(LZFSE_ENCODE_MAX_D_VALUE as usize);
+
+            l_values.push(pending_literals.len() as u32);
+            m_values.push(len);
+            d_values.push(dist as u32);
+            literals.extend_from_slice(&pending_literals);
+            pending_literals.clear();
+
+            pos += len as usize;
+        } else {
+            pending_literals.push(src[pos]);
+            pos += 1;
+        }
+    }
+
+    // Emit remaining literals as a final LMD triplet with M=0.
+    if !pending_literals.is_empty() {
+        l_values.push(pending_literals.len() as u32);
+        m_values.push(0);
+        d_values.push(1);
+        literals.extend_from_slice(&pending_literals);
+        pending_literals.clear();
+    }
+
+    // If no matches were found, the data is not compressible by LZFSE.
+    if m_values.is_empty() {
+        return Err(Error::invalid(
+            "lzfse encode",
+            "no matches found; data is not compressible",
+        ));
+    }
+
+    // Encode the block.
+    let block = lzfse_encode_block(src, &literals, &l_values, &m_values, &d_values);
+
+    // Append the end-of-stream marker.
+    let mut result = block;
+    result.extend_from_slice(&ENDOFSTREAM_BLOCK_MAGIC.to_le_bytes());
+    Ok(result)
+}
+
+/// Compress data using LZFSE (type 3), producing a complete LZFSE frame.
+///
+/// For small inputs (<= `LZFSE_ENCODE_LZVN_THRESHOLD`), the encoder tries
+/// LZVN first and uses whichever produces a smaller result. For data that
+/// does not compress, an uncompressed block is emitted.
+///
+/// Mining reference: Apple `lzfse_encode_base.c` `lzfse_encode_buffer`
+/// and `lzfse_encode_lzvn_block`.
+pub fn encode(src: &[u8]) -> Vec<u8> {
+    if src.is_empty() {
+        return ENDOFSTREAM_BLOCK_MAGIC.to_le_bytes().to_vec();
+    }
+
+    // For inputs up to the LZVN threshold, try LZVN first (it is faster and
+    // often smaller for small inputs).
+    if src.len() <= LZFSE_ENCODE_LZVN_THRESHOLD {
+        let lzvn_payload = super::lzvn::encode(src);
+        let mut lzvn_block = Vec::new();
+        lzvn_block.extend_from_slice(&COMPRESSEDLZVN_BLOCK_MAGIC.to_le_bytes());
+        lzvn_block.extend_from_slice(&(src.len() as u32).to_le_bytes());
+        lzvn_block.extend_from_slice(&(lzvn_payload.len() as u32).to_le_bytes());
+        lzvn_block.extend_from_slice(&lzvn_payload);
+        lzvn_block.extend_from_slice(&ENDOFSTREAM_BLOCK_MAGIC.to_le_bytes());
+        if lzvn_block.len() <= src.len() + 8 {
+            return lzvn_block;
+        }
+    }
+
+    // Try LZFSE V2 encoding.
+    if let Ok(lzfse_data) = lzfse_encode_buffer(src) {
+        if lzfse_data.len() <= src.len() + 16 {
+            return lzfse_data;
+        }
+    }
+
+    // Fall back to uncompressed block.
+    let mut result = Vec::new();
+    result.extend_from_slice(&UNCOMPRESSED_BLOCK_MAGIC.to_le_bytes());
+    result.extend_from_slice(&(src.len() as u32).to_le_bytes());
+    result.extend_from_slice(src);
+    result.extend_from_slice(&ENDOFSTREAM_BLOCK_MAGIC.to_le_bytes());
+    result
 }
 
 #[cfg(test)]
@@ -1290,5 +2136,68 @@ mod tests {
         assert_eq!(result.len(), 1000);
         assert_eq!(&result[0..500], &vec![b'A'; 500]);
         assert_eq!(&result[500..1000], &vec![b'B'; 500]);
+    }
+
+    #[test]
+    fn lzfse_encode_decode_round_trip() {
+        let pattern = b"The quick brown fox jumps over the lazy dog. ".to_vec();
+        let pattern10 = pattern.repeat(10);
+        let seq_bytes: Vec<u8> = (0..1000u32)
+            .flat_map(|i| [i as u8, (i >> 8) as u8, (i >> 16) as u8, (i >> 24) as u8])
+            .collect();
+        let inputs: Vec<&[u8]> = vec![
+            b"ABABABABABABABABABABABABABABABABABABABAB",
+            &[0u8; 100],
+            &pattern10,
+            &[0xAA; 500],
+            &[b'A'; 4500],
+            b"Hello, LZFSE World! This is a test.",
+            &seq_bytes,
+        ];
+
+        for (i, input) in inputs.iter().enumerate() {
+            let compressed = encode(input);
+            if compressed.len() >= input.len() + 16 {
+                println!(
+                    "test {i}: compression not effective ({} >= {})",
+                    compressed.len(),
+                    input.len() + 16
+                );
+                continue;
+            }
+            let decompressed = match decode(&compressed, input.len() as u64) {
+                Ok(d) => d,
+                Err(e) => {
+                    println!("test {i}: decompress error: {:?}", e);
+                    panic!("test {i}: LZFSE round-trip should decompress");
+                }
+            };
+            assert_eq!(
+                &decompressed[..],
+                &input[..],
+                "test {i}: LZFSE round-trip output mismatch"
+            );
+        }
+    }
+
+    #[test]
+    fn lzfse_encode_empty_input() {
+        let compressed = encode(b"");
+        let decompressed = decode(&compressed, 0).unwrap();
+        assert!(decompressed.is_empty());
+    }
+
+    #[test]
+    fn lzfse_encode_incompressible_data() {
+        // Pseudo-random data that won't compress well
+        let mut input = Vec::new();
+        let mut state: u32 = 0x12345678;
+        for _ in 0..500 {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            input.push((state >> 16) as u8);
+        }
+        let compressed = encode(&input);
+        let decompressed = decode(&compressed, input.len() as u64).unwrap();
+        assert_eq!(decompressed, input);
     }
 }

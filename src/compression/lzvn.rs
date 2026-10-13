@@ -9,8 +9,8 @@
 //    this list of conditions and the following disclaimer in the documentation
 //    and/or other materials provided with the distribution.
 // 3. Neither the name of the copyright holder(s) nor the names of any
-//    contributors may be used to endorse or promote products derived from this
-//    software without specific prior written permission.
+//    contributors may be used to endorse or promote products derived from
+//    this software without specific prior written permission.
 //
 // THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
 // AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
@@ -25,11 +25,11 @@
 //
 // Mining reference: Apple `lzfse` library, https://github.com/lzfse/lzfse
 // (mirror: 0x09/hfsfuse `src/lzvn_decode_base.c`, `src/lzvn_decode_base.h`,
-// BSD-3-Clause).
+// `src/lzvn_encode_base.c`, `src/lzvn_encode_base.h`, BSD-3-Clause).
 // Translated to Rust with bounds-checking and no `unsafe`.
 // SPDX-License-Identifier: BSD-3-Clause
 
-//! LZVN bitstream decoder for decmpfs compression type 4.
+//! LZVN bitstream decoder and encoder for decmpfs compression type 4.
 //!
 //! LZVN is Apple's LZ77-family compression format with a variable-length opcode
 //! scheme. Each opcode byte indexes a 256-entry table that determines its
@@ -53,6 +53,10 @@
 //! opcode variant.
 
 use crate::error::{Error, Result};
+
+// ============================================================
+// Decoder
+// ============================================================
 
 /// Size of an LZVN end-of-stream marker in bytes.
 const EOS_SIZE: usize = 8;
@@ -99,7 +103,7 @@ impl<'a> Decoder<'a> {
         while self.src_pos < self.src.len() {
             let opc = self.src[self.src_pos];
             if self.process_opcode(opc)? {
-                break; // EOS reached
+                break;
             }
         }
         Ok(())
@@ -108,7 +112,6 @@ impl<'a> Decoder<'a> {
     /// Process one opcode. Returns `true` if end-of-stream was reached.
     fn process_opcode(&mut self, opc: u8) -> Result<bool> {
         match opc_category(opc) {
-            // sml_d: LLMMMDDD DDDDDDDD LITERAL
             Category::SmlD => {
                 let l = extract_u8(opc, 6, 2) as usize;
                 let m = extract_u8(opc, 3, 3) as usize + 3;
@@ -124,7 +127,6 @@ impl<'a> Decoder<'a> {
                 self.src_pos += 1;
                 self.copy_literal_and_match(l, m, d)?;
             }
-            // med_d: 101LLMMM DDDDDDMM DDDDDDDD LITERAL
             Category::MedD => {
                 let l = extract_u8(opc, 3, 2) as usize;
                 self.src_pos += 1;
@@ -135,14 +137,13 @@ impl<'a> Decoder<'a> {
                         available: self.remaining_src(),
                     });
                 }
-                let opc23 = load_be16(&self.src[self.src_pos..]);
+                let opc23 = load_le16(&self.src[self.src_pos..]);
                 let m =
                     ((extract_u8(opc, 0, 3) as u16) << 2 | extract_u16(opc23, 0, 2)) as usize + 3;
                 let d = extract_u16(opc23, 2, 14) as usize;
                 self.src_pos += 2;
                 self.copy_literal_and_match(l, m, d)?;
             }
-            // lrg_d: LLMMM111 DDDDDDDD DDDDDDDD LITERAL
             Category::LrgD => {
                 let l = extract_u8(opc, 6, 2) as usize;
                 let m = extract_u8(opc, 3, 3) as usize + 3;
@@ -154,11 +155,10 @@ impl<'a> Decoder<'a> {
                         available: self.remaining_src(),
                     });
                 }
-                let d = load_be16(&self.src[self.src_pos..]) as usize;
+                let d = load_le16(&self.src[self.src_pos..]) as usize;
                 self.src_pos += 2;
                 self.copy_literal_and_match(l, m, d)?;
             }
-            // pre_d: LLMMM110 (uses previous distance)
             Category::PreD => {
                 let l = extract_u8(opc, 6, 2) as usize;
                 let m = extract_u8(opc, 3, 3) as usize + 3;
@@ -166,13 +166,11 @@ impl<'a> Decoder<'a> {
                 self.src_pos += 1;
                 self.copy_literal_and_match(l, m, d)?;
             }
-            // sml_m: 1111MMMM (no literal, uses prev distance)
             Category::SmlM => {
                 let m = extract_u8(opc, 0, 4) as usize;
                 self.src_pos += 1;
                 self.copy_match_only(m)?;
             }
-            // lrg_m: 11110000 MMMMMMMM (no literal, uses prev distance)
             Category::LrgM => {
                 self.src_pos += 1;
                 if self.src_pos >= self.src.len() {
@@ -186,13 +184,11 @@ impl<'a> Decoder<'a> {
                 self.src_pos += 1;
                 self.copy_match_only(m)?;
             }
-            // sml_l: 1110LLLL LITERAL (no match)
             Category::SmlL => {
                 let l = extract_u8(opc, 0, 4) as usize;
                 self.src_pos += 1;
                 self.copy_literal_only(l)?;
             }
-            // lrg_l: 11100000 LLLLLLLL LITERAL
             Category::LrgL => {
                 self.src_pos += 1;
                 if self.src_pos >= self.src.len() {
@@ -206,16 +202,13 @@ impl<'a> Decoder<'a> {
                 self.src_pos += 1;
                 self.copy_literal_only(l)?;
             }
-            // eos: 8 bytes of end-of-stream marker
             Category::Eos => {
                 self.src_pos += EOS_SIZE;
                 return Ok(true);
             }
-            // nop: skip 1 byte
             Category::Nop => {
                 self.src_pos += 1;
             }
-            // udef: undefined opcode
             Category::Undef => {
                 return Err(Error::invalid(
                     "lzvn opcode",
@@ -293,11 +286,9 @@ impl<'a> Decoder<'a> {
         }
         let src_start = dst_pos - d;
         if d >= m {
-            // Non-overlapping: safe to copy the whole match at once
             let bytes: Vec<u8> = self.dst[src_start..src_start + m].to_vec();
             self.dst.extend_from_slice(&bytes);
         } else {
-            // Overlapping: D < M, copy byte-by-byte
             for _ in 0..m {
                 let src_idx = self.dst.len() - d;
                 let byte = self.dst[src_idx];
@@ -308,20 +299,9 @@ impl<'a> Decoder<'a> {
     }
 }
 
-/// Extract `nbits` bits starting at `lsb` from a u8.
-fn extract_u8(value: u8, lsb: u32, nbits: u32) -> u8 {
-    (value >> lsb) & ((1u8 << nbits) - 1)
-}
-
-/// Extract `nbits` bits starting at `lsb` from a u16.
-fn extract_u16(value: u16, lsb: u32, nbits: u32) -> u16 {
-    (value >> lsb) & ((1u16 << nbits) - 1)
-}
-
-/// Load a big-endian u16 from a byte slice.
-fn load_be16(data: &[u8]) -> u16 {
-    ((data[0] as u16) << 8) | (data[1] as u16)
-}
+// ============================================================
+// Opcode categories and helpers (shared by decoder and tests)
+// ============================================================
 
 /// Opcode categories for the LZVN decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -367,10 +347,556 @@ fn opc_category(opc: u8) -> Category {
         7 | 15 | 23 | 31 | 39 | 47 | 55 | 63 | 71 | 79 | 87 | 95 | 103 | 111 | 135 | 143 | 151
         | 159 | 199 | 207 => Category::LrgD,
         70 | 78 | 86 | 94 | 102 | 110 | 134 | 142 | 150 | 158 | 198 | 206 => Category::PreD,
-        160..=179 => Category::MedD,
+        160..=191 => Category::MedD,
         _ => Category::SmlD,
     }
 }
+
+/// Extract `nbits` bits starting at `lsb` from a u8.
+fn extract_u8(value: u8, lsb: u32, nbits: u32) -> u8 {
+    (value >> lsb) & ((1u8 << nbits) - 1)
+}
+
+/// Extract `nbits` bits starting at `lsb` from a u16.
+fn extract_u16(value: u16, lsb: u32, nbits: u32) -> u16 {
+    (value >> lsb) & ((1u16 << nbits) - 1)
+}
+
+/// Load a little-endian u16 from a byte slice.
+fn load_le16(data: &[u8]) -> u16 {
+    (data[0] as u16) | ((data[1] as u16) << 8)
+}
+
+// ============================================================
+// LZVN encoder
+// ============================================================
+
+/// Minimum source buffer size for LZVN compression.
+/// Matches `LZVN_ENCODE_MIN_SRC_SIZE` from Apple's header.
+const LZVN_ENCODE_MIN_SRC_SIZE: usize = 8;
+
+/// Hash table parameters, matching Apple's `lzvn_encode_base.h`.
+const LZVN_ENCODE_HASH_BITS: usize = 14;
+const LZVN_ENCODE_HASH_VALUES: usize = 1 << LZVN_ENCODE_HASH_BITS;
+const LZVN_ENCODE_MAX_DISTANCE: i32 = 0xffff;
+const LZVN_ENCODE_MAX_LITERAL_BACKLOG: i32 = 400;
+const LZVN_ENCODE_MIN_MARGIN: i32 = 8;
+
+/// Hash table entry storing up to 4 candidate positions per hash.
+///
+/// Mining reference: Apple `lzvn_encode_base.h` `lzvn_encode_entry_type`.
+#[derive(Clone, Copy)]
+struct LzvnEncodeEntry {
+    indices: [i32; 4],
+    values: [u32; 4],
+}
+
+impl Default for LzvnEncodeEntry {
+    fn default() -> Self {
+        LzvnEncodeEntry {
+            indices: [-LZVN_ENCODE_MAX_DISTANCE; 4],
+            values: [0; 4],
+        }
+    }
+}
+
+/// A match found during LZVN encoding.
+///
+/// Mining reference: Apple `lzvn_encode_base.h` `lzvn_match_info`.
+#[derive(Clone, Copy)]
+struct LzvnMatchInfo {
+    m_begin: i32,
+    m_end: i32,
+    m_len: i32,
+    d: i32,
+    k: i32,
+}
+
+impl LzvnMatchInfo {
+    const fn new() -> Self {
+        LzvnMatchInfo {
+            m_begin: 0,
+            m_end: 0,
+            m_len: 0,
+            d: 0,
+            k: 0,
+        }
+    }
+}
+
+impl Default for LzvnMatchInfo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// LZVN encoder working state.
+///
+/// Mining reference: Apple `lzvn_encode_base.h` `lzvn_encoder_state`.
+struct LzvnEncoderState<'a> {
+    src: &'a [u8],
+    src_begin: i32,
+    src_end: i32,
+    src_current: i32,
+    src_current_end: i32,
+    src_literal: i32,
+    dst: Vec<u8>,
+    pending: LzvnMatchInfo,
+    d_prev: i32,
+    table: Vec<LzvnEncodeEntry>,
+}
+
+/// Encode `src` into a raw LZVN bitstream.
+///
+/// This is the write-side counterpart to the `decode` function. The output
+/// is a complete LZVN bitstream (with end-of-stream marker), suitable for
+/// storage in a decmpfs resource fork with compression type 4.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `lzvn_encode_buffer`.
+pub fn encode(src: &[u8]) -> Vec<u8> {
+    if src.len() < LZVN_ENCODE_MIN_SRC_SIZE {
+        let mut dst = Vec::new();
+        emit_literal_block(&mut dst, src, 0, src.len() as i32);
+        emit_end_of_stream(&mut dst);
+        return dst;
+    }
+
+    let max_dst = src.len() + 8 + 8;
+    let dst = Vec::with_capacity(max_dst);
+    let table = vec![LzvnEncodeEntry::default(); LZVN_ENCODE_HASH_VALUES];
+
+    let mut state = LzvnEncoderState {
+        src,
+        src_begin: 0,
+        src_end: src.len() as i32,
+        src_current: 0,
+        src_current_end: src.len() as i32 - LZVN_ENCODE_MIN_MARGIN,
+        src_literal: 0,
+        dst,
+        pending: LzvnMatchInfo::default(),
+        d_prev: 0,
+        table,
+    };
+
+    init_table(&mut state);
+    encode_loop(&mut state);
+
+    // Emit remaining literals.
+    // NOTE: Any pending match is NOT emitted here, matching the C encoder's
+    // behavior. The remaining literal bytes (which may overlap with the
+    // pending match's range) are emitted uncompressed, preserving data
+    // integrity at the cost of not compressing the final match.
+    let remaining = state.src_end - state.src_literal;
+    if remaining > 0 {
+        emit_literal_block(&mut state.dst, state.src, state.src_literal, remaining);
+        state.src_literal = state.src_end;
+    }
+
+    emit_end_of_stream(&mut state.dst);
+    state.dst
+}
+
+/// Initialize the hash table with invalid positions and the first value.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `lzvn_init_table`.
+fn init_table(state: &mut LzvnEncoderState) {
+    let mut idx = -LZVN_ENCODE_MAX_DISTANCE;
+    if idx < state.src_begin {
+        idx = state.src_begin;
+    }
+    let value = if idx >= 0 && (idx as usize) < state.src.len() {
+        load4_at(state.src, idx as usize)
+    } else {
+        0
+    };
+    let sidx = idx;
+    for entry in state.table.iter_mut() {
+        entry.indices = [sidx, sidx, sidx, sidx];
+        entry.values = [value, value, value, value];
+    }
+}
+
+/// Load 4 little-endian bytes from `src` at `offset`.
+fn load4_at(src: &[u8], offset: usize) -> u32 {
+    let offset = offset.min(src.len().saturating_sub(4));
+    let b0 = src.get(offset).copied().unwrap_or(0) as u32;
+    let b1 = src.get(offset + 1).copied().unwrap_or(0) as u32;
+    let b2 = src.get(offset + 2).copied().unwrap_or(0) as u32;
+    let b3 = src.get(offset + 3).copied().unwrap_or(0) as u32;
+    b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+/// Hash function: takes a 32-bit value and produces a hash in range
+/// `[0, LZVN_ENCODE_HASH_VALUES - 1]`.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `hash3i`.
+fn lzvn_hash3i(i: u32) -> u32 {
+    let i = i & 0x00ff_ffff;
+    let h = i.wrapping_mul(65);
+    (h >> 12) & (LZVN_ENCODE_HASH_VALUES as u32 - 1)
+}
+
+/// Return the number of zero bytes in `x`, starting from the least significant byte.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `trailing_zero_bytes`.
+fn tzcnt_bytes(x: u32) -> i32 {
+    if x == 0 {
+        4
+    } else {
+        (x.trailing_zeros() >> 3) as i32
+    }
+}
+
+/// Find a match at `m_begin` against a candidate at `m0_begin`.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `lzvn_find_match`
+/// (and `lzvn_find_matchN` for the known-match variant).
+fn find_match(
+    src: &[u8],
+    src_begin: i32,
+    src_end: i32,
+    l_begin: i32,
+    m0_begin: i32,
+    m_begin: i32,
+    n_known: i32,
+) -> Option<LzvnMatchInfo> {
+    let src_len = src.len() as i32;
+    if m_begin < 0 || m_begin >= src_len || m0_begin < 0 || m0_begin >= src_len {
+        return None;
+    }
+
+    let mut n = n_known;
+    if n < 3 {
+        let vi = load4_at(src, m0_begin as usize);
+        let vj = load4_at(src, m_begin as usize);
+        n = tzcnt_bytes(vi ^ vj);
+    }
+    if n < 3 {
+        return None;
+    }
+
+    let d = m_begin - m0_begin;
+    if d <= 0 || d > LZVN_ENCODE_MAX_DISTANCE {
+        return None;
+    }
+
+    // Expand forward
+    let mut m_end = m_begin + n;
+    while n == 4 && m_end + 4 < src_end {
+        let vi = load4_at(src, m_end as usize);
+        let vj = load4_at(src, (m_end - d) as usize);
+        n = tzcnt_bytes(vi ^ vj);
+        m_end += n;
+    }
+
+    // Expand backwards
+    let mut m_b = m_begin;
+    let mut m0_b = m0_begin;
+    while m0_b > src_begin && m_b > l_begin {
+        if src[(m0_b - 1) as usize] != src[(m_b - 1) as usize] {
+            break;
+        }
+        m0_b -= 1;
+        m_b -= 1;
+    }
+
+    let m_len = m_end - m_b;
+    Some(LzvnMatchInfo {
+        m_begin: m_b,
+        m_end,
+        m_len,
+        d,
+        k: m_len - if d < 0x600 { 2 } else { 3 },
+    })
+}
+
+/// Main encoding loop: scan source, find matches, emit opcodes.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `lzvn_encode`.
+fn encode_loop(state: &mut LzvnEncoderState) {
+    const NO_MATCH: LzvnMatchInfo = LzvnMatchInfo::new();
+
+    while state.src_current < state.src_current_end {
+        let pos = state.src_current;
+        let vi = load4_at(state.src, pos as usize);
+
+        let h = lzvn_hash3i(vi) as usize;
+        let e = state.table[h];
+
+        // Rotate: insert new entry as most recent
+        state.table[h].indices = [pos, e.indices[0], e.indices[1], e.indices[2]];
+        state.table[h].values = [vi, e.values[0], e.values[1], e.values[2]];
+
+        // Skip if still inside a previously emitted match
+        if pos < state.src_literal {
+            state.src_current += 1;
+            continue;
+        }
+
+        let mut incoming = NO_MATCH;
+
+        // Check 4 hash table candidates
+        for k in 0..4 {
+            let ik = e.indices[k];
+            let nk = tzcnt_bytes(e.values[k] ^ vi);
+            if let Some(m) = find_match(
+                state.src,
+                state.src_begin,
+                state.src_end,
+                state.src_literal,
+                ik,
+                pos,
+                nk,
+            ) {
+                if m.k > incoming.k || (m.k == incoming.k && m.m_end > incoming.m_end + 1) {
+                    incoming = m;
+                }
+            }
+        }
+
+        // Check previous distance
+        if state.d_prev != 0 {
+            if let Some(m1) = find_match(
+                state.src,
+                state.src_begin,
+                state.src_end,
+                state.src_literal,
+                pos - state.d_prev,
+                pos,
+                0,
+            ) {
+                let mut m1 = m1;
+                m1.k = m1.m_len - 1;
+                if m1.k > incoming.k || (m1.k == incoming.k && m1.m_end > incoming.m_end + 1) {
+                    incoming = m1;
+                }
+            }
+        }
+
+        // No match found: may need to flush literals if backlog is too high
+        if incoming.m_len == 0 {
+            if pos - state.src_literal >= LZVN_ENCODE_MAX_LITERAL_BACKLOG {
+                if state.pending.m_len > 0 {
+                    if emit_match(state, state.pending) == 0 {
+                        break;
+                    }
+                    state.pending = NO_MATCH;
+                } else {
+                    if emit_literal(&mut state.dst, state.src, state.src_literal as usize, 271) == 0
+                    {
+                        break;
+                    }
+                    state.src_literal += 271;
+                }
+            }
+            state.src_current += 1;
+            continue;
+        }
+
+        // Decide between pending and incoming matches
+        if state.pending.m_len == 0 {
+            state.pending = incoming;
+        } else if state.pending.m_end <= incoming.m_begin {
+            // No overlap: emit pending, keep incoming
+            if emit_match(state, state.pending) == 0 {
+                break;
+            }
+            state.pending = incoming;
+        } else {
+            // Overlap: emit the better one
+            if incoming.k > state.pending.k {
+                state.pending = incoming;
+            }
+            if emit_match(state, state.pending) == 0 {
+                break;
+            }
+            state.pending = NO_MATCH;
+        }
+
+        state.src_current += 1;
+    }
+}
+
+/// Emit a match instruction, updating encoder state.
+/// Returns bytes written, or 0 if output buffer is full.
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `lzvn_emit_match`.
+fn emit_match(state: &mut LzvnEncoderState, match_info: LzvnMatchInfo) -> i32 {
+    let l = (match_info.m_begin - state.src_literal) as usize;
+    let m = match_info.m_len as usize;
+    let d = match_info.d as usize;
+    let d_prev = state.d_prev as usize;
+
+    let old_len = state.dst.len();
+    emit(
+        &mut state.dst,
+        state.src,
+        state.src_literal as usize,
+        l,
+        m,
+        d,
+        d_prev,
+    );
+
+    if state.dst.len() == old_len {
+        return 0;
+    }
+
+    state.d_prev = match_info.d;
+    state.src_literal = match_info.m_end;
+    (state.dst.len() - old_len) as i32
+}
+
+/// Emit a literal-only block (no match).
+/// Returns bytes written, or 0 if output buffer is full.
+fn emit_literal(dst: &mut Vec<u8>, src: &[u8], src_literal: usize, l_in: i32) -> i32 {
+    let mut l = l_in as usize;
+    let mut p = src_literal;
+    let start_len = dst.len();
+
+    // Phase 1: Emit literals > 15 in chunks of up to 271 (lrg_l opcode)
+    // Format: [0xE0, (x-16), literal bytes...]
+    while l > 15 {
+        let x = if l < 271 { l } else { 271 };
+        dst.push(0xE0);
+        dst.push((x - 16) as u8);
+        let src_slice = &src[p..(p + x).min(src.len())];
+        dst.extend_from_slice(src_slice);
+        p += x;
+        l -= x;
+    }
+
+    // Phase 2: Remaining literals 1-15 as sml_l (0xE0 | L)
+    if l > 0 {
+        dst.push(0xE0 + l as u8);
+        let src_slice = &src[p..(p + l).min(src.len())];
+        dst.extend_from_slice(src_slice);
+    }
+
+    (dst.len() - start_len) as i32
+}
+
+/// Emit a literal + match instruction.
+///
+/// Translates the LZVN `emit` function from `lzvn_encode_base.c`:
+/// handles literal encoding (chunks of 16-271 via lrg_l, then 0-15 via sml_l
+/// combined with the first match opcode), then encodes the match using the
+/// appropriate distance category (sml_d, pre_d, lrg_d, or med_d).
+///
+/// Mining reference: Apple `lzvn_encode_base.c` `emit`.
+fn emit(
+    dst: &mut Vec<u8>,
+    src: &[u8],
+    src_literal: usize,
+    l_in: usize,
+    m_in: usize,
+    d: usize,
+    d_prev: usize,
+) {
+    let mut l = l_in;
+    let mut m = m_in;
+    let mut p = src_literal;
+
+    // Phase 1: Emit literals > 15 in chunks of up to 271 (lrg_l opcode)
+    while l > 15 {
+        let x = if l < 271 { l } else { 271 };
+        dst.push(0xE0);
+        dst.push((x - 16) as u8);
+        let src_slice = &src[p..(p + x).min(src.len())];
+        dst.extend_from_slice(src_slice);
+        p += x;
+        l -= x;
+    }
+
+    // Phase 2: Handle remaining literals (0-15) combined with first match
+    // If l > 3, emit a sml_l opcode first
+    if l > 3 {
+        dst.push(0xE0 + l as u8);
+        let src_slice = &src[p..(p + l).min(src.len())];
+        dst.extend_from_slice(src_slice);
+        p += l;
+        l = 0;
+    }
+
+    // Now l is 0-3: combine with first match
+    // x = min(10 - 2*l, m), then m -= x, x -= 3
+    let mut x = if m <= 10 - 2 * l { m } else { 10 - 2 * l };
+    m -= x;
+    x -= 3;
+
+    // Load 4 bytes starting at the literal position (may read past end;
+    // we only write `l` bytes)
+    let literal = load4_at(src, p);
+
+    // Emit the combined opcode based on distance
+    if d == d_prev {
+        if l == 0 {
+            // sml_m: 1111MMMM where M = x + 3
+            dst.push(0xF0 + (x + 3) as u8);
+        } else {
+            // pre_d: LLxxxy110
+            dst.push((l << 6) as u8 | (x << 3) as u8 | 0x06);
+        }
+        for i in 0..l {
+            dst.push(((literal >> (i * 8)) & 0xFF) as u8);
+        }
+    } else if d < 2048 - 2 * 256 {
+        // Short distance: sml_d format LLxxxDDD DDDDDDDD
+        dst.push((l << 6) as u8 | (x << 3) as u8 | ((d >> 8) & 0x07) as u8);
+        dst.push((d & 0xFF) as u8);
+        for i in 0..l {
+            dst.push(((literal >> (i * 8)) & 0xFF) as u8);
+        }
+    } else if d >= (1 << 14) || m == 0 || (x + 3) + m > 34 {
+        // Long distance or trivial: lrg_d format LLxxx111 DDDDDDDD DDDDDDDD
+        dst.push((l << 6) as u8 | (x << 3) as u8 | 0x07);
+        dst.push((d & 0xFF) as u8);
+        dst.push((d >> 8) as u8);
+        for i in 0..l {
+            dst.push(((literal >> (i * 8)) & 0xFF) as u8);
+        }
+    } else {
+        // Medium distance: med_d format 101LLMMM DDDDDDMM DDDDDDDD
+        let x_total = x + m;
+        m = 0;
+        // First byte: 0xA0 + (x_total >> 2) + (L << 3)
+        dst.push(0xA0 + (x_total >> 2) as u8 + (l << 3) as u8);
+        // Next two bytes (little-endian, matching C store2): (D << 2) | (x_total & 3)
+        let val = (d << 2) | (x_total & 3);
+        dst.push((val & 0xFF) as u8);
+        dst.push((val >> 8) as u8);
+        for i in 0..l {
+            dst.push(((literal >> (i * 8)) & 0xFF) as u8);
+        }
+    }
+
+    // Phase 3: Emit remaining match length (M > 15 or leftover)
+    while m > 15 {
+        let x2 = if m < 271 { m } else { 271 };
+        dst.push(0xF0);
+        dst.push((x2 - 16) as u8);
+        m -= x2;
+    }
+    if m > 0 {
+        // sml_m: 0xF0 + m (where m is 0..15)
+        dst.push(0xF0 + m as u8);
+    }
+}
+
+/// Emit a literal-only block (wrapper for the final flush).
+fn emit_literal_block(dst: &mut Vec<u8>, src: &[u8], src_literal: i32, l_in: i32) -> i32 {
+    emit_literal(dst, src, src_literal as usize, l_in)
+}
+
+/// Emit end-of-stream marker (8 bytes: 0x06 followed by 7 zero bytes).
+fn emit_end_of_stream(dst: &mut Vec<u8>) {
+    dst.push(0x06);
+    dst.extend_from_slice(&[0u8; 7]);
+}
+
+// ============================================================
+// Tests
+// ============================================================
 
 #[cfg(test)]
 mod tests {
@@ -390,93 +916,10 @@ mod tests {
 
     #[test]
     fn literal_then_eos_round_trip() {
-        // sml_l with L=5: opcode 0xe5 (0xe0 | 5), then "Hello", then eos
-        let mut input = Vec::new();
-        input.push(0xe5);
-        input.extend_from_slice(b"Hello");
-        input.push(0x06);
-        input.extend_from_slice(&[0u8; 7]);
-        let result = decode(&input, 5).unwrap();
-        assert_eq!(result, b"Hello");
-    }
-
-    #[test]
-    fn small_literal_then_small_match() {
-        // "HelloHello": literal "Hello" then match 5 bytes at D=5
-        let mut input = Vec::new();
-        // sml_d: L=5 (LL=01), M=5 (MMM=010, +3=5), D bits=000, then D byte=5, then "Hello"
-        // extract(0x50, 6, 2) = (0x50 >> 6) & 3 = 1 (LL=01 -> L=1? No, extract gives bits 6-7)
-        // 0x50 = 0b01010000
-        // bits 6,7 = 0b01 -> L=1, not 5!
-        // For L=5: we need bits 6-7 = 0b01 -> wait, extract gives (opc >> 6) & 3
-        // For L=5, we need extract(opc, 6, 2) = 5, but 5 > 3, impossible!
-        // L is only 2 bits, max value 3. For L > 3, we need lrg_l.
-        // Let's use L=3: bits 6-7 = 0b11 -> opc has 0xC0
-        // M=5: MMM = 010 (extract gives 2, +3 = 5) -> bits 3-5 = 0b010 -> 0x10
-        // D bits = 000 -> bits 0-2 = 0x00
-        // opcode = 0xC0 | 0x10 | 0x00 = 0xD0
-        input.push(0xD0); // sml_d: L=3, M=5, D bits=0
-        input.push(5); // D = 5
-                       // literal is 3 bytes: "Hel"
-        input.extend_from_slice(b"Hel");
-        // Now output = "Hel", d_prev = 5
-        // sml_m: M=5, 0xF5
-        input.push(0xF5); // match 5 bytes from D=5 -> "Hel" + "loHel" ... wait
-                          // After "Hel", D=5, match length 5: copies bytes from dst[-5..]
-                          // But dst has only 3 bytes, so D=5 > 3 -> ERROR!
-                          // This won't work. Let me use L=5 with lrg_l instead.
-        input.clear();
-        // Use lrg_l for L=5: 0xe0, len_byte = 5-16 = negative! That won't work either.
-        // lrg_l needs L >= 16. For L=5, we must use sml_l with L=5, but that's 2 bits.
-        // Actually sml_l is 0xe0 | L, where L is 4 bits (0-15). So L=5 is fine!
-        // I confused myself: sml_l uses 4 bits for L, sml_d uses 2 bits for L.
-        input.push(0xe5); // sml_l: L=5
-        input.extend_from_slice(b"Hello");
-        // Now output = "Hello", need to set D for a match.
-        // pre_d with M=5, L=0: LL=00, MMM=010 (+3=5), bits 0-2 = 110 (for pre_d)
-        // opcode = 0 | (2 << 3) | 6 = 0x16? No, 0x16 is NOP!
-        // pre_d opcodes: 70, 78, 86, 94, 102, 110, 134, 142, 150, 158, 198, 206
-        // These are specific values. The format is LLMMM110 where bits 0-2 = 110.
-        // So opcode with bits 0-2 = 110 is 6, 14, 22, 30, 38, 46, 54, 62, 70, 78, ...
-        // But 30,38,46,54,62 are Undef. 14,22 are Nop.
-        // So pre_d opcodes are: 70, 78, 86, 94, 102, 110, 134, 142, 150, 158, 198, 206
-        // And the L, M fields: extract(opc, 6, 2) for L, extract(opc, 3, 3) for M
-        // For L=0: bits 6-7 = 0b00
-        // For M=2: MMM = 000, extract gives 0, +3 = 3. Need M=5: MMM = 010, extract = 2, +3 = 5
-        // So opcode for L=0, M=5, pre_d: bits 7-6 = 00, bits 5-3 = 010, bits 2-0 = 110
-        // = 0b00010110 = 0x16? But 0x16 = 22 = Nop!
-        // Hmm, 0x16 is in the Nop list. Let me re-examine.
-        // Actually the category table has: 14|22 => Nop, and pre_d for 70,78,...
-        // So 0x16 is Nop, not pre_d. The pattern for pre_d must be different.
-        // Looking at the C code: pre_d opcodes have bits 0-2 = 110 (0x06 in low 3 bits)
-        // 0x06 = eos, 0x0e = nop, 0x16 = nop, 0x1e = udef
-        // Then 0x26=38=udef, 0x2e=46=udef, 0x36=54=udef, 0x3e=62=udef
-        // Then 0x46=70=pre_d, 0x4e=78=pre_d, ...
-        // So the pre_d opcodes are 70,78,86,94,102,110,134,142,150,158,198,206
-        // For L=0, M=5, D=5:
-        // We need an opcode with bits 7-6 = 00 (L=0), bits 5-3 = 010 (M=5-3=2), bits 2-0 = 110 (pre_d)
-        // = 0b00010110 = 0x16, but that's nop!
-        // So for L=0, M=5, the value 0x16 falls into Nop, not PreD.
-        // The issue is the table is sparse: not all values with bits 2-0=110 are pre_d.
-        // pre_d values: 70=0b01000110, 78=0b01001110, 86=0b01010110, ...
-        // These have bits 5-3 != 000.
-        // For L=0, M=3 (MMM=000), the opcode would be 0b00000110 = 0x06 = eos (not pre_d!)
-        // So we can't have L=0, M=3 with pre_d. The closest is 0b00001110 = 0x0e = nop.
-        // Actually for pre_d: 70 = 0b01000110 -> L=1 (bits 6-7=01), M=2 (bits 3-5=001), +3=5
-        // So opcode 0x46 = pre_d with L=1, M=5
-        // That means literally 1, then match 5 bytes from D=5 (set first by sml_d).
-        input.clear();
-        // sml_d: L=1, M=3, D=5 -> opcode = LL(01)MMM(000)DDD(001) = 0b01000001 = 0x41
-        // D = 0 << 8 | 5 = 5, literal = 1 byte "A"
-        // Wait, after match: output = "A", then match 3 bytes from D=5 -> error (D > output)
-        // This is getting complicated. Let me just test the literal case for now.
-        let result = decode(
-            &[
-                0xe5, b'H', b'e', b'l', b'l', b'o', 0x06, 0, 0, 0, 0, 0, 0, 0,
-            ],
-            5,
-        )
-        .unwrap();
+        let data: Vec<u8> = vec![
+            0xe5, b'H', b'e', b'l', b'l', b'o', 0x06, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        let result = decode(&data, 5).unwrap();
         assert_eq!(result, b"Hello");
     }
 
@@ -485,5 +928,75 @@ mod tests {
         assert!(decode(&[0x1e], 0).is_err());
         assert!(decode(&[112], 0).is_err());
         assert!(decode(&[208], 0).is_err());
+    }
+
+    #[test]
+    fn medd_opcodes_in_full_range() {
+        // Verify opcodes 180-191 are classified as MedD, not SmlD
+        for opc in 160u8..=191 {
+            assert_eq!(
+                opc_category(opc),
+                Category::MedD,
+                "opcode 0x{opc:02x} should be MedD"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let inputs: Vec<Vec<u8>> = vec![
+            vec![],
+            b"hello".to_vec(),
+            b"hello world this is a test of compression".to_vec(),
+            vec![b'a'; 100],
+            vec![b'a'; 1000],
+            b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc".to_vec(),
+            (0..1000).map(|i| (i % 256) as u8).collect(),
+            (0..1000).map(|i| (i % 17) as u8).collect(),
+            vec![0xABu8; 1000],
+            vec![0u8; 500],
+            b"The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog.".to_vec(),
+        ];
+
+        for (i, input) in inputs.iter().enumerate() {
+            let encoded = encode(input);
+            let decoded = decode(&encoded, input.len() as u64).unwrap_or_else(|e| {
+                panic!(
+                    "round-trip failed for input {i}: decode error: {e:?}\nencoded: {:02x?}",
+                    encoded
+                )
+            });
+            assert_eq!(decoded, *input, "round-trip mismatch for input {i}");
+        }
+    }
+
+    #[test]
+    fn encode_preserves_data() {
+        let input = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let encoded = encode(input);
+        assert!(
+            encoded.len() < input.len(),
+            "compressed {} should be smaller than input ({})",
+            encoded.len(),
+            input.len()
+        );
+        let decoded = decode(&encoded, input.len() as u64).unwrap();
+        assert_eq!(decoded, input);
+    }
+
+    #[test]
+    fn encode_empty_input() {
+        let encoded = encode(b"");
+        let decoded = decode(&encoded, 0).unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn encode_small_literal_then_match() {
+        // "abc" + repeat -> should find matches at distance 3
+        let input = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabca";
+        let encoded = encode(input);
+        let decoded = decode(&encoded, input.len() as u64).unwrap();
+        assert_eq!(decoded, input);
     }
 }

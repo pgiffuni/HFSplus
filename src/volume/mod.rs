@@ -5935,9 +5935,229 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         result
     }
 
+    /// Truncate a compressed file by decompressing, truncating, and re-compressing.
+    ///
+    /// This is the decompress-truncate-recompress path that `truncate_file_inner`
+    /// delegates to when the target file is decmpfs-compressed. The file's data
+    /// fork is not touched directly; instead the full decompressed content is
+    /// rebuilt at the new length and re-encoded.
+    ///
+    /// For compression types that lack an encoder (BZIP2, LZMA, LZ4), the
+    /// truncated data is stored uncompressed (type 1 in the xattr, or as a plain
+    /// file if too large for inline storage), matching `create_compressed_file`'s
+    /// fallback when compression does not help.
+    fn truncate_compressed_file_inner(
+        &mut self,
+        cnid: u32,
+        decompressed: &[u8],
+        new_len: u64,
+    ) -> Result<()> {
+        let new_len = new_len as usize;
+
+        // A request that keeps the same length changes nothing — refuse, matching
+        // the no-op guard in `truncate_file_inner` for uncompressed files.
+        if new_len == decompressed.len() {
+            return Err(Error::invalid(
+                "truncate",
+                format!(
+                    "{new_len} bytes does not shorten the file's current {} bytes; that is not a truncation",
+                    decompressed.len()
+                ),
+            ));
+        }
+
+        // Truncate or zero-extend the decompressed data.
+        let mut new_data = decompressed.to_vec();
+        if new_data.len() < new_len {
+            new_data.resize(new_len, 0);
+        } else {
+            new_data.truncate(new_len);
+        }
+
+        // Reuse the create path: it handles compression-type selection,
+        // fallback-to-uncompressed, and all metadata updates. We replace the
+        // file's existing compressed payload in place.
+        // Step 1: decompress the existing file to get the compression type.
+        let record = self.read_file_record(cnid)?;
+        let obj = Object::from_record(
+            Vec::new(),
+            crate::catalog::record::CatalogRecord::File(Box::new(record)),
+            self.header.has_expanded_times(),
+        )
+        .expect("a file record becomes an object");
+
+        let compression_type = {
+            let ro = Volume::open(&*self.device)?;
+            let attr_value = ro
+                .getxattr(&obj, crate::attributes::names::DECOMPRESSION_NAME)?
+                .ok_or_else(|| Error::invalid("compressed file", "decmpfs attribute is missing"))?;
+            let header = crate::compression::DecmpfsHeader::from_bytes(&attr_value)?;
+            header.compression_type
+        };
+
+        // Step 2: compress the new data, trying the original type first.
+        let compressed = match crate::compression::compress(&new_data, compression_type) {
+            Ok(c) => c,
+            Err(_) => {
+                // Encoder unavailable for this type: fall back to uncompressed.
+                let inline_limit = self.attributes_inline_limit()?;
+                if crate::compression::DecmpfsHeader::SIZE + new_data.len() <= inline_limit {
+                    return self.rewrite_compressed_file(
+                        cnid,
+                        &new_data,
+                        crate::compression::CompressionType::Uncompressed,
+                        &new_data,
+                    );
+                }
+                // Too large for inline: write as a plain uncompressed file.
+                self.convert_compressed_to_plain_inner(cnid)?;
+                self.write_file_contents_inner(cnid, &new_data)?;
+                return Ok(());
+            }
+        };
+
+        // Step 3: check if the re-compressed payload is smaller than raw.
+        if compressed.len() >= new_data.len() {
+            let inline_limit = self.attributes_inline_limit()?;
+            if crate::compression::DecmpfsHeader::SIZE + new_data.len() <= inline_limit {
+                return self.rewrite_compressed_file(
+                    cnid,
+                    &new_data,
+                    crate::compression::CompressionType::Uncompressed,
+                    &new_data,
+                );
+            }
+            self.convert_compressed_to_plain_inner(cnid)?;
+            self.write_file_contents_inner(cnid, &new_data)?;
+            return Ok(());
+        }
+
+        // Step 4: write the compressed payload back.
+        self.rewrite_compressed_file(cnid, &new_data, compression_type, &compressed)
+    }
+
+    /// Convert a compressed file to a plain uncompressed file by releasing
+    /// resource fork blocks, removing the decmpfs xattr, and clearing the
+    /// `UF_COMPRESSED` flag. Must be called before `write_file_contents_inner`
+    /// so the write is not refused as a compressed-file write.
+    fn convert_compressed_to_plain_inner(&mut self, cnid: u32) -> Result<()> {
+        let mut record = self.read_file_record(cnid)?;
+
+        // Release any resource fork blocks from a fork-backed compression type.
+        self.release_resource_fork_blocks(&mut record, cnid)?;
+        record.resource_fork.logical_size = 0;
+
+        // Remove the decmpfs attribute so the file is no longer marked compressed.
+        self.removexattr_inner(cnid, crate::attributes::names::DECOMPRESSION_NAME)?;
+
+        // Clear UF_COMPRESSED and update timestamps.
+        record.bsd_info.admin_flags &= !UF_COMPRESSED;
+        self.touch_record(&mut record)?;
+        self.replace_catalog_record(cnid, &record)?;
+
+        Ok(())
+    }
+
+    /// Write a compressed payload back to an existing file, replacing any prior
+    /// compressed data. Updates the decmpfs xattr header, the resource fork
+    /// (for fork-backed types), and the `UF_COMPRESSED` flag.
+    fn rewrite_compressed_file(
+        &mut self,
+        cnid: u32,
+        decompressed: &[u8],
+        compression_type: crate::compression::CompressionType,
+        compressed: &[u8],
+    ) -> Result<()> {
+        // Release old resource fork blocks — needed when converting from a
+        // fork-backed type to type 1 (inline), or when re-writing a fork-backed
+        // file (write_resource_fork_inner handles its own release).
+        if matches!(
+            compression_type,
+            crate::compression::CompressionType::Uncompressed
+        ) {
+            let mut record = self.read_file_record(cnid)?;
+            self.release_resource_fork_blocks(&mut record, cnid)?;
+            record.resource_fork.logical_size = 0;
+            self.touch_record(&mut record)?;
+            self.replace_catalog_record(cnid, &record)?;
+        }
+
+        match compression_type {
+            crate::compression::CompressionType::Uncompressed => {
+                // Type 1: data inline in the xattr.
+                let header = crate::compression::DecmpfsHeader {
+                    attr_size: (crate::compression::DecmpfsHeader::SIZE + decompressed.len())
+                        as u32,
+                    compression_magic: crate::compression::CMP_MAGIC,
+                    compression_type,
+                    uncompressed_size: decompressed.len() as u64,
+                };
+                let mut attr_value = header.to_bytes().to_vec();
+                attr_value.extend_from_slice(decompressed);
+                self.setxattr_inner(
+                    cnid,
+                    crate::attributes::names::DECOMPRESSION_NAME,
+                    &attr_value,
+                )?;
+            }
+            crate::compression::CompressionType::Zlib
+            | crate::compression::CompressionType::Lzvn
+            | crate::compression::CompressionType::Lzfse => {
+                // Fork-backed types 2–4: header-only xattr, compressed data in
+                // the resource fork.
+                self.store_compressed_fork_backed(
+                    cnid,
+                    decompressed.len() as u64,
+                    compressed,
+                    compression_type,
+                )?;
+            }
+            crate::compression::CompressionType::Bzip2
+            | crate::compression::CompressionType::Lzma
+            | crate::compression::CompressionType::Lz4 => {
+                return Err(Error::unsupported(format!(
+                    "compression type {compression_type:?} has no encoder for re-compression"
+                )));
+            }
+            crate::compression::CompressionType::Dataless
+            | crate::compression::CompressionType::DatalessPkg
+            | crate::compression::CompressionType::Unknown(_) => {
+                return Err(Error::invalid(
+                    "compression type",
+                    format!("invalid compression type {compression_type:?} for truncate"),
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     fn truncate_file_inner(&mut self, cnid: u32, new_len: u64) -> Result<()> {
         let block_size = self.header.block_size;
         let mut record = self.read_file_record(cnid)?;
+
+        // A compressed file's data fork holds compressed bytes, not raw content.
+        // Truncating those bytes directly would corrupt the file's mapping without
+        // updating the decmpfs metadata. Instead, decompress the file, truncate
+        // the decompressed data, re-compress, and rewrite.
+        // Mining reference: `core/hfs_vfsops.c` `hfs_vnop_write` checks
+        // `ap->a_is_compressed`; `hfs_truncate` does not handle compressed files,
+        // so the decompress-truncate-recompress round trip is done here.
+        if record.has_attributes() {
+            let obj = Object::from_record(
+                Vec::new(),
+                crate::catalog::record::CatalogRecord::File(Box::new(record)),
+                self.header.has_expanded_times(),
+            )
+            .expect("a file record becomes an object");
+            let decompressed = {
+                let ro = Volume::open(&*self.device)?;
+                ro.try_decompress(&obj)?
+            };
+            if let Some(decompressed) = decompressed {
+                return self.truncate_compressed_file_inner(cnid, &decompressed, new_len);
+            }
+        }
 
         // Growing the file: allocate new blocks and zero the extension.
         // POSIX ftruncate allows growing; the extended region is zero-filled.
@@ -6391,7 +6611,12 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         // otherwise. Apple's decmpfs writer follows the same logic: a compressed
         // stream that is not smaller than the original is rejected and the data
         // is stored uncompressed.
-        if matches!(compression_type, crate::compression::CompressionType::Zlib) {
+        if matches!(
+            compression_type,
+            crate::compression::CompressionType::Zlib
+                | crate::compression::CompressionType::Lzvn
+                | crate::compression::CompressionType::Lzfse
+        ) {
             let compressed = crate::compression::compress(data, compression_type)?;
             if compressed.len() >= data.len() {
                 // Compression did not help: fall back to uncompressed inline
@@ -6409,7 +6634,12 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
                 self.write_file_contents_inner(cnid, data)?;
                 return Ok(cnid);
             }
-            return self.store_compressed_fork_backed(cnid, data.len() as u64, &compressed);
+            return self.store_compressed_fork_backed(
+                cnid,
+                data.len() as u64,
+                &compressed,
+                compression_type,
+            );
         }
 
         match compression_type {
@@ -6453,11 +6683,12 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         cnid: u32,
         uncompressed_size: u64,
         compressed: &[u8],
+        compression_type: crate::compression::CompressionType,
     ) -> Result<u32> {
         let header = crate::compression::DecmpfsHeader {
             attr_size: crate::compression::DecmpfsHeader::SIZE as u32,
             compression_magic: crate::compression::CMP_MAGIC,
-            compression_type: crate::compression::CompressionType::Zlib,
+            compression_type,
             uncompressed_size,
         };
         let attr_value = header.to_bytes();
@@ -7590,6 +7821,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
             self.journal_write(at, &bytes[i..i + span])?;
             i += span;
         }
+        self.header.free_blocks = free_blocks;
         self.write_header_u32(48, free_blocks)
     }
 

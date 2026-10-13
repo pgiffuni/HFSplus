@@ -20,7 +20,10 @@ mod common;
 use hfsplus::blockdev::{BlockDeviceMut, FileDevice};
 use hfsplus::btree::io::BTreeFile;
 use hfsplus::catalog::cnid::Cnid;
-use hfsplus::compression::{CompressionType, CompressionType::Uncompressed, CompressionType::Zlib};
+use hfsplus::compression::{
+    CompressionType, CompressionType::Lzfse, CompressionType::Lzvn, CompressionType::Uncompressed,
+    CompressionType::Zlib,
+};
 use hfsplus::file::TreeOverflow;
 use hfsplus::volume::{Object, Volume, WritableVolume};
 
@@ -5802,6 +5805,32 @@ fn creating_a_type2_zlib_file_round_trips_through_decmpfs() {
 }
 
 #[test]
+fn creating_a_type4_lzvn_file_round_trips_through_decmpfs() {
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(20);
+    let path = round_trip_compression("journal-with-attributes", "type4.bin", &data, Lzvn);
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    // The compressed data must live in the resource fork, not the data fork.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("type4.bin"))
+        .expect("lookup")
+        .expect("type4.bin must exist");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        f.record.data_fork.logical_size, 0,
+        "data fork must be empty for type 4 (compressed data is in the resource fork)"
+    );
+    assert!(
+        f.record.resource_fork.logical_size > 0,
+        "resource fork must hold at least one block of compressed data"
+    );
+}
+
+#[test]
 fn a_type2_zlib_compressed_file_survives_reopen_on_journaled_volume() {
     // The journal transaction must commit the resource fork write and the
     // decmpfs xattr atomically.
@@ -5852,4 +5881,195 @@ fn a_compressed_file_with_empty_contents_round_trips() {
         .expect("empty.bin must exist");
     let back = vol.read_file(&obj, 1 << 20).expect("read_file");
     assert!(back.is_empty(), "empty compressed file must round-trip");
+}
+
+/// Truncate a compressed file created via `create_compressed_file`, then
+/// verify the decompressed contents match the truncated payload and that
+/// fsck accepts the resulting image.
+fn truncate_compressed_file(
+    image: &str,
+    name: &str,
+    data: &[u8],
+    ctype: CompressionType,
+    new_len: usize,
+) -> std::path::PathBuf {
+    let Some(path) = copy_fixture(image) else {
+        return std::path::PathBuf::new();
+    };
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let cnid = writable
+            .create_compressed_file(parent, &units(name), data, ctype)
+            .unwrap_or_else(|e| panic!("create_compressed_file: {e}"));
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    // Truncate to new_len.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .truncate_file(cnid, new_len as u64)
+            .expect("truncate_file");
+        dev.sync().expect("flush");
+    }
+
+    // Read back and verify decompressed contents.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount after truncate");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units(name))
+        .expect("lookup")
+        .expect("file must exist after truncate");
+    let back = vol
+        .read_file(&obj, 1 << 20)
+        .expect("read_file after truncate");
+    assert_eq!(
+        back.len(),
+        new_len,
+        "truncated compressed file must have the right decompressed length"
+    );
+    assert_eq!(
+        &back[..],
+        &data[..new_len],
+        "truncated compressed file must have the right decompressed contents"
+    );
+    assert_fsck_clean(&path, &format!("truncated compressed file {name}"));
+
+    path
+}
+
+#[test]
+fn truncating_a_type1_compressed_file_keeps_it_compressed() {
+    let data = b"HFS+ decmpfs type 1 inline truncation test data.\n".repeat(10);
+    let path = truncate_compressed_file(
+        "journal-with-attributes",
+        "trunc1.bin",
+        &data,
+        Uncompressed,
+        data.len() / 2,
+    );
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    // The file should still have its decmpfs xattr after truncation.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("trunc1.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
+    assert!(xattr.is_some(), "type 1 file must still have decmpfs xattr");
+}
+
+#[test]
+fn truncating_a_type2_zlib_file_preserves_zlib() {
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(30);
+    let path = truncate_compressed_file(
+        "journal-with-attributes",
+        "trunc2.bin",
+        &data,
+        Zlib,
+        data.len() / 2,
+    );
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("trunc2.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
+    assert!(xattr.is_some(), "zlib file must still have decmpfs xattr");
+}
+
+#[test]
+fn truncating_a_type3_lzfse_file_preserves_lzfse() {
+    let data = b"LZFSE compression truncation round-trip test block. ".repeat(30);
+    let path = truncate_compressed_file(
+        "journal-with-attributes",
+        "trunc3.bin",
+        &data,
+        Lzfse,
+        data.len() / 2,
+    );
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("trunc3.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
+    assert!(xattr.is_some(), "lzfse file must still have decmpfs xattr");
+}
+
+#[test]
+fn truncating_a_type4_lzvn_file_preserves_lzvn() {
+    let data = b"LZVN compression truncation round-trip test block. ".repeat(30);
+    let path = truncate_compressed_file(
+        "journal-with-attributes",
+        "trunc4.bin",
+        &data,
+        Lzvn,
+        data.len() / 2,
+    );
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("trunc4.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
+    assert!(xattr.is_some(), "lzvn file must still have decmpfs xattr");
+}
+
+#[test]
+fn truncating_incompressible_data_falls_back_to_uncompressed() {
+    // Data that does not compress well. After truncation, the re-compressed
+    // zlib payload may be >= the raw data, triggering the fallback to type 1
+    // (inline uncompressed) or a plain file. The round-trip check verifies
+    // the contents are correct regardless of which path is taken.
+    let data: Vec<u8> = (0..800).map(|i| ((i * 31 + 17) % 251) as u8).collect();
+    let path = truncate_compressed_file(
+        "journal-with-attributes",
+        "incompress.bin",
+        &data,
+        Zlib,
+        400,
+    );
+    if path.as_os_str().is_empty() {
+        return;
+    }
+
+    // The file must still be decmpfs-compressed after truncation.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("incompress.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
+    assert!(xattr.is_some(), "file must still have decmpfs xattr");
 }

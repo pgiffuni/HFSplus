@@ -46,7 +46,7 @@
 //! | 1    | uncompressed (inline)                  | handled |
 //! | 2    | ZLIB (RFC 1950/1951)                  | implemented |
 //! | 7    | LZ4 frame                             | implemented |
-//! | 3    | LZFSE (Apple's Lempel–Ziv–FS entropy) | implemented (V1, V2, LZVN) |
+//! | 3    | LZFSE (Apple's Lempel–Ziv–FS entropy) | implemented (encoder + decoder) |
 //! | 4    | LZVN                                | implemented |
 //! | 6    | LZMA                                | unsupported |
 //! | 5    | BZIP2                               | unsupported |
@@ -329,7 +329,9 @@ pub fn decompress(
 ///   stored inline in the `com.apple.decmpfs` attribute after the 16-byte header.
 /// - **Type 2** (`Zlib`): produces an RFC 1950 zlib stream via `zlib-rs`,
 ///   matching Apple's use of the standard C `zlib` library.
-/// - Types 3–7 and the data-less markers are not yet supported for writing.
+/// - **Type 3** (`Lzfse`): produces an LZFSE frame (V2 or LZVN block + EOS).
+/// - **Type 4** (`Lzvn`): produces a raw LZVN bitstream.
+/// - Types 5–7 and the data-less markers are not yet supported for writing.
 pub fn compress(data: &[u8], compression_type: CompressionType) -> Result<Vec<u8>> {
     match compression_type {
         CompressionType::Uncompressed => Ok(data.to_vec()),
@@ -358,13 +360,13 @@ pub fn compress(data: &[u8], compression_type: CompressionType) -> Result<Vec<u8
 
             Ok(output[before..after].to_vec())
         }
-        CompressionType::Lzfse
-        | CompressionType::Lzvn
-        | CompressionType::Bzip2
-        | CompressionType::Lzma
-        | CompressionType::Lz4 => Err(Error::unsupported(format!(
-            "compression type {compression_type:?} is not yet implemented for writing"
-        ))),
+        CompressionType::Lzvn => Ok(lzvn::encode(data)),
+        CompressionType::Lzfse => Ok(lzfse::encode(data)),
+        CompressionType::Bzip2 | CompressionType::Lzma | CompressionType::Lz4 => {
+            Err(Error::unsupported(format!(
+                "compression type {compression_type:?} is not yet implemented for writing"
+            )))
+        }
         CompressionType::Dataless | CompressionType::DatalessPkg => Err(Error::invalid(
             "compression type",
             "data-less markers cannot carry payload",
