@@ -208,7 +208,7 @@ fn file_attr_conversion_for_regular_file() {
             if let hfsplus::volume::Object::File(file) = entry {
                 if !entry.is_symlink() {
                     let expanded = vol.header().has_expanded_times();
-                    let attr = hfsplus_fuse::file_attrs_to_file_attr(file, expanded);
+                    let attr = hfsplus_fuse::file_attrs_to_file_attr(file, &vol, expanded);
                     assert_eq!(attr.ino.0, entry.cnid().0 as u64);
                     assert_eq!(attr.kind, fuser::FileType::RegularFile);
                     break;
@@ -459,6 +459,8 @@ fn writable_modify_file_metadata() {
                 atime: None,
                 mtime: None,
                 ctime: None,
+                birthtime: None,
+                finder_info: None,
             },
         )
     })
@@ -481,11 +483,9 @@ fn writable_modify_file_metadata() {
             cnid,
             hfsplus::volume::FileMetadataChanges {
                 mode: Some(original_mode),
-                uid: None,
-                gid: None,
-                atime: None,
-                mtime: None,
-                ctime: None,
+                birthtime: None,
+                finder_info: None,
+                ..Default::default()
             },
         )
     })

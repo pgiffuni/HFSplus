@@ -105,6 +105,31 @@ pub fn is_compressed(
         .any(|a| a.name == DECOMPRESSION_NAME))
 }
 
+/// Whether the file carries content protection metadata, meaning its data
+/// fork and resource fork are stored encrypted on disk.
+///
+/// Returns `true` when the `com.apple.system.cprotect` extended attribute is
+/// present, regardless of protection class.
+///
+/// The volume-level `kHFSContentProtectionMask` (bit 30 in the volume header
+/// `attributes` field) only signals that the volume *might* contain
+/// content-protected files; it does not mark any individual file. This
+/// function checks the per-file attribute.
+///
+/// Mining reference: `core/hfs_cprotect.h`
+/// (`CONTENT_PROTECTION_XATTR_NAME`), `core/hfs_cnode.c` `cp_entry_init`,
+/// and `core/hfs_readwrite.c` `hfs_vnop_read` which consults `cp_handle_vnop`
+/// (driven by the parsed cprotect entry) before allowing a read.
+pub fn is_content_protected(
+    tree: &crate::attributes::AttributesFile<'_, impl crate::blockdev::BlockDevice + ?Sized>,
+    cnid: u32,
+) -> crate::error::Result<bool> {
+    Ok(tree
+        .attributes_for(cnid)?
+        .iter()
+        .any(|a| a.name == CONTENT_PROTECTION_NAME))
+}
+
 /// Whether `name` is one HFS+ writes for itself.
 pub fn is_system_attribute(name: &str) -> bool {
     SYSTEM_ATTRIBUTE_NAMES.contains(&name)
@@ -152,5 +177,11 @@ mod tests {
             !FIRST_LINK_NAME.eq_ignore_ascii_case(RESOURCE_FORK_NAME),
             "distinct names, distinct concepts"
         );
+    }
+
+    #[test]
+    fn content_protection_name_is_recognised() {
+        assert_eq!(CONTENT_PROTECTION_NAME, "com.apple.system.cprotect");
+        assert!(is_system_attribute(CONTENT_PROTECTION_NAME));
     }
 }

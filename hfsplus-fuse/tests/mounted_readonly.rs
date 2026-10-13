@@ -73,6 +73,7 @@ where
     let mut _child = Command::new(&fuse_bin)
         .arg(&img)
         .arg(&mp)
+        .arg("-r")
         .spawn()
         .expect("spawn fuse mount");
 

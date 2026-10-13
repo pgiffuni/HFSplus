@@ -311,9 +311,9 @@ open-sourced), but their numeric assignments are established by macOS practice:
 | 2 | ZLIB (RFC 1950/1951) | `zlib-rs` (type 2) | `zlib-rs` streaming `Deflate`/`Inflate` |
 | 3 | LZFSE | `src/compression/lzfse.rs` (V1, V2, LZVN-in-LZFSE) | `encode()` translates Apple `lzfse/lzfse` BSD-3-Clause `lzfse_encode_base.c`; 4-stream FSE encoder with backwards literal ordering, 8-byte LMD payload padding, and "same-as-previous" distance encoding |
 | 4 | LZVN | `src/compression/lzvn.rs` | `encode()` translates Apple `lzvn_encode_base.c` (BSD-3-Clause) |
-| 5 | BZIP2 | unsupported | not yet implemented |
-| 6 | LZMA | unsupported | not yet implemented |
-| 7 | LZ4 frame | `src/compression/lz4.rs` | not yet implemented |
+| 5 | BZIP2 | unsupported | not yet implemented (Apple never used in decmpfs) |
+| 6 | LZMA | unsupported | not yet implemented (Apple never used in decmpfs) |
+| 7 | LZ4 frame | `src/compression/lz4.rs` | not needed (Apple never used in decmpfs; fallback to uncompressed on write)
 | 0x80000001 | DATALESS_CMPFS_TYPE | rejected | N/A |
 | 0x80000002 | DATALESS_PKG_CMPFS_TYPE | rejected | N/A |
 

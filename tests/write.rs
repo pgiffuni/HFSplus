@@ -6279,3 +6279,398 @@ fn writing_a_type3_compressed_file_recompresses_with_lzfse() {
     assert_eq!(back, new_data);
     assert_fsck_clean(&path, "recompressed LZFSE file");
 }
+
+#[test]
+fn a_journaled_write_to_a_lzfse_compressed_file_is_durable_after_reopen() {
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"LZFSE journaled write durability test block. ".repeat(30);
+    let new_data = b"LZFSE journal re-encoded content. ".repeat(20);
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_compressed_file(parent, &units("jrw_lzfse.bin"), &data, Lzfse)
+            .expect("create_compressed_file on journaled volume");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_file_contents(cnid, &new_data)
+            .expect("write to LZFSE compressed file should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after journaled LZFSE write");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file after write");
+    assert_eq!(back, new_data, "re-encoded LZFSE data must survive reopen");
+    assert!(
+        vol.getxattr(&obj, "com.apple.decmpfs")
+            .expect("getxattr")
+            .is_some(),
+        "file must still be compressed after re-encode"
+    );
+    assert_fsck_clean(&path, "journaled LZFSE compressed write");
+}
+
+#[test]
+fn a_journaled_truncate_of_an_lzfse_compressed_file_is_durable() {
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(30);
+    let new_len = data.len() / 2;
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_compressed_file(parent, &units("journaled_trunc_lzfse.bin"), &data, Lzfse)
+            .expect("create_compressed_file on journaled volume");
+        writable
+            .truncate_file(cnid, new_len as u64)
+            .expect("truncate should succeed");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open for reading after truncate");
+    let vol = Volume::open(&dev).expect("mount after truncate");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after truncate");
+    let back = vol
+        .read_file(&obj, 1 << 20)
+        .expect("read_file after truncate");
+    assert_eq!(
+        back.len(),
+        new_len,
+        "journaled LZFSE truncate must produce the right decompressed length"
+    );
+    assert_eq!(&back[..], &data[..new_len]);
+    assert_fsck_clean(&path, "journaled LZFSE compressed truncate after reopen");
+}
+
+#[test]
+fn a_journaled_truncate_of_an_lzvn_compressed_file_is_durable() {
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(30);
+    let new_len = data.len() / 2;
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_compressed_file(parent, &units("journaled_trunc_lzvn.bin"), &data, Lzvn)
+            .expect("create_compressed_file on journaled volume");
+        writable
+            .truncate_file(cnid, new_len as u64)
+            .expect("truncate should succeed");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    let dev = FileDevice::open(&path).expect("open for reading after truncate");
+    let vol = Volume::open(&dev).expect("mount after truncate");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after truncate");
+    let back = vol
+        .read_file(&obj, 1 << 20)
+        .expect("read_file after truncate");
+    assert_eq!(
+        back.len(),
+        new_len,
+        "journaled LZVN truncate must produce the right decompressed length"
+    );
+    assert_eq!(&back[..], &data[..new_len]);
+    assert_fsck_clean(&path, "journaled LZVN compressed truncate after reopen");
+}
+
+#[test]
+fn writing_uncompressible_data_to_a_compressed_file_falls_back_to_uncompressed() {
+    // When new data does not compress smaller than raw (e.g. high-entropy
+    // random data), the re-encode path must fall back to type 1 (inline
+    // uncompressed) if the data fits, or to a plain uncompressed file
+    // otherwise. This exercises the same fallback branch that an unsupported
+    // compression type would hit, but through a path the library can actually
+    // produce.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(30);
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_compressed_file(parent, &units("rc_w.bin"), &data, Zlib)
+            .expect("create_compressed_file on journaled volume");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    // High-entropy data that won't compress smaller than raw. Uses a 64-bit
+    // LCG with a period of 2^64, so within 1000 bytes there are no repeating
+    // patterns for zlib to exploit.
+    let mut state = 0x123456789abcdef0u64;
+    let mut new_data = Vec::with_capacity(1000);
+    for _ in 0..1000 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        new_data.push((state >> 32) as u8);
+    }
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .write_file_contents(cnid, &new_data)
+            .expect("write to compressed file should fall back to uncompressed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after write");
+    let vol = Volume::open(&dev).expect("mount after write");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after write");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file after write");
+    assert_eq!(back, new_data, "fallback write must produce the new data");
+    // The file must still be compressed (type 1, inline uncompressed) because
+    // the data fits the inline attribute limit.
+    let xattr = vol
+        .getxattr(&obj, "com.apple.decmpfs")
+        .expect("getxattr")
+        .expect("file must still have decmpfs xattr after inline fallback");
+    let header =
+        hfsplus::compression::DecmpfsHeader::from_bytes(&xattr).expect("parse decmpfs header");
+    assert_eq!(
+        header.compression_type,
+        hfsplus::compression::CompressionType::Uncompressed,
+        "must fall back to type 1 (inline uncompressed)"
+    );
+    assert_eq!(
+        &xattr[hfsplus::compression::DecmpfsHeader::SIZE..],
+        &new_data[..]
+    );
+    assert_fsck_clean(&path, "uncompressible data fallback to inline uncompressed");
+}
+
+#[test]
+fn a_journaled_birthtime_change_survives_reopen() {
+    // modify_file_metadata can change the create_date (birthtime) field on both
+    // file and folder records. On a journaled volume the change must survive a
+    // reopen and pass fsck.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let (cnid, _create_before) = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists");
+        let f = obj.as_file().expect("a file");
+        (f.cnid.0, f.record.create_date)
+    };
+
+    let new_birthtime = 1_000_000u64;
+    let expected = hfsplus::timestamp::to_hfs_time(new_birthtime as i64, false);
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .modify_file_metadata(
+                cnid,
+                hfsplus::volume::FileMetadataChanges {
+                    birthtime: Some(new_birthtime as i64),
+                    ..Default::default()
+                },
+            )
+            .expect("modify birthtime should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after metadata change");
+    let vol = Volume::open(&dev).expect("mount after metadata change");
+    let obj = vol
+        .lookup_cnid(Cnid(cnid))
+        .expect("lookup")
+        .expect("file must exist after reopen");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        f.record.create_date, expected,
+        "birthtime must survive reopen"
+    );
+    assert_fsck_clean(&path, "journaled birthtime change after reopen");
+}
+
+#[test]
+fn a_journaled_finder_info_change_survives_reopen() {
+    // modify_file_metadata can update the 16-byte finderInfo field on a file
+    // record. On a journaled volume the change must survive a reopen.
+    let Some(path) = copy_fixture("journal-with-files") else {
+        return;
+    };
+
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists");
+        obj.as_file().expect("a file").cnid.0
+    };
+
+    let new_finder: [u8; 16] = [
+        0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+        0x07,
+    ];
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        writable
+            .modify_file_metadata(
+                cnid,
+                hfsplus::volume::FileMetadataChanges {
+                    finder_info: Some(new_finder),
+                    ..Default::default()
+                },
+            )
+            .expect("modify finder_info should succeed");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading after finder_info change");
+    let vol = Volume::open(&dev).expect("mount after change");
+    let obj = vol
+        .lookup_cnid(Cnid(cnid))
+        .expect("lookup")
+        .expect("file must exist after reopen");
+    let f = obj.as_file().expect("a file");
+    assert_eq!(
+        f.record.finder_info, new_finder,
+        "finder_info must survive reopen"
+    );
+    assert_fsck_clean(&path, "journaled finder_info change after reopen");
+}
+
+#[test]
+fn reading_a_content_protected_file_returns_unsupported() {
+    // Files carrying com.apple.system.cprotect have encrypted data forks.
+    // The crate does not implement per-file decryption (see docs/encryption.md,
+    // section 3), so reads must return an explicit error rather than raw
+    // ciphertext.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let cnid = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        let obj = vol
+            .lookup(vol.root_cnid(), &units("fragmented.bin"))
+            .expect("lookup")
+            .expect("fragmented.bin exists");
+        obj.as_file().expect("a file").cnid.0
+    };
+
+    // Plant a com.apple.system.cprotect attribute on the file.
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("journaled volume should accept writes");
+        let dummy_cprotect: [u8; 44] = [
+            0x01, 0x00, 0x00, 0x00, // version
+            0x00, 0x00, 0x00, 0x00, // flags
+            0x00, 0x00, 0x00, 0x00, // protection_class
+            0x00, 0x00, 0x00, 0x00, // keyclass
+            0x00, 0x00, 0x00, 0x00, // unk1
+            0x00, 0x00, 0x00, 0x00, // unk2
+            0x00, 0x00, 0x00, 0x00, // salt
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        writable
+            .setxattr(cnid, "com.apple.system.cprotect", &dummy_cprotect)
+            .expect("setxattr cprotect should succeed");
+        dev.sync().expect("flush");
+    }
+
+    // Reading the file through the library must return unsupported.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup")
+        .expect("file must still exist");
+    let result = vol.read_file(&obj, 1 << 20);
+    assert!(
+        result.is_err(),
+        "reading a content-protected file must not return ciphertext"
+    );
+    let err_str = format!("{}", result.unwrap_err());
+    assert!(
+        err_str.contains("content protection"),
+        "error must mention content protection, got: {err_str}"
+    );
+}

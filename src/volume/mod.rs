@@ -429,6 +429,19 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     where
         D: Sync,
     {
+        // Content-protected files store their data fork encrypted on disk.
+        // Reading the data fork would return ciphertext, not the file's
+        // contents. Refuse explicitly rather than silently returning
+        // encrypted bytes. See docs/encryption.md (section 3).
+        let cnid = file.cnid();
+        if let Some(attrs) = self.attributes()? {
+            if crate::attributes::names::is_content_protected(attrs, cnid.0)? {
+                return Err(Error::unsupported(
+                    "content protection: per-file encryption is not implemented; the data fork is encrypted",
+                ));
+            }
+        }
+
         // The decmpfs attribute is present iff the file is compressed.
         // `getxattr` filters it from listxattr but we can read it directly.
         let Some(attr_value) = self.getxattr(file, crate::attributes::names::DECOMPRESSION_NAME)?
@@ -818,6 +831,14 @@ pub struct FileMetadataChanges {
     pub mtime: Option<i64>,
     /// Attribute modification time in Unix seconds.
     pub ctime: Option<i64>,
+    /// Creation time (birthtime) in Unix seconds, written to
+    /// `HFSPlusCatalogFile.create_date` / `HFSPlusCatalogFolder.create_date`.
+    pub birthtime: Option<i64>,
+    /// 16 bytes of Finder opaque info, written to the `finderInfo` field of
+    /// the catalog record. Only the first 4 bytes (`date_added`) have a
+    /// standard interpretation when `kHFS_HAS_DATE_ADDED_MASK` is set;
+    /// the rest are application-defined.
+    pub finder_info: Option<[u8; 16]>,
 }
 
 /// A volume opened for mutation.
@@ -6376,6 +6397,12 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         if let Some(t) = changes.ctime {
             record.attribute_mod_date = timestamp::to_hfs_time(t, expanded);
         }
+        if let Some(t) = changes.birthtime {
+            record.create_date = timestamp::to_hfs_time(t, expanded);
+        }
+        if let Some(fi) = changes.finder_info {
+            record.finder_info = fi;
+        }
 
         self.replace_catalog_record(cnid, &record)
     }
@@ -8511,6 +8538,33 @@ impl Object {
         match self {
             Object::Directory(_) => 0,
             Object::File(f) => f.data_size,
+        }
+    }
+
+    /// The effective file size as seen by POSIX: for uncompressed files this is
+    /// the data fork's logical size; for decmpfs-compressed files it is the
+    /// `uncompressed_size` field from the `com.apple.decmpfs` attribute header,
+    /// which is the size users and tools expect to see.
+    ///
+    /// Returns `data_size()` when the file is not compressed or when the
+    /// volume cannot look up the xattr (e.g. the attribute is sparse).
+    pub fn posix_size<D: crate::blockdev::BlockDevice + ?Sized>(&self, vol: &Volume<'_, D>) -> u64 {
+        match self {
+            Object::File(f) => {
+                if f.has_attributes {
+                    if let Ok(Some(attr_value)) =
+                        vol.getxattr(self, crate::attributes::names::DECOMPRESSION_NAME)
+                    {
+                        if let Ok(header) =
+                            crate::compression::DecmpfsHeader::from_bytes(&attr_value)
+                        {
+                            return header.uncompressed_size;
+                        }
+                    }
+                }
+                f.data_size
+            }
+            Object::Directory(_) => 0,
         }
     }
 

@@ -11,7 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use hfsplus::catalog::record::{S_IFDIR, S_IFLNK, S_IFREG};
 use hfsplus::catalog::Cnid;
 use hfsplus::timestamp::to_bsd_time;
-use hfsplus::volume::{DirAttrs, FileAttrs, Times};
+use hfsplus::volume::{DirAttrs, FileAttrs, Object, Times};
 
 /// Convert an HFS+ timestamp to a `SystemTime`.
 ///
@@ -86,10 +86,20 @@ pub fn dir_attrs_to_file_attr(dir: &DirAttrs, expanded: bool) -> fuser::FileAttr
 }
 
 /// Build a `fuser::FileAttr` from a file's attributes.
-pub fn file_attrs_to_file_attr(file: &FileAttrs, expanded: bool) -> fuser::FileAttr {
+///
+/// `vol` is used to look up the `com.apple.decmpfs` attribute and report the
+/// decompressed size for compressed files.
+pub fn file_attrs_to_file_attr<D: hfsplus::blockdev::BlockDevice + ?Sized>(
+    file: &FileAttrs,
+    vol: &hfsplus::volume::Volume<'_, D>,
+    expanded: bool,
+) -> fuser::FileAttr {
     let mode = file_mode(file);
     let nlink = file.link_count;
-    let size = file.data_size;
+    let size = {
+        let obj = Object::File(file.clone());
+        obj.posix_size(vol)
+    };
     let (atime, mtime, ctime, crtime) = times_to_fileattr(&file.times, expanded);
     let kind = if file.record.is_symlink() {
         fuser::FileType::Symlink

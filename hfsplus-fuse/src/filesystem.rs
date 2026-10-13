@@ -68,6 +68,19 @@ impl VolumeHolder {
 fn make_holder(image_path: &str) -> hfsplus::Result<(VolumeHolder, bool)> {
     let device = FileDevice::open(image_path)?;
     let volume = Volume::open(&device)?;
+
+    // Refuse volumes marked with kHFSContentProtectionMask (bit 30). This flag
+    // indicates the volume *may* contain content-protected files whose data
+    // forks are encrypted. Since per-file decryption is not implemented
+    // (see docs/encryption.md), mounting such a volume would risk serving
+    // ciphertext as file contents. See docs/encryption.md section 1.
+    if volume.header().attribute_flags().has_content_protection() {
+        return Err(hfsplus::error::Error::unsupported(
+            "content protection: volume has per-file encryption (bit 30 set); \
+             this build does not implement decryption — see docs/encryption.md",
+        ));
+    }
+
     let expanded = volume.header().has_expanded_times();
     let volume: Volume<'static, FileDevice> = unsafe { std::mem::transmute(volume) };
     Ok((
@@ -269,10 +282,14 @@ fn name_to_utf16(name: &OsStr) -> Option<Vec<u16>> {
 }
 
 /// Internal helper: convert an `Object` to a `fuser::FileAttr`.
-fn object_to_attr(object: &Object, expanded: bool) -> fuser::FileAttr {
+fn object_to_attr<D: hfsplus::blockdev::BlockDevice + ?Sized>(
+    object: &Object,
+    vol: &hfsplus::volume::Volume<'_, D>,
+    expanded: bool,
+) -> fuser::FileAttr {
     match object {
         Object::Directory(dir) => dir_attrs_to_file_attr(dir, expanded),
-        Object::File(file) => file_attrs_to_file_attr(file, expanded),
+        Object::File(file) => file_attrs_to_file_attr(file, vol, expanded),
     }
 }
 
@@ -367,7 +384,7 @@ impl Filesystem for HfsPlusFilesystem {
         match self.get_read_volume() {
             Ok(holder) => match holder.volume.lookup(parent_cnid, &utf16) {
                 Ok(Some(object)) => {
-                    let attr = object_to_attr(&object, self.expanded_times);
+                    let attr = object_to_attr(&object, holder.volume(), self.expanded_times);
                     reply.entry(&TTL, &attr, Generation(0));
                 }
                 Ok(None) => reply.error(Errno::ENOENT),
@@ -380,9 +397,16 @@ impl Filesystem for HfsPlusFilesystem {
     fn forget(&self, _req: &Request, _ino: INodeNo, _nlookup: u64) {}
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.lookup_cnid(Cnid(ino.0 as u32)) {
+        let holder = match self.get_read_volume() {
+            Ok(h) => h,
+            Err(e) => {
+                reply.error(fuse_errno(&e));
+                return;
+            }
+        };
+        match holder.volume.lookup_cnid(Cnid(ino.0 as u32)) {
             Ok(Some(object)) => {
-                let attr = object_to_attr(&object, self.expanded_times);
+                let attr = object_to_attr(&object, holder.volume(), self.expanded_times);
                 reply.attr(&TTL, &attr);
             }
             Ok(None) => reply.error(Errno::ENOENT),
@@ -615,7 +639,7 @@ impl Filesystem for HfsPlusFilesystem {
                 Ok((entries, _next_cursor)) => {
                     for (sent, entry) in (0_u64..).zip(entries.iter().skip(skip)) {
                         let entry_ino = fuser::INodeNo(entry.cnid().0 as u64);
-                        let attr = object_to_attr(entry, self.expanded_times);
+                        let attr = object_to_attr(entry, holder.volume(), self.expanded_times);
                         let name_bytes = entry.name();
                         let name = utf16_to_bytes(name_bytes);
                         let os_name = std::ffi::OsStr::from_bytes(&name);
@@ -773,13 +797,20 @@ impl Filesystem for HfsPlusFilesystem {
         let parent_cnid = newparent.0 as u32;
         let target_cnid = ino.0 as u32;
         match self.with_writable(|wvol| wvol.create_hard_link(parent_cnid, &utf16, target_cnid)) {
-            Ok(cnid) => match self.lookup_cnid(Cnid(cnid)) {
-                Ok(Some(object)) => {
-                    let attr = object_to_attr(&object, self.expanded_times);
-                    reply.entry(&TTL, &attr, Generation(0));
+            Ok(cnid) => {
+                self.invalidate_volume();
+                match self.get_read_volume() {
+                    Ok(holder) => match holder.volume.lookup_cnid(Cnid(cnid)) {
+                        Ok(Some(object)) => {
+                            let attr =
+                                object_to_attr(&object, holder.volume(), self.expanded_times);
+                            reply.entry(&TTL, &attr, Generation(0));
+                        }
+                        _ => reply.error(Errno::ENOENT),
+                    },
+                    Err(e) => reply.error(fuse_errno(&e)),
                 }
-                _ => reply.error(Errno::ENOENT),
-            },
+            }
             Err(e) => reply.error(fuse_errno(&e)),
         }
     }
@@ -850,7 +881,7 @@ impl Filesystem for HfsPlusFilesystem {
         mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         _fh: Option<FileHandle>,
-        _crtime: Option<std::time::SystemTime>,
+        crtime: Option<std::time::SystemTime>,
         _chgtime: Option<std::time::SystemTime>,
         _bkuptime: Option<std::time::SystemTime>,
         _flags: Option<fuser::BsdFileFlags>,
@@ -868,8 +899,12 @@ impl Filesystem for HfsPlusFilesystem {
             }
         }
 
-        let has_meta_changes =
-            mode.is_some() || uid.is_some() || gid.is_some() || atime.is_some() || mtime.is_some();
+        let has_meta_changes = mode.is_some()
+            || uid.is_some()
+            || gid.is_some()
+            || atime.is_some()
+            || mtime.is_some()
+            || crtime.is_some();
         if has_meta_changes {
             let changes = hfsplus::volume::FileMetadataChanges {
                 mode,
@@ -900,6 +935,12 @@ impl Filesystem for HfsPlusFilesystem {
                     ),
                 }),
                 ctime: None,
+                birthtime: crtime.and_then(|t| {
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
+                }),
+                finder_info: None,
             };
             match self.with_writable(|wvol| wvol.modify_file_metadata(cnid, changes)) {
                 Ok(_) => {}
@@ -911,12 +952,15 @@ impl Filesystem for HfsPlusFilesystem {
         }
 
         // Report the (possibly updated) attributes from a fresh read.
-        match self.lookup_cnid(Cnid(cnid)) {
-            Ok(Some(object)) => {
-                let attr = object_to_attr(&object, self.expanded_times);
-                reply.attr(&TTL, &attr);
-            }
-            Ok(None) => reply.error(Errno::ENOENT),
+        match self.get_read_volume() {
+            Ok(holder) => match holder.volume.lookup_cnid(Cnid(cnid)) {
+                Ok(Some(object)) => {
+                    let attr = object_to_attr(&object, holder.volume(), self.expanded_times);
+                    reply.attr(&TTL, &attr);
+                }
+                Ok(None) => reply.error(Errno::ENOENT),
+                Err(e) => reply.error(fuse_errno(&e)),
+            },
             Err(e) => reply.error(fuse_errno(&e)),
         }
     }
@@ -968,6 +1012,15 @@ impl Filesystem for HfsPlusFilesystem {
             }
         };
 
+        // Block writes to internal system-managed attributes. These carry
+        // filesystem bookkeeping (content protection, decmpfs compression, hard
+        // link chains, resource fork) and cannot be safely set or removed by
+        // userspace. See docs/encryption.md section 2.
+        if hfsplus::attributes::names::is_system_attribute(name_str) {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
         match self.with_writable(|wvol| wvol.setxattr(cnid, name_str, value)) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(fuse_errno(&e)),
@@ -984,6 +1037,12 @@ impl Filesystem for HfsPlusFilesystem {
             }
         };
 
+        // Block removal of internal system-managed attributes. See setxattr.
+        if hfsplus::attributes::names::is_system_attribute(name_str) {
+            reply.error(Errno::EPERM);
+            return;
+        }
+
         match self.with_writable(|wvol| wvol.removexattr(cnid, name_str)) {
             Ok(_) => reply.ok(),
             Err(e) => reply.error(fuse_errno(&e)),
@@ -999,6 +1058,18 @@ impl Filesystem for HfsPlusFilesystem {
                 return;
             }
         };
+
+        // Filter internal system-managed attribute names from the public
+        // getxattr interface. `com.apple.decmpfs` is hidden by Apple's own
+        // xattr interface, and `com.apple.system.cprotect` is internal
+        // encryption metadata that must not be exposed as ordinary data.
+        // See docs/encryption.md section 2.
+        if name_str == hfsplus::attributes::names::DECOMPRESSION_NAME
+            || name_str == hfsplus::attributes::names::CONTENT_PROTECTION_NAME
+        {
+            reply.error(Errno::ENODATA);
+            return;
+        }
 
         match self.get_read_volume() {
             Ok(holder) => match holder.volume.lookup_cnid(cnid) {
@@ -1029,8 +1100,18 @@ impl Filesystem for HfsPlusFilesystem {
                 Ok(Some(object)) => match holder.volume.listxattr(&object) {
                     Ok(names) => {
                         // FUSE expects a NUL-separated list of attribute names.
+                        // Filter out internal system-managed names that are
+                        // hidden from the public xattr interface. See getxattr
+                        // comment for the justification.
+                        let hidden = [
+                            hfsplus::attributes::names::DECOMPRESSION_NAME,
+                            hfsplus::attributes::names::CONTENT_PROTECTION_NAME,
+                        ];
                         let mut buf = Vec::new();
                         for n in &names {
+                            if hidden.iter().any(|h| *h == n) {
+                                continue;
+                            }
                             buf.extend_from_slice(n.as_bytes());
                             buf.push(0);
                         }

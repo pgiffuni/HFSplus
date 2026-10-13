@@ -56,8 +56,8 @@ input: every field, offset, and count is bounds-checked.
 | 15 | Catalog extent-overflow growth | Complete: grow_fork_of spills to Extents B-tree; write_file_contents_inner and write_resource_fork_inner resolve overflow blocks via ExtentMapper; release_resource_fork_blocks frees overflow groups on truncation; leaf splits and depth-1 tree splits supported; test for 9-block resource fork round-trip with fsck verification |
 | 16 | In-tree checker (hfsck) | Done — see roadmap-write-fsck.md |
 | 17 | In-tree formatter (hnewfs) | Done — `src/format/writer.rs` creates HFS+/HFSX volumes with and without journal; `src/bin/hnewfs.rs` CLI; verified by `hfsck` |
-| 18 | FUSE adapter (P0) | In progress — `hfsplus-fuse` crate with read/write filesystem |
-| 19 | FUSE adapter (P1) | Updated: compressed-file write rejection lifted; write_file_contents now re-encodes through reencode_compressed_file |
+| 18 | FUSE adapter (P0) | Complete — `hfsplus-fuse` crate with full read/write filesystem |
+| 19 | FUSE adapter (P1) | Complete: compressed-file writes re-encode through `reencode_compressed_file`; GETXATTR, LISTXATTR, LSEEK, READDIRPLUS |
 | 20 | FUSE adapter (P2) | Complete: BMAP, FALLOCATE (punch_hole zeroes data), COPY_FILE_RANGE |
 
 ---
@@ -109,18 +109,18 @@ decoders integrated into the `decompress()` dispatch in `src/compression/mod.rs`
 
 ## Phase B — HFS completeness
 
-- Finish attribute mutation (SETXATTR / REMOVEXATTR)
-- Finish hard-link lifecycle (all four operations: link, lookup, unlink,
-  directory hard links)
-- Finish catalog extent-overflow growth (>8 inline extent slots)
-- Finish resource-fork mutation
-- Finish timestamp / FinderInfo metadata semantics
+All items complete:
+- Attribute mutation (SETXATTR / REMOVEXATTR)
+- Hard-link lifecycle (all four operations: link, lookup, unlink, directory hard links)
+- Catalog extent-overflow growth (>8 inline extent slots)
+- Resource-fork mutation
+- Timestamp / FinderInfo metadata semantics (`FileMetadataChanges` extended with `birthtime` and `finder_info`)
 
 ---
 
 ## Phase C — FUSE P0
 
-Add `src/fuse/` (thin adapter). Implement:
+Complete — all POSIX FUSE operations implemented: INIT, LOOKUP, FORGET, GETATTR, ACCESS, OPENDIR, READDIR, RELEASEDIR, OPEN, RELEASE, READ, WRITE, FLUSH, FSYNC, CREATE, MKDIR, UNLINK, RMDIR, RENAME, SYMLINK, READLINK, LINK, SETATTR, STATFS. CNID is the FUSE inode number.
 
 ```
 INIT  LOOKUP  FORGET  GETATTR  ACCESS
@@ -137,11 +137,7 @@ CNID is the FUSE inode number. Do not use host filesystem inode numbers.
 
 ## Phase D — FUSE P1
 
-- GETXATTR / LISTXATTR / SETXATTR / REMOVEXATTR
-- LSEEK (via existing `seek_data` / `seek_hole`)
-- READDIRPLUS (via existing `DirCursor` / `DirEntry`)
-- Compression-aware logical READ (already implemented)
-- Correct compressed-file write rejection (return EOPNOTSUPP)
+Complete: GETXATTR / LISTXATTR / SETXATTR / REMOVEXATTR, LSEEK (via `seek_data` / `seek_hole`), READDIRPLUS (via `DirCursor` / `DirEntry`), compression-aware logical READ, and compressed-file writes re-encode through `reencode_compressed_file`.
 
 ---
 
