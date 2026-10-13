@@ -57,7 +57,7 @@ input: every field, offset, and count is bounds-checked.
 | 16 | In-tree checker (hfsck) | Done — see roadmap-write-fsck.md |
 | 17 | In-tree formatter (hnewfs) | Done — `src/format/writer.rs` creates HFS+/HFSX volumes with and without journal; `src/bin/hnewfs.rs` CLI; verified by `hfsck` |
 | 18 | FUSE adapter (P0) | In progress — `hfsplus-fuse` crate with read/write filesystem |
-| 19 | FUSE adapter (P1) | Complete: xattr, LSEEK, READDIRPLUS, compression-aware READ, compressed-file write rejection |
+| 19 | FUSE adapter (P1) | Updated: compressed-file write rejection lifted; write_file_contents now re-encodes through reencode_compressed_file |
 | 20 | FUSE adapter (P2) | Complete: BMAP, FALLOCATE (punch_hole zeroes data), COPY_FILE_RANGE |
 
 ---
@@ -208,7 +208,8 @@ Since the last roadmap update, journal write-side support has been completed:
 - Do not redo existing infrastructure (BMAP, SEEK_DATA/SEEK_HOLE,
   ExtentRanges, DirCursor, READDIRPLUS, basic xattr reading).
 - The FUSE layer must be thin; all filesystem semantics live in the library.
-- For compressed files, writes return EOPNOTSUPP until a correct
-  recompression path exists.
+- For compressed files, writes re-encode the full content through
+  `reencode_compressed_file`, preserving the original compression type with
+  fallback to type 1 (inline) or a plain file.
 - Never panic on corrupt filesystem input.
 - Every mutation must satisfy: serialized -> reopened -> `fsck.hfsplus` accepts.

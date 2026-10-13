@@ -372,7 +372,7 @@ final choice.
 | --- | --- |
 | Apple | `core/hfs_vfsops.c` `hfs_vnop_write` (refuses compressed); `core/hfs_cnode.c` `hfs_set_bsd_flags` (sets `UF_COMPRESSED` in `admin_flags`); `core/hfs_xattr.c` `hfs_vnop_setxattr` (writes `com.apple.decmpfs`) |
 | Structures | `DecmpfsHeader` serialised as 16 little-endian bytes; `UF_COMPRESSED` (0x20) in `BsdInfo.admin_flags` |
-| Invariants | a file transitions to compressed as a unit: set the xattr, write the resource fork (for types 2+), then set `UF_COMPRESSED` in the catalog record; `write_file_contents` refuses writes to an existing compressed file with `EOPNOTSUPP` |
+| Invariants | a file transitions to compressed as a unit: set the xattr, write the resource fork (for types 2+), then set `UF_COMPRESSED` in the catalog record; `write_file_contents` re-encodes the full content through `reencode_compressed_file` rather than refusing with `EOPNOTSUPP` |
 | Rust | `src/compression/mod.rs` `compress`; `src/volume/mod.rs` `create_compressed_file`, `UF_COMPRESSED` constant |
 | Differences | type 1 stores the payload inline in the xattr (16-byte header + raw data); type 2 stores only the header in the xattr and the zlib stream in the resource fork, mirroring Apple's fork-backed layout for types 2–7 |
 
@@ -386,17 +386,17 @@ reference once an encoder strategy is chosen, but the LZFSE/LZVN encoder sources
 live in the external `lzfse/lzfse` repo (BSD-3-Clause) and translating them is a
 separate milestone.
 
-Truncating a compressed file decompresses, resizes, and re-compresses:
-`truncate_file_inner` in `src/volume/mod.rs` delegates to
-`truncate_compressed_file_inner`, which preserves the original compression type
-when a re-encoder exists, falls back to type 1 (inline uncompressed) when the
-payload fits the inline attribute limit but re-compression does not help or the
-type is unsupported, and falls back to a plain uncompressed file otherwise.
-`rewrite_compressed_file` dispatches to `store_compressed_fork_backed` for
-fork-backed types and directly writes the xattr for type 1. A key fix in
-`write_allocation_bitmap` keeps `self.header.free_blocks` in sync with the
-on-disk bitmap so that a release-then-allocate cycle does not trigger the
-free-count disagreement check.
+Truncating or writing a compressed file decompresses, resizes, and re-compresses.
+`truncate_file_inner` delegates to `truncate_compressed_file_inner`;
+`write_file_contents_inner` delegates to `reencode_compressed_file`. Both
+preserve the original compression type when a re-encoder exists, fall back to
+type 1 (inline uncompressed) when the payload fits the inline attribute limit
+but re-compression does not help or the type is unsupported, and fall back to a
+plain uncompressed file otherwise. `rewrite_compressed_file` dispatches to
+`store_compressed_fork_backed` for fork-backed types and directly writes the
+xattr for type 1. A key fix in `write_allocation_bitmap` keeps
+`self.header.free_blocks` in sync with the on-disk bitmap so that a
+release-then-allocate cycle does not trigger the free-count disagreement check.
 
 The other attribute names HFS+ writes for its own bookkeeping are pinned in
 `src/attributes/names.rs`, verified against the source rather than recalled: they
