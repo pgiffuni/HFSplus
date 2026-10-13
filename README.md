@@ -1,4 +1,4 @@
-# HFSPfuse — a userspace HFS+/HFSX filesystem in Rust
+# HFS+fuse — a userspace HFS+/HFSX filesystem in Rust
 
 A read/write implementation of Apple's HFS+ (Mac OS Extended) and HFSX
 journaling file systems, structured as a library with FUSE and command-line
