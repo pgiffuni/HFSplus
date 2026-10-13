@@ -13,6 +13,63 @@ adapters. All on-disk layout and algorithm logic is derived from Apple's own
 | `hfsck` | Read-only consistency checker (`fsck_hfs` equivalent). Validates the catalog B-tree, extents overflow, allocation bitmap, extended attributes, and journal. |
 | `hfsls` | Lists an image's contents (`hls` equivalent) without mounting it. Recursive (`-R`) and JSON output. |
 | `hfsinspect` | Prints volume-header facts, B-tree summaries, and raw node dumps for a given image. |
+| `hfsplus-fuse` | FUSE adapter: mounts an HFS+/HFSX image at a given mountpoint. |
+
+## Quick start
+
+### Create a new filesystem
+
+```sh
+# Create a 1 GiB image file
+dd if=/dev/zero of=disk.img bs=1M count=1024
+
+# Format it as HFS+ (journaled, case-insensitive)
+hnewfs -v "MyVolume" -J -b 4096 disk.img
+
+# For case-sensitive (HFSX), add -s
+hnewfs -v "MyVolume" -J -s -b 16384 disk.img
+```
+
+### Mount and use
+
+```sh
+# Read-write mount (default)
+hfsplus-fuse disk.img /mnt/hfs
+
+# Read-only mount
+hfsplus-fuse -r disk.img /mnt/hfs
+
+# Unmount
+fusermount -u /mnt/hfs    # Linux
+# or: fusermount3 -u /mnt/hfs
+```
+
+### Check consistency
+
+```sh
+# Read-only check (default: never repairs, exits 0 if clean)
+hfsck disk.img
+
+# Force check even if volume is marked clean
+hfsck -f disk.img
+
+# Always attempt repairs (if a repair mode is implemented)
+hfsck -y disk.img
+```
+
+### Inspect an image
+
+```sh
+# Show volume header and B-tree summaries
+hfsinspect disk.img
+
+# List contents (recursive, JSON)
+hfsls -R --json disk.img
+```
+
+See `docs/dev-tools.md` for details on each tool's options.
+
+## FUSE adapter options
 
 ## Library structure
 
