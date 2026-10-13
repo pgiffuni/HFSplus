@@ -3881,6 +3881,56 @@ fn a_journaled_truncate_is_durable_after_reopen() {
 }
 
 #[test]
+fn a_journaled_truncate_of_compressed_file_is_durable() {
+    // Create a compressed file on a journaled volume, then truncate it.
+    // The journal transaction must cover the resource fork rewrite and the
+    // decmpfs xattr update, so that the truncated compressed file survives
+    // a reopen and passes fsck.
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(30);
+    let new_len = data.len() / 2;
+
+    let parent = {
+        let dev = FileDevice::open(&path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable =
+            WritableVolume::open(&mut dev).expect("a journaled volume should accept writes");
+        let cnid = writable
+            .create_compressed_file(parent, &units("journaled_trunc.bin"), &data, Zlib)
+            .expect("create_compressed_file on journaled volume");
+        writable
+            .truncate_file(cnid, new_len as u64)
+            .expect("truncate should succeed");
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    // Reopen and verify.
+    let dev = FileDevice::open(&path).expect("open for reading after truncate");
+    let vol = Volume::open(&dev).expect("mount after truncate");
+    let obj = vol
+        .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
+        .expect("lookup by CNID")
+        .expect("file must exist after truncate");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file after truncate");
+    assert_eq!(
+        back.len(),
+        new_len,
+        "journaled compressed truncate must produce the right decompressed length"
+    );
+    assert_eq!(&back[..], &data[..new_len]);
+    assert_fsck_clean(&path, "journaled compressed truncate after reopen");
+}
+
+#[test]
 fn writing_a_data_fork_that_overflows_extents() {
     // A data fork that grows beyond eight inline extents must spill into
     // the Extents B-tree. With a 4 KiB block size, writing 9+ blocks
