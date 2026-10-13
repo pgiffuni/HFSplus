@@ -903,12 +903,19 @@ pub struct FileMetadataChanges {
 /// | `punch_hole` | catalog leaf (fork record) | no | no | open → commit/abort |
 /// | `create_symlink` | catalog leaf (file record + thread), parent folder record (valence), data fork blocks | allocated blocks on grow (via `write_file_contents_inner` → `grow_fork`) | `fileCount`, `nextCatalogID`, `freeBlocks` on grow (via `create_file_inner` + `grow_fork`) | open → commit/abort |
 /// | `modify_file_metadata` | catalog leaf (record fields: mode, uid, gid, timestamps) | no | no | open → commit/abort |
+/// | `write_file_contents` (compressed) | catalog fork record, attributes B-tree leaf (decmpfs xattr), resource fork blocks, allocation bitmap (freed/allocated via `write_allocation_bitmap`) | freed + allocated blocks | `freeBlocks` | open → commit/abort |
+/// | `truncate_file` (compressed) | catalog fork record, attributes B-tree leaf (decmpfs xattr), resource fork blocks, allocation bitmap (freed/allocated via `write_allocation_bitmap`) | freed + allocated blocks | `freeBlocks` | open → commit/abort |
+/// | `create_compressed_file` | catalog fork record, attributes B-tree leaf (decmpfs xattr), resource fork blocks, allocation bitmap (allocated via `write_allocation_bitmap`) | allocated blocks on grow | `freeBlocks` on grow | open → commit/abort |
 ///
 /// All writes pass through [`journal_write`](Self::journal_write), which is the
 /// only path to the device. Internal helpers (`replace_catalog_record`,
-/// `release_blocks`, `write_allocation_bitmap`, `grow_fork`, B-tree leaf writes)
-/// are called from within the public method's transaction and therefore inherit
-/// its protection.
+/// `release_resource_fork_blocks`, `write_allocation_bitmap`, `grow_fork`,
+/// `setxattr_inner`, `removexattr_inner`, B-tree leaf writes) are called from
+/// within the public method's transaction and therefore inherit its protection.
+/// The compressed-file methods (`create_compressed_file`,
+/// `truncate_compressed_file_inner`, `reencode_compressed_file`) delegate to
+/// the same helpers, so their multi-structure writes are covered by the same
+/// transaction boundary.
 pub struct WritableVolume<'d, D: ?Sized> {
     /// Exclusive access to the bytes, for as long as this exists.
     device: &'d mut D,
