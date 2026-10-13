@@ -3920,7 +3920,9 @@ fn a_journaled_truncate_of_compressed_file_is_durable() {
         .lookup_cnid(hfsplus::catalog::cnid::Cnid(cnid))
         .expect("lookup by CNID")
         .expect("file must exist after truncate");
-    let back = vol.read_file(&obj, 1 << 20).expect("read_file after truncate");
+    let back = vol
+        .read_file(&obj, 1 << 20)
+        .expect("read_file after truncate");
     assert_eq!(
         back.len(),
         new_len,
@@ -6122,4 +6124,100 @@ fn truncating_incompressible_data_falls_back_to_uncompressed() {
         .expect("file must exist");
     let xattr = vol.getxattr(&obj, "com.apple.decmpfs").expect("getxattr");
     assert!(xattr.is_some(), "file must still have decmpfs xattr");
+}
+
+/// Rewrite a compressed file's full content via write_file_contents, then
+/// verify the decompressed data matches. This exercises the
+/// reencode_compressed_file path (decompress → recompress → rewrite).
+fn write_compressed_file(
+    path: &std::path::Path,
+    name: &str,
+    data: &[u8],
+    ctype: CompressionType,
+) -> u32 {
+    let parent = {
+        let dev = FileDevice::open(path).expect("open for reading");
+        let vol = Volume::open(&dev).expect("mount");
+        vol.root_cnid().0
+    };
+
+    let cnid = {
+        let mut dev = FileDevice::open_writable(path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        let cnid = writable
+            .create_compressed_file(parent, &units(name), data, ctype)
+            .unwrap_or_else(|e| panic!("create_compressed_file: {e}"));
+        dev.sync().expect("flush");
+        cnid
+    };
+
+    cnid
+}
+
+#[test]
+fn writing_a_type2_compressed_file_recompresses_with_zlib() {
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(30);
+    let cnid = write_compressed_file(&path, "wrc2.bin", &data, Zlib);
+
+    // Write new content — full replacement via write_file_contents.
+    let new_data = b"New content for zlib-compressed file. ".repeat(20);
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .write_file_contents(cnid, &new_data)
+            .expect("write_file_contents to compressed file");
+        dev.sync().expect("flush");
+    }
+
+    // Read back and verify.
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("wrc2.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file");
+    assert_eq!(back, new_data, "recompressed file must hold the new data");
+    assert!(
+        vol.getxattr(&obj, "com.apple.decmpfs")
+            .expect("getxattr")
+            .is_some(),
+        "file must still be compressed after reencode"
+    );
+    assert_fsck_clean(&path, "recompressed zlib file");
+}
+
+#[test]
+fn writing_a_type3_compressed_file_recompresses_with_lzfse() {
+    let Some(path) = copy_fixture("journal-with-attributes") else {
+        return;
+    };
+
+    let data = b"LZFSE recompression test block for write path. ".repeat(30);
+    let cnid = write_compressed_file(&path, "wrc3.bin", &data, Lzfse);
+    let new_data = b"LZFSE recompressed content. ".repeat(20);
+
+    {
+        let mut dev = FileDevice::open_writable(&path).expect("open writable");
+        let mut writable = WritableVolume::open(&mut dev).expect("open for mutation");
+        writable
+            .write_file_contents(cnid, &new_data)
+            .expect("write_file_contents to LZFSE file");
+        dev.sync().expect("flush");
+    }
+
+    let dev = FileDevice::open(&path).expect("open for reading");
+    let vol = Volume::open(&dev).expect("mount");
+    let obj = vol
+        .lookup(vol.root_cnid(), &units("wrc3.bin"))
+        .expect("lookup")
+        .expect("file must exist");
+    let back = vol.read_file(&obj, 1 << 20).expect("read_file");
+    assert_eq!(back, new_data);
+    assert_fsck_clean(&path, "recompressed LZFSE file");
 }

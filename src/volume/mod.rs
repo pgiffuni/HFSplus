@@ -1304,23 +1304,31 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
 
         // A compressed file's data fork holds compressed bytes, not raw
         // content. Writing raw bytes here would corrupt the file's mapping
-        // without updating the decmpfs metadata. Refuse with EOPNOTSUPP, as
-        // Apple does: `hfs_vnop_write` checks `ap->a_is_compressed` and
-        // returns `EOPNOTSUPP` for the write path.
-        // Mining reference: `core/hfs_vfsops.c` `hfs_vnop_write` and
-        // `core/hfs_readwrite.c` `hfs_write_recover`.
+        // without updating the decmpfs metadata.
+        //
+        // Instead, re-compress the new content using the file's existing
+        // compression type (with fallback to type 1 or plain file), then
+        // rewrite the decmpfs header and resource fork. This mirrors the
+        // decompress-truncate-recompress path used by truncate_file_inner.
+        //
+        // Mining reference: `core/hfs_vfsops.c` `hfs_vnop_write` checks
+        // `ap->a_is_compressed`; Apple routes compressed writes through
+        // `decmpfs_update_attrs` (re-encode the whole file). The user's
+        // FUSE layer already does the read-modify-write to produce the
+        // full `data` buffer; we just re-encode it.
         if record.has_attributes() {
-            // Open a read-only Volume to check for the decmpfs attribute
-            // without holding a conflicting borrow.
             let obj = Object::from_record(
                 Vec::new(),
                 crate::catalog::record::CatalogRecord::File(Box::new(record)),
                 self.header.has_expanded_times(),
             )
             .expect("a file record becomes an object");
-            let ro = Volume::open(&*self.device)?;
-            if ro.try_decompress(&obj)?.is_some() {
-                return Err(Error::unsupported("write to compressed file"));
+            let is_compressed = {
+                let ro = Volume::open(&*self.device)?;
+                ro.try_decompress(&obj)?.is_some()
+            };
+            if is_compressed {
+                return self.reencode_compressed_file(cnid, data);
             }
         }
 
@@ -6056,6 +6064,63 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
         self.replace_catalog_record(cnid, &record)?;
 
         Ok(())
+    }
+
+    /// Re-encode a compressed file after a full-content write. Reads the
+    /// original compression type from the decmpfs xattr, compresses the new
+    /// data, and falls back to type 1 (inline) or a plain file when
+    /// re-compression does not help or the type is unsupported.
+    fn reencode_compressed_file(&mut self, cnid: u32, new_data: &[u8]) -> Result<()> {
+        let record = self.read_file_record(cnid)?;
+        let obj = Object::from_record(
+            Vec::new(),
+            crate::catalog::record::CatalogRecord::File(Box::new(record)),
+            self.header.has_expanded_times(),
+        )
+        .expect("a file record becomes an object");
+
+        let compression_type = {
+            let ro = Volume::open(&*self.device)?;
+            let attr_value = ro
+                .getxattr(&obj, crate::attributes::names::DECOMPRESSION_NAME)?
+                .ok_or_else(|| Error::invalid("compressed file", "decmpfs attribute is missing"))?;
+            let header = crate::compression::DecmpfsHeader::from_bytes(&attr_value)?;
+            header.compression_type
+        };
+
+        let compressed = match crate::compression::compress(new_data, compression_type) {
+            Ok(c) => c,
+            Err(_) => {
+                // Encoder unavailable: fall back to uncompressed inline or plain.
+                let inline_limit = self.attributes_inline_limit()?;
+                if crate::compression::DecmpfsHeader::SIZE + new_data.len() <= inline_limit {
+                    return self.rewrite_compressed_file(
+                        cnid,
+                        new_data,
+                        crate::compression::CompressionType::Uncompressed,
+                        new_data,
+                    );
+                }
+                self.convert_compressed_to_plain_inner(cnid)?;
+                return self.write_file_contents_inner(cnid, new_data);
+            }
+        };
+
+        if compressed.len() >= new_data.len() {
+            let inline_limit = self.attributes_inline_limit()?;
+            if crate::compression::DecmpfsHeader::SIZE + new_data.len() <= inline_limit {
+                return self.rewrite_compressed_file(
+                    cnid,
+                    new_data,
+                    crate::compression::CompressionType::Uncompressed,
+                    new_data,
+                );
+            }
+            self.convert_compressed_to_plain_inner(cnid)?;
+            return self.write_file_contents_inner(cnid, new_data);
+        }
+
+        self.rewrite_compressed_file(cnid, new_data, compression_type, &compressed)
     }
 
     /// Write a compressed payload back to an existing file, replacing any prior
