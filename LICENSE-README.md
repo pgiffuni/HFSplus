@@ -77,9 +77,6 @@ Currently derived files:
 
 - **Never** remove or alter Apple copyright, license or attribution notices
   from derived files.
-- **Never** introduce GPL-licensed code into this repository. This rules out
-  direct translation of `0x09/hfsfuse`, which is GPL-2.0; that project is used
-  only as an external behavioural reference and is never vendored here.
 - Any new third-party dependency (compression codec, Unicode table, etc.) must
   have its licence verified as compatible **before** it becomes mandatory.
   Optional, licence-clean implementations are preferred.
