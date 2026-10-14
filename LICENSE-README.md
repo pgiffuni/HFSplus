@@ -99,7 +99,7 @@ Two distinct uses are permitted, and they carry different obligations:
 | `apple-oss-distributions/hfs` (mirror: `pgiffuni/apple-hfs`) | APSL-1.2 | **Primary.** Structures, algorithms, semantics. Mined and cited. |
 | `hfsutils` 3.2.6 (`hmount`, `hls`, `hformat`, …) | GPL-2.0 | **Executable only.** May be run to build images. Never read as a reference; never vendored. |
 | `hfsplus` 1.0.4 (`hpmount`, `hpls`, libhfsp) | GPL-2.0 | **Executable only.** Same rule. |
-| `0x09/hfsfuse` | GPL-2.0 | **Behavioural baseline only.** Defines the read-only feature set to meet or exceed. Never copied, translated, linked, or vendored. |
+| `0x09/hfsfuse` | MIT | **Behavioural baseline only.** Defines the read-only feature set to meet or exceed. |
 
 This is recorded because it is easy to lose: both `hfsutils` and `hfsplus` are
 installed, both look like obvious HFS+ tooling, and both are GPL-2.0. Neither may
