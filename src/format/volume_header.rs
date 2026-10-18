@@ -146,9 +146,9 @@ pub const K_HFS_EXPANDED_TIMES_MASK: u32 = 0x2000_0000;
 /// protection.
 ///
 /// Mining reference: `kHFSContentProtectionMask = 0x40000000` in Apple
-/// `core/hfs_format.h`. Relevant to the encryption/content-protection
-/// investigation: its presence tells us files *may* be protected, not that any
-/// particular one is.
+/// `core/hfs_format.h`. TN1150, Volume Attributes, confirms this is a
+/// volume-level hint that files *may* be protected, not that any particular
+/// one is. Relevant to the encryption/content-protection investigation.
 pub const K_HFS_CONTENT_PROTECTION_MASK: u32 = 0x4000_0000;
 
 /// `kHFSUnusedNodeFixBit` — bit 31: unused catalog B-tree nodes are zero-filled.

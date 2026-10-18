@@ -6,7 +6,7 @@
 //! the extents overflow tree and the attributes tree are all the same
 //! structure with different key types, so nothing here knows what a "catalog
 //! record" is. Callers decode keys and records through
-//! [`key`](key) and their own record types.
+//! [`key`] and their own record types.
 //!
 //! Mining reference: Apple `core/BTree.c` and the `BTree*` family implement the
 //! same engine for the kernel. This is the userspace translation of the

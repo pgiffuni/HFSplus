@@ -80,9 +80,16 @@ pub const FINDER_USER_INFO_SIZE: usize = 16;
 pub const FINDER_OPAQUE_INFO_SIZE: usize = 16;
 
 /// `kHFSHasAttributesMask`: the object has extended attributes.
+///
+/// TN1150, Catalog File Record: "this bit indicates that the file has
+/// extended attributes stored in an external attributes file." The attributes
+/// are found via the attributes B-tree, not inline in the catalog record.
 pub const K_HFS_HAS_ATTRIBUTES_MASK: u16 = 0x0004;
 
 /// `kHFSHasSecurityMask`: the object has ACLs.
+///
+/// TN1150 notes this indicates an extended security structure (ACL) is present
+/// for the object, stored in the attributes B-tree.
 pub const K_HFS_HAS_SECURITY_MASK: u16 = 0x0008;
 
 /// `kHFSHasFolderCountMask`: an HFSX folder keeps a separate sub-folder count.

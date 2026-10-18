@@ -16,6 +16,12 @@
 //! extents (0x30)   reserved, then an 8-descriptor extent record
 //! ```
 //!
+//! TN1150, Attributes File Data: these three record types correspond to
+//! `kHFSPlusAttrInlineData`, `kHFSPlusAttrForkData`, and
+//! `kHFSPlusAttrExtents` in Apple's enum. The spec says implementations must
+//! **ignore record types not defined here**, so unknown values are rejected
+//! rather than silently decoded.
+//!
 //! The inline form stores the value in the record, which is the common case and
 //! the only one that costs no allocation. The fork form stores it in allocation
 //! blocks and can be *continued* by further `extents` records, chained through

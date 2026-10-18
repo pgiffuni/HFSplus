@@ -41,6 +41,12 @@ pub const HEADER_USER_BYTES: usize = 128;
 
 /// Whether a node size is one of the seven values Apple's `VerifyHeader`
 /// accepts: 512 through 32768 in powers of two.
+///
+/// TN1150, B-Trees: "the typical node size for an HFS Plus catalog B-tree is
+/// 4 KB" and "the node size of the attributes file must be at least 4 KB
+/// (`kHFSPlusAttrMinNodeSize`)". These bounds are enforced at format time, not
+/// check time, so the legal size range here is the same one Apple's
+/// `VerifyHeader` uses for every B-tree type.
 const fn is_legal_node_size(size: u16) -> bool {
     matches!(size, 512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768)
 }

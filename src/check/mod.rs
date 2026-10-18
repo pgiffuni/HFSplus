@@ -17,6 +17,15 @@
 //! structures that were written independently by the formatter, which is a real
 //! signal even though both sides are read by the same code.
 //!
+//! TN1150, Volume Consistency Checks, describes the checks an implementation
+//! **must** run at mount time on a volume that was not unmounted cleanly: the
+//! `nextCatalogID` check (skipped when
+//! `kHFSCatalogNodeIDsReusedBit` is set) and the allocation-file consistency
+//! check (walk the bitmap, mark header/trailer blocks, mark all special-file
+//! extents, then walk every catalog leaf and every extent-overflow leaf). Those
+//! are mount-time invariants; these checks are the always-on, read-only
+//! subset a reader can run unconditionally.
+//!
 //! Correctness of what each check *is* comes from Apple's source, not from here.
 //! The provenance of each check is named below.
 //!

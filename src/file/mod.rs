@@ -226,7 +226,7 @@ impl<'a, D: BlockDevice + ?Sized> ForkReader<'a, D> {
     /// BMAP: translate a fork-relative byte offset to a device byte offset.
     ///
     /// The offset must be block-aligned. A hole yields
-    /// [`Error::OutOfRange`](crate::error::Error::OutOfRange), matching the
+    /// [`Error::OutOfRange`], matching the
     /// semantics of `ExtentMapper::bmap`.
     pub fn bmap(&self, offset: u64) -> Result<u64> {
         self.mapper.bmap(offset)

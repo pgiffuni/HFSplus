@@ -520,7 +520,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
     ///
     /// The offset must be aligned to the volume's allocation block size, as
     /// FUSE's BMAP opcode requires. Returns
-    /// [`Error::OutOfRange`](crate::error::Error::OutOfRange) when the block is
+    /// [`Error::OutOfRange`] when the block is
     /// past the file's allocated extents (a sparse hole).
     ///
     /// Mining reference: Apple `core/FileExtentMapping.c` `MapFileBlockC`
@@ -685,7 +685,7 @@ impl<'a, D: BlockDevice + ?Sized> Volume<'a, D> {
 
     /// The volume's journal, if it has one.
     ///
-    /// The returned [`Journal`] can hand out an overlaid device whose reads
+    /// The returned [`crate::journal::Journal`] can hand out an overlaid device whose reads
     /// consult the replayed blocks. Neither this nor the overlay writes to the
     /// image: the volume type exposes no write path at all.
     ///
@@ -899,7 +899,7 @@ pub struct FileMetadataChanges {
 /// # Journal transaction coverage
 ///
 /// Every public mutation method opens a journal transaction, performs its
-/// writes through [`journal_write`](Self::journal_write) (which records a
+/// writes through the internal `journal_write` method (which records a
 /// before-image before modifying a home block), and commits or abandons the
 /// transaction when the inner work returns. The coverage table below lists
 /// each mutation, the disk structures it can change, and the transaction
@@ -928,7 +928,7 @@ pub struct FileMetadataChanges {
 /// | `truncate_file` (compressed) | catalog fork record, attributes B-tree leaf (decmpfs xattr), resource fork blocks, allocation bitmap (freed/allocated via `write_allocation_bitmap`) | freed + allocated blocks | `freeBlocks` | open → commit/abort |
 /// | `create_compressed_file` | catalog fork record, attributes B-tree leaf (decmpfs xattr), resource fork blocks, allocation bitmap (allocated via `write_allocation_bitmap`) | allocated blocks on grow | `freeBlocks` on grow | open → commit/abort |
 ///
-/// All writes pass through [`journal_write`](Self::journal_write), which is the
+/// All writes pass through the internal `journal_write` method, which is the
 /// only path to the device. Internal helpers (`replace_catalog_record`,
 /// `release_resource_fork_blocks`, `write_allocation_bitmap`, `grow_fork`,
 /// `setxattr_inner`, `removexattr_inner`, B-tree leaf writes) are called from
@@ -1301,7 +1301,7 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
     /// - **Growth.** A file that outgrows its blocks needs an allocator, and an
     ///   allocator that guessed at a free block would be worse than no mutation.
     ///   The error names the shortfall rather than truncating the write.
-    /// - **A length change in the record.** See [`Self::replace_catalog_record`].
+    /// - **A length change in the record.** See `replace_catalog_record`.
     ///
     /// Mining reference: `core/hfs_cnode.c` `hfs_update` sets `c_touch_modtime`
     /// and `c_touch_chgtime` on a content change, which become `contentModDate`
@@ -5944,14 +5944,14 @@ impl<'d, D: BlockDeviceMut + Sync + ?Sized> WritableVolume<'d, D> {
     /// A freed extent is not removed from the record; its `startBlock` and
     /// `blockCount` are both set to zero, and a zeroed descriptor *is* the
     /// terminator. So the record keeps its length, which is the same property that
-    /// lets [`Self::grow_fork`] append extents without touching the extents tree.
+    /// lets `grow_fork` append extents without touching the extents tree.
     /// The two are the same fact seen from opposite ends, and it is the reason
     /// allocation and deallocation are both testable before Milestone 8C.
     ///
     /// # Order of operations
     ///
     /// The bitmap is freed and flushed *before* the catalog record is rewritten —
-    /// the same order as [`Self::grow_fork`], and the same reason. A crash in
+    /// the same order as `grow_fork`, and the same reason. A crash in
     /// between leaves a file whose record claims fewer blocks than it has: the
     /// extra blocks are orphans, which is recoverable. The reverse order would
     /// leave a record claiming blocks the bitmap has handed to something else.
@@ -8130,6 +8130,11 @@ pub const FILE_HARDLINKS_FOLDER: &str = "\u{2500}\u{2500}\u{2500}\u{2500}HFS+ Pr
 ///
 /// ".HFS+ Private Directory Data" followed by CR -- 29 units. The trailing CR
 /// is in Apple's definition and is easy to lose when transcribing it.
+///
+/// TN1150, Hard Links: this directory holds the indirect-node inodes for
+/// directory hard links. Mining reference: `HFSPLUSMETADATAFOLDER` in
+/// `core/hfs_format.h` distinguishes `FILE_HARDLINKS` (for file hard links)
+/// and `DIR_HARDLINKS` (for directory hard links).
 pub const DIR_HARDLINKS_FOLDER: &str = ".HFS+ Private Directory Data\r";
 
 /// `kHFSThreadExistsMask` -- the record's flags say its thread record exists.

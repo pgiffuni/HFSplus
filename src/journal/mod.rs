@@ -39,17 +39,17 @@
 //!
 //! The commit path is wired in and called by every mutating write path in
 //! [`crate::volume::WritableVolume`]. Each public mutation method begins a
-//! journal transaction, routes all disk writes through
-//! [`crate::volume::WritableVolume::journal_write`] (which records before-images
-//! in the [`TransactionBuffer`] before mutating home blocks), and commits via
-//! [`end_transaction`](crate::volume::WritableVolume::end_transaction) →
-//! [`commit_transaction`]. On failure the transaction is abandoned without
-//! advancing the journal header, so uncommitted writes are invisible to replay.
+//! journal transaction, routes all disk writes through the volume's internal
+//! `journal_write` method (which records before-images in the
+//! [`TransactionBuffer`] before mutating home blocks), and commits via the
+//! internal `end_transaction` method → [`commit_transaction`]. On failure the
+//! transaction is abandoned without advancing the journal header, so
+//! uncommitted writes are invisible to replay.
 //!
 //! A journaled volume can be opened for writing: [`crate::volume::WritableVolume`]
 //! reads the journal info block and header during [`open`](crate::volume::WritableVolume::open)
-//! and stores them in a [`JournalState`](crate::volume::JournalState) that
-//! [`TransactionBuffer`] fills on the first mutation.
+//! and stores them in an internal journal-state struct that [`TransactionBuffer`]
+//! fills on the first mutation.
 //!
 //! That has a measurable consequence for verification, and it is not a subtlety:
 //! `fsck.hfsplus` prints "Checking Journaled HFS Plus volume" or "Checking

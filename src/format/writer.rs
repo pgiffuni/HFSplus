@@ -227,7 +227,10 @@ fn compute_layout(block_size: u32, node_size: u16, journal_blocks: u32) -> Volum
     let nodes_per_tree = 8u32;
 
     // The attributes B-tree always uses an 8 KiB node size (large enough for
-    // the 266-byte attribute key body), regardless of the filesystem block size.
+    // the 266-byte attribute key body), regardless of the filesystem block
+    // size. TN1150: "the node size of the attributes file must be at least 4 KB
+    // (`kHFSPlusAttrMinNodeSize`)". 8 KiB exceeds that floor and matches
+    // newfs_hfs's choice.
     let attributes_node_size: u16 = 8192;
 
     let extents_start = alloc_start + alloc_blocks + 1 + journal_blocks;

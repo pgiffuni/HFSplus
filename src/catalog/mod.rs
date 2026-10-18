@@ -6,7 +6,7 @@
 //!
 //! The volume header has no name field. A volume's name is the name of its root
 //! folder, which is a `kHFSPlusFolderRecord` with CNID `kHFSRootFolderID` in this
-//! B-tree. See [`volume_header::VolumeHeader::volume_name_is_in_the_catalog`].
+//! B-tree. See [`crate::format::volume_header::VolumeHeader::volume_name_is_in_the_catalog`].
 //!
 //! Mining reference: Apple `core/hfs_catalog.c` implements this namespace and
 //! `core/hfs_vfsutils.c` (`hfs_MountHFSPlusVolume`) opens it.

@@ -12,6 +12,11 @@
 //! Mining reference: Apple `core/hfs_journal.c` `journal_replay` walks the
 //! transaction list and calls `update_fs_block` for each recorded block, and
 //! `core/hfs_vfsutils.c` decides at mount time whether replay is needed.
+//! TN1150, Journal / Replaying the Journal, sets out the steps at the format
+//! level: check `kHFSVolumeJournaledBit`, read the journal info block, skip if
+//! `kJIJournalNeedInitMask` is set, then walk `start..end` copying each
+//! block-list header's blocks to their sector offsets, wrapping at the journal
+//! buffer boundary.
 //!
 //! # Replay must not write
 //!
@@ -1707,7 +1712,7 @@ pub struct EncodedList {
 
 /// A transaction assembled for writing, and where it ends.
 ///
-/// The inverse of the walk in [`Journal::replay`], which advances
+/// The inverse of the walk in `Journal::replay`, which advances
 /// `next = data_offset + bytes_used` and reads each list's header from a whole
 /// `blhdr_size` block. Lists are packed **back to back with no rounding**, which is
 /// the part that is not obvious and which the reader's arithmetic fixes exactly.
